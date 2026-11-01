@@ -61,6 +61,14 @@ fn loggable(p: &str) -> String {
         .collect()
 }
 
+/// The token the client presented in the service's own auth header (e.g. "Bearer <token>").
+fn presented<'a>(headers: &'a hyper::HeaderMap, header: &str, format: &str) -> Option<&'a [u8]> {
+    let v = headers.get(header)?.as_bytes();
+    let (pre, post) = format.split_once("{key}")?;
+    v.strip_prefix(pre.as_bytes())?
+        .strip_suffix(post.as_bytes())
+}
+
 pub async fn handle(
     vault: Arc<Vault>,
     http: reqwest::Client,
@@ -69,44 +77,55 @@ pub async fn handle(
     let start = Instant::now();
     let method = req.method().as_str().to_string();
     let path = req.uri().path().to_string();
-    let (token, rest) = match path
+    let (service, rest) = match path
         .strip_prefix('/')
         .map(|p| p.split_once('/').unwrap_or((p, "")))
     {
-        Some((t, r)) => (t.to_string(), format!("/{r}")),
+        Some((s, r)) => (s.to_string(), format!("/{r}")),
         None => (String::new(), String::new()),
     };
-    let Some(used) = vault.take(&token) else {
+    let Some(svc) = vault.cfg.services.get(&service) else {
         log::line(
             &vault.cfg.log,
-            &format!("- {method} - 404 (no such token, or locked)"),
+            &format!("- {method} - 404 (no such service)"),
         );
-        return reply(StatusCode::NOT_FOUND, "unknown token (locked?)");
+        return reply(StatusCode::NOT_FOUND, "no such service");
     };
     let rest = if rest == "/" { String::new() } else { rest };
-    let res = forward(&vault, &http, &used.service, &used.key, &method, &rest, req).await;
-    let status = res.status().as_u16();
     let shown = if rest.is_empty() {
         "/".to_string()
     } else {
         loggable(&rest)
     };
+    let ok = presented(req.headers(), &svc.auth_header, &svc.auth_format)
+        .is_some_and(|t| vault.check_token(&service, t));
+    let res = if ok {
+        forward(&vault, &http, &service, &method, &rest, req).await
+    } else {
+        reply(
+            StatusCode::UNAUTHORIZED,
+            &format!(
+                "send the credproxy token as the API key ({})",
+                svc.auth_header
+            ),
+        )
+    };
+    let status = res.status().as_u16();
     log::line(
         &vault.cfg.log,
         &format!(
-            "{} {method} {shown} {status} {}ms",
-            used.service,
+            "{service} {method} {shown} {status} {}ms",
             start.elapsed().as_millis()
         ),
     );
     res
 }
 
+/// Allowlist first, then the key (unlocking if needed): a refused call never raises a Touch ID prompt.
 async fn forward(
     vault: &Vault,
     http: &reqwest::Client,
     service: &str,
-    key: &Zeroizing<String>,
     method: &str,
     rest: &str,
     req: Request<Incoming>,
@@ -137,6 +156,11 @@ async fn forward(
         }
     }
 
+    let key = match vault.key(service, false).await {
+        Ok(k) => k,
+        Err(e) => return reply(StatusCode::SERVICE_UNAVAILABLE, &e),
+    };
+    let key = &key;
     let mut url = format!("{}{sub}", route.upstream);
     if let Some(q) = parts.uri.query() {
         url.push('?');

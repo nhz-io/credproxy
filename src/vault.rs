@@ -1,34 +1,102 @@
-//! Keys in memory: unlock (age decrypts, one Touch ID), per-unlock token, idle lock.
+//! Keys in memory (age decrypts on first use: one Touch ID), stable per-service tokens on disk, idle lock.
 
 use crate::config::Config;
 use std::collections::HashMap;
+use std::io::Write;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
 use tokio::io::AsyncReadExt;
 use zeroize::Zeroizing;
 
-pub struct Unlocked {
-    pub key: Zeroizing<String>,
-    pub token: String,
-    pub last_used: Instant,
+/// After a failed unlock (Touch ID denied, timeout), requests don't prompt again for this long;
+/// `credproxy unlock` still does. Stops retrying clients from raising prompt after prompt.
+pub const UNLOCK_BACKOFF: Duration = Duration::from_secs(30);
+
+struct Unlocked {
+    key: Zeroizing<String>,
+    last_used: Instant,
+}
+
+#[derive(Default)]
+struct Slot {
+    token: String,
+    unlocked: Option<Unlocked>,
+    failed_at: Option<Instant>,
 }
 
 pub struct Vault {
     pub cfg: Config,
-    keys: Mutex<HashMap<String, Unlocked>>,
+    slots: Mutex<HashMap<String, Slot>>,
     unlocking: tokio::sync::Mutex<()>,
 }
 
-pub struct Use {
-    pub service: String,
-    pub key: Zeroizing<String>,
+/// The runtime/state dirs must be ours and private.
+pub fn private_dir(dir: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+        .map_err(|e| format!("{}: {e}", dir.display()))?;
+    let m = std::fs::metadata(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    if m.uid() != unsafe { libc::getuid() } || m.mode() & 0o077 != 0 {
+        return Err(format!(
+            "{}: must be owned by you with mode 700",
+            dir.display()
+        ));
+    }
+    Ok(())
 }
 
 fn new_token() -> String {
     let mut b = [0u8; 32];
     getrandom::fill(&mut b).expect("getrandom");
     b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+fn token_path(cfg: &Config, service: &str) -> PathBuf {
+    cfg.state_dir.join("tokens").join(service)
+}
+
+fn write_token(path: &Path, token: &str) -> Result<(), String> {
+    let tmp = path.with_extension("new");
+    let _ = std::fs::remove_file(&tmp);
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)
+        .map_err(|e| format!("{}: {e}", tmp.display()))?;
+    f.write_all(token.as_bytes()).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// The service's token, created on first use. 64 hex chars in <state_dir>/tokens/<service> (0600).
+pub fn token(cfg: &Config, service: &str) -> Result<String, String> {
+    let path = token_path(cfg, service);
+    private_dir(path.parent().unwrap())?;
+    match std::fs::read_to_string(&path) {
+        Ok(t) if t.len() == 64 && t.bytes().all(|b| b.is_ascii_hexdigit()) => Ok(t),
+        Ok(_) => Err(format!(
+            "{}: not a token; `credproxy rotate {service}` replaces it",
+            path.display()
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let t = new_token();
+            write_token(&path, &t)?;
+            Ok(t)
+        }
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    }
+}
+
+/// A new token for the service; the old one stops working.
+pub fn rotate_file(cfg: &Config, service: &str) -> Result<String, String> {
+    let path = token_path(cfg, service);
+    private_dir(path.parent().unwrap())?;
+    let t = new_token();
+    write_token(&path, &t)?;
+    Ok(t)
 }
 
 /// age output → key: one line of visible ASCII (anything else could split a header).
@@ -50,27 +118,108 @@ fn to_key(raw: &[u8]) -> Result<Zeroizing<String>, String> {
 }
 
 impl Vault {
-    pub fn new(cfg: Config) -> Self {
-        Vault {
-            cfg,
-            keys: Mutex::new(HashMap::new()),
-            unlocking: tokio::sync::Mutex::new(()),
+    pub fn new(cfg: Config) -> Result<Self, String> {
+        let mut slots = HashMap::new();
+        for name in cfg.services.keys() {
+            slots.insert(
+                name.clone(),
+                Slot {
+                    token: token(&cfg, name)?,
+                    ..Slot::default()
+                },
+            );
         }
+        Ok(Vault {
+            cfg,
+            slots: Mutex::new(slots),
+            unlocking: tokio::sync::Mutex::new(()),
+        })
     }
 
-    /// Token of an unlocked service, decrypting first if needed. Unlocks run one at a time.
-    pub async fn unlock(&self, service: &str) -> Result<String, String> {
+    /// Does `presented` equal the service's token? Constant time; unknown services never match.
+    pub fn check_token(&self, service: &str, presented: &[u8]) -> bool {
+        let slots = self.slots.lock().unwrap();
+        slots
+            .get(service)
+            .is_some_and(|s| bool::from(s.token.as_bytes().ct_eq(presented)))
+    }
+
+    pub fn token(&self, service: &str) -> Option<String> {
+        self.slots
+            .lock()
+            .unwrap()
+            .get(service)
+            .map(|s| s.token.clone())
+    }
+
+    pub fn rotate(&self, service: &str) -> Result<String, String> {
+        if !self.cfg.services.contains_key(service) {
+            return Err(format!("unknown service {service:?}"));
+        }
+        let t = rotate_file(&self.cfg, service)?;
+        self.slots
+            .lock()
+            .unwrap()
+            .entry(service.to_string())
+            .or_default()
+            .token = t.clone();
+        Ok(t)
+    }
+
+    fn cached(&self, service: &str) -> Option<Zeroizing<String>> {
+        let mut slots = self.slots.lock().unwrap();
+        let u = slots.get_mut(service)?.unlocked.as_mut()?;
+        u.last_used = Instant::now();
+        Some(u.key.clone())
+    }
+
+    /// The service's key, decrypting first if locked (one at a time). `force` ignores the back-off.
+    pub async fn key(&self, service: &str, force: bool) -> Result<Zeroizing<String>, String> {
+        if let Some(k) = self.cached(service) {
+            return Ok(k);
+        }
         let svc = self
             .cfg
             .services
             .get(service)
             .ok_or(format!("unknown service {service:?}"))?;
         let _one = self.unlocking.lock().await;
-        if let Some(u) = self.keys.lock().unwrap().get_mut(service) {
-            u.last_used = Instant::now();
-            return Ok(u.token.clone());
+        if let Some(k) = self.cached(service) {
+            return Ok(k);
         }
-        let file = self.cfg.secrets_dir.join(&svc.secret);
+        let failed = self
+            .slots
+            .lock()
+            .unwrap()
+            .get(service)
+            .and_then(|s| s.failed_at);
+        if let Some(t) = failed.filter(|t| !force && t.elapsed() < UNLOCK_BACKOFF) {
+            let left = (UNLOCK_BACKOFF - t.elapsed()).as_secs() + 1;
+            return Err(format!(
+                "locked: last unlock failed; retry in {left}s or run `credproxy unlock {service}`"
+            ));
+        }
+        let res = self.decrypt(svc.secret.as_path()).await;
+        let mut slots = self.slots.lock().unwrap();
+        let slot = slots.entry(service.to_string()).or_default();
+        match res {
+            Ok(key) => {
+                slot.failed_at = None;
+                slot.unlocked = Some(Unlocked {
+                    key: key.clone(),
+                    last_used: Instant::now(),
+                });
+                Ok(key)
+            }
+            Err(e) => {
+                slot.failed_at = Some(Instant::now());
+                Err(e)
+            }
+        }
+    }
+
+    async fn decrypt(&self, secret: &Path) -> Result<Zeroizing<String>, String> {
+        let file = self.cfg.secrets_dir.join(secret);
         let mut child = tokio::process::Command::new(&self.cfg.age)
             .arg("-d")
             .arg("-i")
@@ -105,81 +254,57 @@ impl Vault {
                 .trim();
             return Err(format!("could not decrypt {}: {last}", file.display()));
         }
-        let key = to_key(&out)?;
-        let token = new_token();
-        self.keys.lock().unwrap().insert(
-            service.to_string(),
-            Unlocked {
-                key,
-                token: token.clone(),
-                last_used: Instant::now(),
-            },
-        );
-        Ok(token)
+        to_key(&out)
     }
 
-    /// Lock one service, or all of them. Dropping `Unlocked` zeroes the key.
+    /// Lock one service, or all of them. Dropping the key zeroes it.
     pub fn lock(&self, service: Option<&str>) -> Vec<String> {
-        let mut keys = self.keys.lock().unwrap();
-        match service {
-            Some(s) => keys
-                .remove(s)
-                .map(|_| vec![s.to_string()])
-                .unwrap_or_default(),
-            None => keys.drain().map(|(k, _)| k).collect(),
-        }
-    }
-
-    /// Service for a request token (constant-time compare), marking it used.
-    pub fn take(&self, token: &str) -> Option<Use> {
-        let mut keys = self.keys.lock().unwrap();
-        let mut hit = None;
-        for (name, u) in keys.iter() {
-            if bool::from(u.token.as_bytes().ct_eq(token.as_bytes())) {
-                hit = Some(name.clone());
+        let mut slots = self.slots.lock().unwrap();
+        let mut locked = Vec::new();
+        for (name, s) in slots.iter_mut() {
+            if service.is_none_or(|x| x == name) && s.unlocked.take().is_some() {
+                locked.push(name.clone());
             }
         }
-        let name = hit?;
-        let u = keys.get_mut(&name)?;
-        u.last_used = Instant::now();
-        Some(Use {
-            service: name,
-            key: u.key.clone(),
-        })
+        locked
     }
 
     /// Lock every service unused for `idle_lock`; returns their names.
     pub fn sweep(&self) -> Vec<String> {
         let idle = self.cfg.idle_lock;
-        let mut keys = self.keys.lock().unwrap();
-        let old: Vec<String> = keys
-            .iter()
-            .filter(|(_, u)| u.last_used.elapsed() >= idle)
-            .map(|(k, _)| k.clone())
-            .collect();
-        for k in &old {
-            keys.remove(k);
+        let mut slots = self.slots.lock().unwrap();
+        let mut locked = Vec::new();
+        for (name, s) in slots.iter_mut() {
+            if s.unlocked
+                .as_ref()
+                .is_some_and(|u| u.last_used.elapsed() >= idle)
+            {
+                s.unlocked = None;
+                locked.push(name.clone());
+            }
         }
-        old
+        locked
     }
 
     /// (service, unlocked, seconds until idle lock)
     pub fn status(&self) -> Vec<(String, bool, u64)> {
-        let keys = self.keys.lock().unwrap();
+        let slots = self.slots.lock().unwrap();
         self.cfg
             .services
             .keys()
-            .map(|name| match keys.get(name) {
-                Some(u) => (
-                    name.clone(),
-                    true,
-                    self.cfg
-                        .idle_lock
-                        .saturating_sub(u.last_used.elapsed())
-                        .as_secs(),
-                ),
-                None => (name.clone(), false, 0),
-            })
+            .map(
+                |name| match slots.get(name).and_then(|s| s.unlocked.as_ref()) {
+                    Some(u) => (
+                        name.clone(),
+                        true,
+                        self.cfg
+                            .idle_lock
+                            .saturating_sub(u.last_used.elapsed())
+                            .as_secs(),
+                    ),
+                    None => (name.clone(), false, 0),
+                },
+            )
             .collect()
     }
 }
@@ -204,5 +329,28 @@ mod tests {
         assert_eq!(a.len(), 64);
         assert_ne!(a, b);
         assert!(a.bytes().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn token_file_is_stable_private_and_rotates() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = crate::config::parse(&format!(
+            "state_dir = \"{}\"\n[services.x]\nsecret = \"x/k\"\n[[services.x.routes]]\nprefix = \"/\"\nupstream = \"https://example.com\"\nallow = [\"GET /x\"]\n",
+            dir.path().display()
+        ))
+        .unwrap();
+        let a = token(&cfg, "x").unwrap();
+        assert_eq!(token(&cfg, "x").unwrap(), a);
+        let p = token_path(&cfg, "x");
+        assert_eq!(std::fs::metadata(&p).unwrap().mode() & 0o777, 0o600);
+        assert_eq!(
+            std::fs::metadata(p.parent().unwrap()).unwrap().mode() & 0o777,
+            0o700
+        );
+        let b = rotate_file(&cfg, "x").unwrap();
+        assert_ne!(a, b);
+        assert_eq!(token(&cfg, "x").unwrap(), b);
+        std::fs::write(&p, "junk").unwrap();
+        assert!(token(&cfg, "x").is_err());
     }
 }

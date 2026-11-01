@@ -1,14 +1,15 @@
-//! The daemon: TCP listener on 127.0.0.1 for proxied calls, Unix control socket (0700 dir) for unlock/lock/status.
+//! The daemon: HTTP on the fixed loopback address for proxied calls, Unix control socket (0700 dir) for
+//! unlock/lock/rotate/status. Normally run by launchd (`credproxy install`).
 
 use crate::config::{self, Config};
 use crate::log;
 use crate::proxy;
-use crate::vault::Vault;
+use crate::vault::{Vault, private_dir};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use serde_json::{Value, json};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,21 +19,6 @@ use tokio::sync::Notify;
 
 pub fn socket_path(cfg: &Config) -> PathBuf {
     cfg.runtime_dir.join("ctl.sock")
-}
-
-/// The runtime dir must be ours and private: anyone who can reach the socket can use unlocked keys.
-pub fn private_dir(dir: &Path) -> Result<(), String> {
-    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
-        .map_err(|e| format!("{}: {e}", dir.display()))?;
-    let m = std::fs::metadata(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    if m.uid() != unsafe { libc::getuid() } || m.mode() & 0o077 != 0 {
-        return Err(format!(
-            "{}: must be owned by you with mode 700",
-            dir.display()
-        ));
-    }
-    Ok(())
 }
 
 /// No core dumps (they would hold the key) and, on macOS, no debugger attach.
@@ -46,6 +32,19 @@ fn harden() {
     unsafe {
         const PT_DENY_ATTACH: libc::c_int = 31;
         libc::ptrace(PT_DENY_ATTACH, 0, std::ptr::null_mut(), 0);
+    }
+}
+
+/// `launchctl setenv` each client variable of `service`, so apps started from now on inherit them.
+pub fn publish_env(cfg: &Config, service: &str, token: &str) {
+    for (k, v) in cfg.client_env(service, token) {
+        let ok = std::process::Command::new("/bin/launchctl")
+            .args(["setenv", &k, &v])
+            .status()
+            .is_ok_and(|s| s.success());
+        if !ok {
+            log::line(&cfg.log, &format!("- launchctl setenv {k} failed"));
+        }
     }
 }
 
@@ -66,20 +65,28 @@ async fn serve(cfg: Config) -> Result<(), String> {
         return Err("already running".into());
     }
     let _ = std::fs::remove_file(&sock);
-    let tcp = TcpListener::bind("127.0.0.1:0")
+    let tcp = TcpListener::bind(cfg.listen)
         .await
-        .map_err(|e| e.to_string())?;
-    let port = tcp.local_addr().map_err(|e| e.to_string())?.port();
+        .map_err(|e| format!("{}: {e}", cfg.listen))?;
     let ctl = UnixListener::bind(&sock).map_err(|e| format!("{}: {e}", sock.display()))?;
     std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600))
         .map_err(|e| e.to_string())?;
 
-    let vault = Arc::new(Vault::new(cfg));
+    let vault = Arc::new(Vault::new(cfg)?);
+    if vault.cfg.launchd_env {
+        for s in vault.cfg.services.keys() {
+            publish_env(&vault.cfg, s, &vault.token(s).unwrap_or_default());
+        }
+    }
     let http = proxy::client();
     let stop = Arc::new(Notify::new());
     log::line(
         &vault.cfg.log,
-        &format!("- started pid {} port {port}", std::process::id()),
+        &format!(
+            "- started pid {} on {}",
+            std::process::id(),
+            vault.cfg.listen
+        ),
     );
 
     let sweeper = {
@@ -114,7 +121,7 @@ async fn serve(cfg: Config) -> Result<(), String> {
             a = ctl.accept() => {
                 let Ok((conn, _)) = a else { continue };
                 let (vault, stop) = (vault.clone(), stop.clone());
-                tokio::spawn(async move { control(conn, vault, port, stop).await });
+                tokio::spawn(async move { control(conn, vault, stop).await });
             }
             _ = stop.notified() => break,
             _ = term.recv() => break,
@@ -128,7 +135,7 @@ async fn serve(cfg: Config) -> Result<(), String> {
     Ok(())
 }
 
-async fn control(conn: UnixStream, vault: Arc<Vault>, port: u16, stop: Arc<Notify>) {
+async fn control(conn: UnixStream, vault: Arc<Vault>, stop: Arc<Notify>) {
     match conn.peer_cred() {
         Ok(c) if c.uid() == unsafe { libc::getuid() } => {}
         _ => return,
@@ -141,33 +148,40 @@ async fn control(conn: UnixStream, vault: Arc<Vault>, port: u16, stop: Arc<Notif
     }
     let req: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
     let service = req.get("service").and_then(|s| s.as_str());
-    let res = match req.get("op").and_then(|o| o.as_str()) {
-        Some("unlock") => match service {
-            Some(s) => match vault.unlock(s).await {
-                Ok(token) => {
-                    log::line(&vault.cfg.log, &format!("{s} unlocked"));
-                    json!({"ok": true, "url": format!("http://127.0.0.1:{port}/{token}"), "env": vault.cfg.services[s].env})
-                }
-                Err(e) => json!({"ok": false, "error": e}),
-            },
-            None => json!({"ok": false, "error": "no service"}),
+    let res = match (req.get("op").and_then(|o| o.as_str()), service) {
+        (Some("unlock"), Some(s)) => match vault.key(s, true).await {
+            Ok(_) => {
+                log::line(&vault.cfg.log, &format!("{s} unlocked"));
+                json!({"ok": true})
+            }
+            Err(e) => json!({"ok": false, "error": e}),
         },
-        Some("lock") => {
+        (Some("rotate"), Some(s)) => match vault.rotate(s) {
+            Ok(t) => {
+                if vault.cfg.launchd_env {
+                    publish_env(&vault.cfg, s, &t);
+                }
+                log::line(&vault.cfg.log, &format!("{s} token rotated"));
+                json!({"ok": true})
+            }
+            Err(e) => json!({"ok": false, "error": e}),
+        },
+        (Some("lock"), _) => {
             let locked = vault.lock(service);
             for s in &locked {
                 log::line(&vault.cfg.log, &format!("{s} locked"));
             }
             json!({"ok": true, "locked": locked})
         }
-        Some("status") => {
+        (Some("status"), _) => {
             let services: Vec<Value> = vault
                 .status()
                 .into_iter()
                 .map(|(name, unlocked, left)| json!({"name": name, "unlocked": unlocked, "locks_in_secs": left}))
                 .collect();
-            json!({"ok": true, "pid": std::process::id(), "port": port, "services": services})
+            json!({"ok": true, "pid": std::process::id(), "listen": vault.cfg.listen.to_string(), "services": services})
         }
-        Some("stop") => {
+        (Some("stop"), _) => {
             stop.notify_one();
             json!({"ok": true})
         }

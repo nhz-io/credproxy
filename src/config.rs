@@ -2,6 +2,7 @@
 
 use serde::Deserialize;
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -20,6 +21,12 @@ struct RawConfig {
     runtime_dir: String,
     #[serde(default = "default_log")]
     log: String,
+    #[serde(default = "default_listen")]
+    listen: String,
+    #[serde(default = "default_state_dir")]
+    state_dir: String,
+    #[serde(default = "default_true")]
+    launchd_env: bool,
     #[serde(default)]
     services: BTreeMap<String, RawService>,
 }
@@ -28,7 +35,8 @@ struct RawConfig {
 #[serde(deny_unknown_fields)]
 struct RawService {
     secret: String,
-    env: String,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
     #[serde(default)]
     auth: RawAuth,
     routes: Vec<RawRoute>,
@@ -80,6 +88,15 @@ fn default_runtime_dir() -> String {
 fn default_log() -> String {
     "~/Library/Logs/credproxy.log".into()
 }
+fn default_listen() -> String {
+    "127.0.0.1:7777".into()
+}
+fn default_state_dir() -> String {
+    "~/Library/Application Support/credproxy".into()
+}
+fn default_true() -> bool {
+    true
+}
 fn default_header() -> String {
     "Authorization".into()
 }
@@ -95,13 +112,20 @@ pub struct Config {
     pub secrets_dir: PathBuf,
     pub runtime_dir: PathBuf,
     pub log: PathBuf,
+    /// Loopback address clients call: http://<listen>/<service>/<route prefix>/...
+    pub listen: SocketAddr,
+    /// Holds tokens/<service> (0600): the stable per-service token clients present as their API key.
+    pub state_dir: PathBuf,
+    /// Publish each service's env (URLs + token) with `launchctl setenv`, so apps started later inherit it.
+    pub launchd_env: bool,
     pub services: BTreeMap<String, Service>,
 }
 
 #[derive(Debug)]
 pub struct Service {
     pub secret: PathBuf,
-    pub env: String,
+    /// Variables for clients: values may use {base} (http://<listen>/<service>) and {token}.
+    pub env: BTreeMap<String, String>,
     pub auth_header: String,
     pub auth_format: String,
     pub routes: Vec<Route>,
@@ -265,6 +289,38 @@ impl Service {
     }
 }
 
+fn check_listen(s: &str) -> Result<SocketAddr, String> {
+    let a: SocketAddr = s
+        .parse()
+        .map_err(|_| format!("listen {s:?}: expected 127.0.0.1:<port>"))?;
+    if !a.ip().is_loopback() {
+        return Err(format!("listen {s:?}: loopback addresses only"));
+    }
+    Ok(a)
+}
+
+impl Config {
+    /// Base URL of a service: http://<listen>/<service>
+    pub fn base_url(&self, service: &str) -> String {
+        format!("http://{}/{service}", self.listen)
+    }
+
+    /// The service's client variables with {base} and {token} filled in.
+    pub fn client_env(&self, service: &str, token: &str) -> Vec<(String, String)> {
+        let base = self.base_url(service);
+        self.services[service]
+            .env
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.clone(),
+                    v.replace("{base}", &base).replace("{token}", token),
+                )
+            })
+            .collect()
+    }
+}
+
 pub fn load(path: &Path) -> Result<Config, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
     parse(&text).map_err(|e| format!("{}: {e}", path.display()))
@@ -285,10 +341,9 @@ pub fn parse(text: &str) -> Result<Config, String> {
                 "service {name}: secret must be a relative path like \"{name}/api-key\""
             ));
         }
-        if !valid_env(&s.env) {
+        if let Some(k) = s.env.keys().find(|k| !valid_env(k)) {
             return Err(format!(
-                "service {name}: env {:?} is not an environment variable name",
-                s.env
+                "service {name}: env {k:?} is not an environment variable name"
             ));
         }
         if !s.auth.format.contains("{key}") {
@@ -363,6 +418,9 @@ pub fn parse(text: &str) -> Result<Config, String> {
         secrets_dir: expand(&raw.secrets_dir),
         runtime_dir: expand(&raw.runtime_dir),
         log: expand(&raw.log),
+        listen: check_listen(&raw.listen)?,
+        state_dir: expand(&raw.state_dir),
+        launchd_env: raw.launchd_env,
         services,
     })
 }
@@ -374,7 +432,7 @@ mod tests {
     const RUNPOD: &str = r#"
 [services.runpod]
 secret = "runpod/api-key"
-env = "RUNPOD_PROXY"
+env = { RUNPOD_API_URL = "{base}/v1", RUNPOD_API_KEY = "{token}" }
 [[services.runpod.routes]]
 prefix = "/graphql"
 upstream = "https://api.runpod.io/graphql"
@@ -388,6 +446,23 @@ prefix = "/v2"
 upstream = "https://api.runpod.io/v2"
 allow = ["GET /pods", "DELETE /pods/{id}", "GET /catalog/gpus"]
 "#;
+
+    #[test]
+    fn example_config_parses() {
+        let c = parse(include_str!("../examples/runpod.toml")).unwrap();
+        let env = c.client_env("runpod", "tok");
+        assert!(env.contains(&(
+            "RUNPOD_REST_V2_URL".to_string(),
+            "http://127.0.0.1:7777/runpod/v2".to_string()
+        )));
+        assert!(env.contains(&("RUNPOD_API_KEY".to_string(), "tok".to_string())));
+        let s = &c.services["runpod"];
+        assert_eq!(
+            s.route("/v1/pods").unwrap().0.upstream,
+            "https://rest.runpod.io/v1"
+        );
+        assert!(s.route("/invoke/x").is_none() && s.route("/pods").is_none());
+    }
 
     #[test]
     fn longest_prefix_wins() {
@@ -424,6 +499,17 @@ allow = ["GET /pods", "DELETE /pods/{id}", "GET /catalog/gpus"]
         let s = &c.services["runpod"];
         assert_eq!(s.secret, PathBuf::from("runpod/api-key.age"));
         assert_eq!(s.auth_format, "Bearer {key}");
+        assert_eq!(c.listen.to_string(), "127.0.0.1:7777");
+        assert_eq!(
+            c.client_env("runpod", "tok"),
+            [
+                ("RUNPOD_API_KEY".to_string(), "tok".to_string()),
+                (
+                    "RUNPOD_API_URL".to_string(),
+                    "http://127.0.0.1:7777/runpod/v1".to_string()
+                ),
+            ]
+        );
         let (r, rest) = s.route("/graphql").unwrap();
         assert!(r.graphql_queries.is_some());
         assert_eq!(rest, "");
@@ -468,7 +554,9 @@ allow = ["GET /pods", "DELETE /pods/{id}", "GET /catalog/gpus"]
         let bad = [
             RUNPOD.replace("https://api.runpod.io", "http://api.runpod.io"),
             RUNPOD.replace("runpod/api-key", "../api-key"),
-            RUNPOD.replace("RUNPOD_PROXY", "runpod-proxy"),
+            RUNPOD.replace("RUNPOD_API_URL", "runpod-url"),
+            format!("listen = \"0.0.0.0:7777\"\n{RUNPOD}"),
+            format!("listen = \"7777\"\n{RUNPOD}"),
             RUNPOD.replace("GET /pods/{id}", "GET pods"),
             RUNPOD.replace("prefix = \"/graphql\"", "prefix = \"/\""),
             format!("idle_lock = \"0h\"\n{RUNPOD}"),

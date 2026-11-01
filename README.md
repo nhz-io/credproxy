@@ -2,16 +2,18 @@
 
 A small local proxy for macOS that holds API keys in memory and adds them to allowed requests, so the
 programs (and AI agents) making those requests never see the keys. Keys stay sealed with
-[age](https://github.com/FiloSottile/age) on disk; one unlock (e.g. one Touch ID with
-[age-plugin-se](https://github.com/remko/age-plugin-se)) serves every call until it idles out or you lock it.
+[age](https://github.com/FiloSottile/age) on disk; the first request unlocks (e.g. one Touch ID with
+[age-plugin-se](https://github.com/remko/age-plugin-se)) and the key serves every call until it idles out or you
+lock it.
+
+Clients get a fixed URL and a **token** that they send as if it were the API key:
 
 ```bash
-credproxy run runpod -- python launcher.py sweep
+export RUNPOD_API_URL=http://127.0.0.1:7777/runpod/v1 RUNPOD_API_KEY=<token>
 ```
 
-The launcher gets `RUNPOD_PROXY=http://127.0.0.1:<port>/<token>` and calls `$RUNPOD_PROXY/pods`;
-credproxy checks the call against the service's allowlist, adds `Authorization: Bearer <key>`, forwards it over
-HTTPS and returns the reply with the key scrubbed out.
+credproxy checks the token, checks the call against the service's allowlist, swaps the token for the real key,
+forwards over HTTPS and returns the reply with the key scrubbed out. The token is useless anywhere but this proxy.
 
 ## Why
 
@@ -26,27 +28,34 @@ HTTPS and returns the reply with the key scrubbed out.
 
 | Piece | How |
 |---|---|
-| Unlock | `credproxy run <service>` starts the daemon if needed and asks it to unlock: it runs `age -d -i <identity> <secrets_dir>/<secret>.age` and reads the plaintext from a pipe into memory (zeroed on lock). The key must be one line of printable ASCII. |
-| Token | 256-bit random per unlock, compared in constant time; locking invalidates it. |
-| Lock | After `idle_lock` without use (default 12 h), on `credproxy lock [service]`, on `stop`, and when the daemon exits. |
-| Transport | Clients: HTTP on `127.0.0.1:<random port>`, path `/<token>/…`. Control: Unix socket `ctl.sock` (0600) in a 0700 runtime dir, peer uid checked. |
+| Daemon | LaunchAgent (`credproxy install`): starts at login, locked; restarted if it exits. |
+| URL | `http://<listen>/<service>/<route prefix>/…`, `listen` fixed (default `127.0.0.1:7777`, loopback only). |
+| Token | Per service, 256-bit random, in `<state_dir>/tokens/<service>` (0600, dir 0700); stable until `credproxy rotate`. The client sends it in the service's own auth header (e.g. `Authorization: Bearer <token>`); compared in constant time. Missing or wrong → 401. |
+| Client env | Per service `[env]` templates (`{base}`, `{token}`). The daemon publishes them with `launchctl setenv` at start and on rotate (apps launched later inherit them); `credproxy env` prints them as `export` lines for shell profiles. |
+| Unlock | On the first allowed request for a locked service (or `credproxy unlock`): `age -d -i <identity> <secrets_dir>/<secret>.age`, plaintext read from a pipe into memory (zeroed on lock). One line of printable ASCII. A failed unlock (Touch ID denied) blocks new prompts from requests for 30 s. |
+| Order | Token → allowlist → key. A request that would be refused never triggers an unlock. |
+| Lock | After `idle_lock` without use (default 12 h), on `credproxy lock [service]`, and when the daemon exits. |
 | Allowlist | Per route: `METHOD /path/{param}` rules (`{param}` = one segment of `[A-Za-z0-9._-]`, never `.`/`..`), or a GraphQL endpoint where only one `query` operation whose top-level fields are all listed passes (no mutations, subscriptions or fragments). Anything else → 403, never sent upstream. |
-| Upstream | HTTPS only (plain HTTP only to 127.0.0.1, for tests), no redirects followed, own `User-Agent: credproxy/<version>`, 60 s timeout. Only `Content-Type` and `Accept` are forwarded from the client; its `Authorization`, cookies and other headers are dropped. Request body ≤ 1 MiB, response ≤ 16 MiB. |
+| Upstream | HTTPS only (plain HTTP only to 127.0.0.1, for tests), no redirects followed, own `User-Agent: credproxy/<version>`, 60 s timeout. Only `Content-Type` and `Accept` are forwarded from the client; its auth header, cookies and other headers are dropped. Request body ≤ 1 MiB, response ≤ 16 MiB. |
 | Reply | Status, `Content-Type` and body, with every verbatim copy of the key replaced by `[REDACTED]`. |
+| Control | Unix socket `ctl.sock` (0600) in a 0700 runtime dir, peer uid checked: status, unlock, lock, rotate, stop. |
 | Log | `~/Library/Logs/credproxy.log` (0600): time, service, method, path, status, ms. No token, no query string, no key. |
 | Hardening | Core dumps off; on macOS the daemon requests `PT_DENY_ATTACH` (not tested by the test suite). |
 
 ## Limits (read these)
 
-- **Anything running as you can use an unlocked service**, within its allowlist — like ssh-agent. It can connect to
-  the control socket and get the URL. It cannot read the key through credproxy.
-- **Anything running as you can also trigger an unlock** of a locked service. That shows a Touch ID prompt
-  (with age-plugin-se); deny prompts you didn't expect.
+- **The token is in every process's environment** (by design, so every tool finds it) and in the token file. Anything
+  running as you can read it and use the proxy within the allowlist — like ssh-agent. It cannot get the key through
+  credproxy.
+- **Using a locked service raises a Touch ID prompt** (with age-plugin-se). Deny prompts you didn't expect.
 - **Root, or a process able to read the daemon's memory, can read the key.** Copies of it also pass through the
   HTTP client's buffers while a request is built; those are not zeroed.
+- **Other local users can reach the port**, but need the token (0600 file, your processes' env).
 - **Scrubbing catches the key verbatim only**, not encoded forms (base64, URL-encoded).
 - **The allowlist covers method and path.** Query strings and REST request bodies are passed through unchecked, so
   an allowed `POST /pods` can create any pod the API allows.
+- **`launchctl setenv` reaches apps started after it**, not ones already running; shells get the variables from
+  `credproxy env` in the profile.
 
 ## Install
 
@@ -54,8 +63,18 @@ HTTPS and returns the reply with the key scrubbed out.
 brew install --cask nhz-io/tap/credproxy
 ```
 
-Apple Silicon. Needs `age` (and `age-plugin-se` for a Secure Enclave identity) on `PATH`:
-`brew install age age-plugin-se`.
+Apple Silicon. Needs `age` (and `age-plugin-se` for a Secure Enclave identity): `brew install age age-plugin-se`.
+Write the config (below), then:
+
+```bash
+credproxy install
+```
+
+Shell profile (`~/.zshrc`), for terminals and tools started from them:
+
+```zsh
+(( $+commands[credproxy] )) && eval "$(credproxy env)"
+```
 
 ### Build from source
 
@@ -67,62 +86,51 @@ cargo test
 cargo install --locked --path .
 ```
 
-The tests need `age` and `age-keygen`; they use a throwaway identity and a fake key.
+The tests need `age` and `age-keygen`; they use a throwaway identity, a fake key and a free port, and never touch
+launchd.
 
 ## Config
 
-`~/.config/credproxy/config.toml` (or `$CREDPROXY_CONFIG`). Example: [examples/runpod.toml](examples/runpod.toml).
+`~/.config/credproxy/config.toml` (or `$CREDPROXY_CONFIG`). Full example: [examples/runpod.toml](examples/runpod.toml).
 
 ```toml
 idle_lock = "12h"                                  # s, m or h
-# age = "age"                                      # defaults shown
+listen = "127.0.0.1:7777"
+# launchd_env = true                               # defaults shown
+# age = "age"
 # identity = "~/.config/age/se-identity.txt"
 # secrets_dir = "~/.secrets"
+# state_dir = "~/Library/Application Support/credproxy"
 # runtime_dir = "~/Library/Caches/credproxy"
 # log = "~/Library/Logs/credproxy.log"
 
 [services.runpod]
 secret = "runpod/api-key"                          # ~/.secrets/runpod/api-key.age
-env = "RUNPOD_PROXY"                               # variable the child gets
-# auth = { header = "Authorization", format = "Bearer {key}" }
+# auth = { header = "Authorization", format = "Bearer {key}" }   # also how clients send the token
+
+[services.runpod.env]
+RUNPOD_API_URL = "{base}/v1"                       # {base} = http://127.0.0.1:7777/runpod
+RUNPOD_API_KEY = "{token}"
 
 [[services.runpod.routes]]
-prefix = "/graphql"                                # longest prefix wins
-upstream = "https://api.runpod.io/graphql"
-graphql_queries = ["gpuTypes"]
-
-[[services.runpod.routes]]
-prefix = "/"
+prefix = "/v1"                                     # longest prefix wins
 upstream = "https://rest.runpod.io/v1"
 allow = ["GET /pods", "POST /pods", "GET /pods/{id}", "DELETE /pods/{id}", "GET /billing/pods"]
 ```
 
-The daemon reads the config at start; after changing it, `credproxy stop` (the next `run` starts a new one).
+The daemon reads the config at start; after changing it, `credproxy stop` (launchd starts it again).
 
 ## Use
 
-```bash
-credproxy run <service> [--] <command> [args...]
-```
-
-```bash
-credproxy status
-```
-
-```bash
-credproxy lock [<service>]
-```
-
-```bash
-credproxy stop
-```
-
-A wrapper per tool keeps it short, e.g. `~/.local/bin/runpod`:
-
-```zsh
-#!/bin/zsh
-exec credproxy run runpod -- python -I ~/src/launcher.py "$@"
-```
+| Command | What |
+|---|---|
+| `credproxy status` | Running? Which services are unlocked, and for how long |
+| `credproxy unlock <service>` | Unlock now (e.g. before a long job), instead of on the first request |
+| `credproxy lock [<service>]` | Forget the key(s) now |
+| `credproxy rotate <service>` | New token; the old one stops working. New shells and apps get it |
+| `credproxy env [--launchctl]` | Client variables as `export` lines, or set them in launchd |
+| `credproxy install` / `uninstall` | LaunchAgent on/off (`uninstall` also unsets the launchd variables) |
+| `credproxy stop` | Stop the daemon (locks everything; launchd starts a fresh one) |
 
 ## License
 

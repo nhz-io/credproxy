@@ -6,7 +6,7 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -17,12 +17,17 @@ struct Env {
     dir: tempfile::TempDir,
     cfg: PathBuf,
     key: String,
+    base: String,
     hits: Arc<AtomicUsize>,
+    daemon: Option<Child>,
 }
 
 impl Drop for Env {
     fn drop(&mut self) {
         let _ = self.cli(&["stop"]);
+        if let Some(mut d) = self.daemon.take() {
+            let _ = d.wait();
+        }
     }
 }
 
@@ -76,11 +81,20 @@ fn sh(cmd: &mut Command) -> Output {
     o
 }
 
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
 async fn setup(idle: &str) -> Env {
     let dir = tempfile::Builder::new().prefix("cp").tempdir().unwrap();
     let d = dir.path();
     let hits = Arc::new(AtomicUsize::new(0));
     let port = upstream(hits.clone()).await;
+    let listen = free_port();
     let mut rnd = [0u8; 12];
     getrandom::fill(&mut rnd).unwrap();
     let key = format!(
@@ -107,14 +121,17 @@ async fn setup(idle: &str) -> Env {
         &cfg,
         format!(
             r#"idle_lock = "{idle}"
+listen = "127.0.0.1:{listen}"
+launchd_env = false
 identity = "{d}/id.txt"
 secrets_dir = "{d}/secrets"
 runtime_dir = "{d}/run"
+state_dir = "{d}/state"
 log = "{d}/credproxy.log"
 
 [services.fake]
 secret = "fake/api-key"
-env = "FAKE_PROXY"
+env = {{ FAKE_API_URL = "{{base}}/v1", FAKE_API_KEY = "{{token}}" }}
 
 [[services.fake.routes]]
 prefix = "/graphql"
@@ -122,7 +139,7 @@ upstream = "http://127.0.0.1:{port}/gql"
 graphql_queries = ["gpuTypes"]
 
 [[services.fake.routes]]
-prefix = "/"
+prefix = "/v1"
 upstream = "http://127.0.0.1:{port}/v1"
 allow = ["GET /pods", "GET /pods/{{id}}", "POST /pods", "GET /billing/pods"]
 "#,
@@ -130,12 +147,28 @@ allow = ["GET /pods", "GET /pods/{{id}}", "POST /pods", "GET /billing/pods"]
         ),
     )
     .unwrap();
-    Env {
+    let daemon = Command::new(BIN)
+        .arg("serve")
+        .env("CREDPROXY_CONFIG", &cfg)
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut env = Env {
         dir,
         cfg,
         key,
+        base: format!("http://127.0.0.1:{listen}/fake"),
         hits,
+        daemon: Some(daemon),
+    };
+    for _ in 0..100 {
+        if String::from_utf8_lossy(&env.cli(&["status"]).stdout).starts_with("running") {
+            return env;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    env.daemon.take().unwrap().kill().unwrap();
+    panic!("daemon did not start");
 }
 
 impl Env {
@@ -147,23 +180,30 @@ impl Env {
             .unwrap()
     }
 
-    /// Run a shell snippet through `credproxy run fake`, return its stdout.
-    fn run(&self, script: &str) -> String {
-        let o = self.cli(&["run", "fake", "--", "sh", "-c", script]);
-        assert!(
-            o.status.success(),
-            "run failed: {}",
-            String::from_utf8_lossy(&o.stderr)
-        );
-        String::from_utf8(o.stdout).unwrap()
-    }
-
-    fn url(&self) -> String {
-        self.run("printf %s \"$FAKE_PROXY\"")
+    /// FAKE_API_KEY from `credproxy env`: the token clients present.
+    fn token(&self) -> String {
+        let out = String::from_utf8(
+            sh(Command::new(BIN)
+                .arg("env")
+                .env("CREDPROXY_CONFIG", &self.cfg))
+            .stdout,
+        )
+        .unwrap();
+        let line = out
+            .lines()
+            .find(|l| l.starts_with("export FAKE_API_KEY="))
+            .expect("FAKE_API_KEY");
+        line.trim_start_matches("export FAKE_API_KEY=")
+            .trim_matches('\'')
+            .to_string()
     }
 
     fn log(&self) -> String {
         std::fs::read_to_string(self.dir.path().join("credproxy.log")).unwrap_or_default()
+    }
+
+    fn unlocked(&self) -> bool {
+        String::from_utf8_lossy(&self.cli(&["status"]).stdout).contains("fake: unlocked")
     }
 
     fn path(&self) -> &Path {
@@ -171,21 +211,22 @@ impl Env {
     }
 }
 
-async fn get(url: &str) -> (u16, String) {
-    let r = reqwest::Client::new()
+async fn get(url: &str, token: Option<&str>) -> (u16, String) {
+    let mut r = reqwest::Client::new()
         .get(url)
         .header("cookie", "session=leak")
-        .header("authorization", "Bearer client-supplied")
-        .header("x-extra", "1")
-        .send()
-        .await
-        .unwrap();
+        .header("x-extra", "1");
+    if let Some(t) = token {
+        r = r.header("authorization", format!("Bearer {t}"));
+    }
+    let r = r.send().await.unwrap();
     (r.status().as_u16(), r.text().await.unwrap())
 }
 
-async fn post(url: &str, body: serde_json::Value) -> (u16, String) {
+async fn post(url: &str, token: &str, body: serde_json::Value) -> (u16, String) {
     let r = reqwest::Client::new()
         .post(url)
+        .header("authorization", format!("Bearer {token}"))
         .header("content-type", "application/json")
         .body(body.to_string())
         .send()
@@ -197,42 +238,63 @@ async fn post(url: &str, body: serde_json::Value) -> (u16, String) {
 #[tokio::test(flavor = "multi_thread")]
 async fn proxies_allowed_calls_only() {
     let env = setup("12h").await;
-    let base = env.url();
-    assert!(base.starts_with("http://127.0.0.1:"), "{base}");
-    assert_eq!(
-        env.url(),
-        base,
-        "second run reuses the unlocked key and token"
-    );
+    let (base, tok) = (env.base.clone(), env.token());
+    assert_eq!(env.token(), tok, "token is stable");
 
-    // allowed: key added, own User-Agent, client auth/cookie/extra headers dropped, query passed, key scrubbed from reply
-    let (s, body) = get(&format!("{base}/pods/abc-1?x=1")).await;
+    // no token / wrong token: 401, and no unlock (no Touch ID for strangers)
+    assert_eq!(get(&format!("{base}/v1/pods"), None).await.0, 401);
+    assert_eq!(
+        get(&format!("{base}/v1/pods"), Some(&"0".repeat(64)))
+            .await
+            .0,
+        401
+    );
+    // right token but refused path: 403, still no unlock
+    assert_eq!(
+        get(&format!("{base}/v1/endpoints"), Some(&tok)).await.0,
+        403
+    );
+    assert!(!env.unlocked(), "refused calls must not unlock");
+    assert_eq!(env.hits.load(Ordering::SeqCst), 0);
+
+    // allowed: unlocks on demand, token replaced by the key, own User-Agent, other client headers dropped,
+    // query passed, key scrubbed from the reply
+    let (s, body) = get(&format!("{base}/v1/pods/abc-1?x=1"), Some(&tok)).await;
     assert_eq!(s, 200, "{body}");
+    assert!(env.unlocked());
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(v["path"], "/v1/pods/abc-1");
     assert_eq!(v["query"], "x=1");
     assert_eq!(v["auth"], "Bearer [REDACTED]");
     assert!(v["ua"].as_str().unwrap().starts_with("credproxy/"));
     assert!(v["cookie"].is_null() && v["x"].is_null());
-    assert!(!body.contains(&env.key));
-    let (s, _) = get(&format!("{base}/billing/pods?podId=abc&bucketSize=hour")).await;
-    assert_eq!(s, 200);
+    assert!(!body.contains(&env.key) && !body.contains(&tok));
+    assert_eq!(
+        get(
+            &format!("{base}/v1/billing/pods?podId=abc&bucketSize=hour"),
+            Some(&tok)
+        )
+        .await
+        .0,
+        200
+    );
 
     // denied before reaching upstream
     let before = env.hits.load(Ordering::SeqCst);
     for p in [
-        "/pods/a/b",
-        "/endpoints",
-        "/pods/..",
-        "/pods/%2e%2e",
-        "/user",
+        "/v1/pods/a/b",
+        "/v1/endpoints",
+        "/v1/pods/%2e%2e",
+        "/v1",
         "/",
+        "/v2/pods",
+        "/pods",
     ] {
-        let (s, _) = get(&format!("{base}{p}")).await;
-        assert_eq!(s, 403, "{p}");
+        assert_eq!(get(&format!("{base}{p}"), Some(&tok)).await.0, 403, "{p}");
     }
     let r = reqwest::Client::new()
-        .delete(format!("{base}/pods/x"))
+        .delete(format!("{base}/v1/pods/x"))
+        .header("authorization", format!("Bearer {tok}"))
         .send()
         .await
         .unwrap();
@@ -246,6 +308,7 @@ async fn proxies_allowed_calls_only() {
     // GraphQL: listed query passes, mutation and other fields don't
     let (s, body) = post(
         &format!("{base}/graphql"),
+        &tok,
         serde_json::json!({"query": "query { gpuTypes { id } }"}),
     )
     .await;
@@ -255,49 +318,76 @@ async fn proxies_allowed_calls_only() {
         "mutation { podTerminate(input: {podId: \"x\"}) }",
         "{ myself { pubKey } }",
     ] {
-        let (s, _) = post(&format!("{base}/graphql"), serde_json::json!({"query": q})).await;
-        assert_eq!(s, 403, "{q}");
+        assert_eq!(
+            post(
+                &format!("{base}/graphql"),
+                &tok,
+                serde_json::json!({"query": q})
+            )
+            .await
+            .0,
+            403,
+            "{q}"
+        );
     }
-    let (s, _) = get(&format!("{base}/graphql")).await;
-    assert_eq!(s, 403);
 
-    // wrong or missing token
-    let port_base = &base[..base.rfind('/').unwrap()];
-    let (s, _) = get(&format!("{port_base}/{}/pods", "0".repeat(64))).await;
-    assert_eq!(s, 404);
-    let (s, _) = get(&format!("{port_base}/pods")).await;
-    assert_eq!(s, 404);
+    // unknown service
+    let root = &base[..base.rfind('/').unwrap()];
+    assert_eq!(
+        get(&format!("{root}/other/v1/pods"), Some(&tok)).await.0,
+        404
+    );
 
     // log: method/path/status only — no key, token or query
     let log = env.log();
-    assert!(log.contains("fake GET /pods/abc-1 200"), "{log}");
-    assert!(log.contains("fake DELETE /pods/x 403"), "{log}");
-    let token = &base[base.rfind('/').unwrap() + 1..];
+    assert!(log.contains("fake GET /v1/pods/abc-1 200"), "{log}");
+    assert!(log.contains("fake GET /v1/pods 401"), "{log}");
+    assert!(log.contains("fake DELETE /v1/pods/x 403"), "{log}");
     assert!(
         !log.contains(&env.key)
-            && !log.contains(token)
+            && !log.contains(&tok)
             && !log.contains("x=1")
             && !log.contains("podId"),
         "{log}"
     );
 
-    // explicit lock: the old URL stops working, a new run unlocks with a new token
-    let o = env.cli(&["lock", "fake"]);
-    assert!(String::from_utf8_lossy(&o.stdout).contains("locked: fake"));
-    let (s, _) = get(&format!("{base}/pods")).await;
-    assert_eq!(s, 404);
-    assert_ne!(env.url(), base);
+    // lock: same token keeps working (unlocks again)
+    assert!(String::from_utf8_lossy(&env.cli(&["lock", "fake"]).stdout).contains("locked: fake"));
+    assert!(!env.unlocked());
+    assert_eq!(get(&format!("{base}/v1/pods"), Some(&tok)).await.0, 200);
+
+    // rotate: old token refused, new one works
+    assert!(env.cli(&["rotate", "fake"]).status.success());
+    let new = env.token();
+    assert_ne!(new, tok);
+    assert_eq!(get(&format!("{base}/v1/pods"), Some(&tok)).await.0, 401);
+    assert_eq!(get(&format!("{base}/v1/pods"), Some(&new)).await.0, 200);
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn key_not_in_argv_env_or_files() {
     let env = setup("12h").await;
-    // the child sees the proxy URL, not the key; ps -E shows argv + environment of every process we can see
-    let out = env.run("echo \"$FAKE_PROXY\"; ps -E -ww -ax -o pid=,command=");
-    assert!(
-        out.contains("FAKE_PROXY=http://127.0.0.1:"),
-        "child env should carry the URL"
+    let tok = env.token();
+    assert_eq!(
+        get(&format!("{}/v1/pods", env.base), Some(&tok)).await.0,
+        200
     );
+    assert!(env.unlocked());
+    // a client shell with the env; ps -E shows argv + environment of every process we can see
+    let o = Command::new("sh")
+        .args([
+            "-c",
+            &format!("eval \"$({BIN} env)\"; ps -E -ww -ax -o pid=,command="),
+        ])
+        .env("CREDPROXY_CONFIG", &env.cfg)
+        .output()
+        .unwrap();
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(
+        out.contains(&format!("FAKE_API_KEY={tok}")),
+        "client env carries the token"
+    );
+    assert!(out.contains("FAKE_API_URL=http://127.0.0.1:"));
     assert!(!out.contains(&env.key), "key visible in ps -E");
     // not vacuous: the daemon is in the listing, with its environment
     assert!(
@@ -305,10 +395,7 @@ async fn key_not_in_argv_env_or_files() {
             .any(|l| l.contains("credproxy serve") && l.contains("CREDPROXY_CONFIG=")),
         "daemon not in ps -E output"
     );
-    let status = String::from_utf8(env.cli(&["status"]).stdout).unwrap();
-    assert!(status.contains("fake: unlocked"), "{status}");
-    assert!(!status.contains(&env.key));
-    // nothing on disk holds it (runtime dir, log, config)
+    // nothing on disk holds it (state, runtime dir, log, config)
     for entry in walk(env.path()) {
         if entry.extension().is_some_and(|e| e == "age") {
             continue;
@@ -339,22 +426,42 @@ fn walk(p: &Path) -> Vec<PathBuf> {
 #[tokio::test(flavor = "multi_thread")]
 async fn idle_lock() {
     let env = setup("1s").await;
-    let base = env.url();
-    let (s, _) = get(&format!("{base}/pods")).await;
-    assert_eq!(s, 200);
+    let tok = env.token();
+    assert_eq!(
+        get(&format!("{}/v1/pods", env.base), Some(&tok)).await.0,
+        200
+    );
     tokio::time::sleep(Duration::from_millis(2500)).await;
-    let (s, _) = get(&format!("{base}/pods")).await;
-    assert_eq!(s, 404, "should have locked after 1s idle");
+    assert!(!env.unlocked(), "should have locked after 1s idle");
     assert!(env.log().contains("fake locked (idle)"));
+    assert_eq!(
+        get(&format!("{}/v1/pods", env.base), Some(&tok)).await.0,
+        200,
+        "next call unlocks again"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn bad_secret_fails_cleanly() {
+async fn failed_unlock_backs_off() {
     let env = setup("12h").await;
+    let tok = env.token();
     std::fs::write(env.path().join("secrets/fake/api-key.age"), b"not age").unwrap();
-    let o = env.cli(&["run", "fake", "--", "true"]);
+    let (s, body) = get(&format!("{}/v1/pods", env.base), Some(&tok)).await;
+    assert_eq!(s, 503);
+    assert!(body.contains("could not decrypt"), "{body}");
+    let (s, body) = get(&format!("{}/v1/pods", env.base), Some(&tok)).await;
+    assert_eq!(s, 503);
+    assert!(
+        body.contains("retry in"),
+        "no new prompt during back-off: {body}"
+    );
+    let o = env.cli(&["unlock", "fake"]);
     assert!(!o.status.success());
-    assert!(String::from_utf8_lossy(&o.stderr).contains("could not decrypt"));
-    let o = env.cli(&["run", "nope", "--", "true"]);
-    assert!(String::from_utf8_lossy(&o.stderr).contains("unknown service"));
+    assert!(
+        String::from_utf8_lossy(&o.stderr).contains("could not decrypt"),
+        "explicit unlock ignores back-off"
+    );
+    assert!(
+        String::from_utf8_lossy(&env.cli(&["unlock", "nope"]).stderr).contains("unknown service")
+    );
 }
