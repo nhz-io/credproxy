@@ -129,7 +129,6 @@ log = "{d}/credproxy.log"
 
 [services.fake]
 secret = "fake/api-key"
-token = "test-local-token"
 
 [[services.fake.routes]]
 prefix = "/graphql"
@@ -228,7 +227,8 @@ async fn post(url: &str, token: &str, body: serde_json::Value) -> (u16, String) 
 async fn proxies_allowed_calls_only() {
     let env = setup("12h").await;
     let (base, tok) = (env.base.clone(), env.token());
-    assert_eq!(tok, "test-local-token");
+    assert_eq!(tok.len(), 64);
+    assert_eq!(env.token(), tok, "same token until the daemon restarts");
 
     // a request that names another host (DNS rebinding) is refused before anything else, and never unlocks
     let port = base
@@ -453,5 +453,41 @@ async fn failed_unlock_backs_off() {
     );
     assert!(
         String::from_utf8_lossy(&env.cli(&["unlock", "nope"]).stderr).contains("unknown service")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn token_changes_on_restart() {
+    let mut env = setup("12h").await;
+    let old = env.token();
+    assert_eq!(
+        get(&format!("{}/v1/pods", env.base), Some(&old)).await.0,
+        200
+    );
+    assert!(env.cli(&["stop"]).status.success());
+    env.daemon.take().unwrap().wait().unwrap();
+    env.daemon = Some(
+        Command::new(BIN)
+            .arg("serve")
+            .env("CREDPROXY_CONFIG", &env.cfg)
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    for _ in 0..100 {
+        if String::from_utf8_lossy(&env.cli(&["status"]).stdout).starts_with("running") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let new = env.token();
+    assert_ne!(new, old, "new token after restart");
+    assert_eq!(
+        get(&format!("{}/v1/pods", env.base), Some(&old)).await.0,
+        401
+    );
+    assert_eq!(
+        get(&format!("{}/v1/pods", env.base), Some(&new)).await.0,
+        200
     );
 }

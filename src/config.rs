@@ -31,7 +31,6 @@ struct RawConfig {
 #[serde(deny_unknown_fields)]
 struct RawService {
     secret: String,
-    token: String,
     #[serde(default)]
     auth: RawAuth,
     routes: Vec<RawRoute>,
@@ -109,8 +108,6 @@ pub struct Config {
 #[derive(Debug)]
 pub struct Service {
     pub secret: PathBuf,
-    /// What clients send in place of the key. Not a secret: only accepted from this machine (see proxy.rs).
-    pub token: String,
     pub auth_header: String,
     pub auth_format: String,
     pub routes: Vec<Route>,
@@ -298,14 +295,6 @@ pub fn parse(text: &str) -> Result<Config, String> {
                 "service {name}: secret must be a relative path like \"{name}/api-key\""
             ));
         }
-        if s.token.is_empty()
-            || s.token.len() > 256
-            || !s.token.bytes().all(|b| (0x21..=0x7e).contains(&b))
-        {
-            return Err(format!(
-                "service {name}: token must be 1-256 printable characters without spaces (e.g. \"credproxy-local\")"
-            ));
-        }
         if !s.auth.format.contains("{key}") {
             return Err(format!("service {name}: auth.format must contain {{key}}"));
         }
@@ -364,7 +353,6 @@ pub fn parse(text: &str) -> Result<Config, String> {
             name.clone(),
             Service {
                 secret: PathBuf::from(format!("{}.age", s.secret)),
-                token: s.token,
                 auth_header: s.auth.header,
                 auth_format: s.auth.format,
                 routes,
@@ -390,7 +378,6 @@ mod tests {
     const RUNPOD: &str = r#"
 [services.runpod]
 secret = "runpod/api-key"
-token = "credproxy-local"
 [[services.runpod.routes]]
 prefix = "/graphql"
 upstream = "https://api.runpod.io/graphql"
@@ -409,7 +396,6 @@ allow = ["GET /pods", "DELETE /pods/{id}", "GET /catalog/gpus"]
     fn example_config_parses() {
         let c = parse(include_str!("../examples/runpod.toml")).unwrap();
         let s = &c.services["runpod"];
-        assert_eq!(s.token, "credproxy-local");
         assert_eq!(c.listen.to_string(), "127.0.0.1:7777");
         assert_eq!(
             s.route("/v1/pods").unwrap().0.upstream,
@@ -499,8 +485,6 @@ allow = ["GET /pods", "DELETE /pods/{id}", "GET /catalog/gpus"]
         let bad = [
             RUNPOD.replace("https://api.runpod.io", "http://api.runpod.io"),
             RUNPOD.replace("runpod/api-key", "../api-key"),
-            RUNPOD.replace("token = \"credproxy-local\"", "token = \"two words\""),
-            RUNPOD.replace("token = \"credproxy-local\"\n", ""),
             format!("listen = \"0.0.0.0:7777\"\n{RUNPOD}"),
             format!("listen = \"7777\"\n{RUNPOD}"),
             RUNPOD.replace("GET /pods/{id}", "GET pods"),

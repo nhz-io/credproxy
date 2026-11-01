@@ -1,4 +1,5 @@
-//! Keys in memory: age decrypts on first use (one Touch ID), idle lock.
+//! Keys in memory (age decrypts on first use: one Touch ID), idle lock, and per-service tokens that exist only
+//! in memory: random at every daemon start, handed out over the control socket.
 
 use crate::config::Config;
 use std::collections::HashMap;
@@ -21,6 +22,7 @@ struct Unlocked {
 
 #[derive(Default)]
 struct Slot {
+    token: String,
     unlocked: Option<Unlocked>,
     failed_at: Option<Instant>,
 }
@@ -46,6 +48,12 @@ pub fn private_dir(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn new_token() -> String {
+    let mut b = [0u8; 32];
+    getrandom::fill(&mut b).expect("getrandom");
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
 /// age output → key: one line of visible ASCII (anything else could split a header).
 fn to_key(raw: &[u8]) -> Result<Zeroizing<String>, String> {
     let mut end = raw.len();
@@ -66,19 +74,40 @@ fn to_key(raw: &[u8]) -> Result<Zeroizing<String>, String> {
 
 impl Vault {
     pub fn new(cfg: Config) -> Self {
+        let slots = cfg
+            .services
+            .keys()
+            .map(|name| {
+                (
+                    name.clone(),
+                    Slot {
+                        token: new_token(),
+                        ..Slot::default()
+                    },
+                )
+            })
+            .collect();
         Vault {
             cfg,
-            slots: Mutex::new(HashMap::new()),
+            slots: Mutex::new(slots),
             unlocking: tokio::sync::Mutex::new(()),
         }
     }
 
     /// Does `presented` equal the service's token? Constant time; unknown services never match.
     pub fn check_token(&self, service: &str, presented: &[u8]) -> bool {
-        self.cfg
-            .services
+        let slots = self.slots.lock().unwrap();
+        slots
             .get(service)
             .is_some_and(|s| bool::from(s.token.as_bytes().ct_eq(presented)))
+    }
+
+    pub fn token(&self, service: &str) -> Option<String> {
+        self.slots
+            .lock()
+            .unwrap()
+            .get(service)
+            .map(|s| s.token.clone())
     }
 
     fn cached(&self, service: &str) -> Option<Zeroizing<String>> {
@@ -227,6 +256,14 @@ impl Vault {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tokens_are_random_hex() {
+        let (a, b) = (new_token(), new_token());
+        assert_eq!(a.len(), 64);
+        assert_ne!(a, b);
+        assert!(a.bytes().all(|c| c.is_ascii_hexdigit()));
+    }
 
     #[test]
     fn key_parsing() {

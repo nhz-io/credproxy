@@ -138,6 +138,10 @@ async fn control(conn: UnixStream, vault: Arc<Vault>, stop: Arc<Notify>) {
             }
             Err(e) => json!({"ok": false, "error": e}),
         },
+        (Some("token"), Some(s)) => match vault.token(s) {
+            Some(t) => json!({"ok": true, "token": t}),
+            None => json!({"ok": false, "error": format!("unknown service {s:?}")}),
+        },
         (Some("lock"), _) => {
             let locked = vault.lock(service);
             for s in &locked {

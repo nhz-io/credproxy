@@ -6,10 +6,10 @@ programs (and AI agents) making those requests never see the keys. Keys stay sea
 [age-plugin-se](https://github.com/remko/age-plugin-se)) and the key serves every call until it idles out or you
 lock it.
 
-Clients get a fixed URL and send a **token** from the config where the API key would go:
+Clients get a fixed URL and send a **token** where the API key would go:
 
 ```bash
-curl -H "Authorization: Bearer credproxy-local" http://127.0.0.1:7777/runpod/v1/pods
+curl -H "Authorization: Bearer $(credproxy token runpod)" http://127.0.0.1:7777/runpod/v1/pods
 ```
 
 credproxy checks that the request comes from this machine and carries the token, checks it against the service's
@@ -31,14 +31,14 @@ allowlist, swaps the token for the real key, forwards over HTTPS and returns the
 | Daemon | LaunchAgent (`credproxy install`): starts at login, locked; restarted if it exits. |
 | URL | `http://<listen>/<service>/<route prefix>/…`, `listen` fixed (default `127.0.0.1:7777`, loopback only). |
 | Host check | Every request must say `Host: 127.0.0.1:<port>` (or `localhost:<port>`), else 403. A DNS-rebinding web page reaches 127.0.0.1 under its own domain name, which the browser puts in `Host`. |
-| Token | Per service, in the config (`token = "credproxy-local"`). Not a secret on a single-user Mac: what it guards against is browsers, and they can't send an `Authorization` header to another site without the server's consent (credproxy never gives it). The client sends it in the service's own auth header (e.g. `Authorization: Bearer <token>`); compared in constant time. Missing or wrong → 401. |
+| Token | Per service, random (256 bits) at every daemon start, **in memory only**: never written to disk. Clients get it with `credproxy token <service>` (control socket below) and send it in the service's own auth header (e.g. `Authorization: Bearer <token>`); compared in constant time. Missing or wrong → 401. After a daemon restart the old token gets 401: fetch the token at the start of a run, and again on a 401. |
 | Unlock | On the first allowed request for a locked service (or `credproxy unlock`): `age -d -i <identity> <secrets_dir>/<secret>.age`, plaintext read from a pipe into memory (zeroed on lock). One line of printable ASCII. A failed unlock (Touch ID denied) blocks new prompts from requests for 30 s. |
 | Order | Host → token → allowlist → key. A request that would be refused never triggers an unlock. |
 | Lock | After `idle_lock` without use (default 12 h), on `credproxy lock [service]`, and when the daemon exits. |
 | Allowlist | Per route: `METHOD /path/{param}` rules (`{param}` = one segment of `[A-Za-z0-9._-]`, never `.`/`..`), or a GraphQL endpoint where only one `query` operation whose top-level fields are all listed passes (no mutations, subscriptions or fragments). Anything else → 403, never sent upstream. |
 | Upstream | HTTPS only (plain HTTP only to 127.0.0.1, for tests), no redirects followed, own `User-Agent: credproxy/<version>`, 60 s timeout. Only `Content-Type` and `Accept` are forwarded from the client; its auth header, cookies and other headers are dropped. Request body ≤ 1 MiB, response ≤ 16 MiB. |
 | Reply | Status, `Content-Type` and body, with every verbatim copy of the key replaced by `[REDACTED]`. |
-| Control | Unix socket `ctl.sock` (0600) in a 0700 runtime dir, peer uid checked: status, unlock, lock, stop. |
+| Control | Unix socket `ctl.sock` (0600) in a 0700 runtime dir, peer uid checked: token, status, unlock, lock, stop. |
 | Log | `~/Library/Logs/credproxy.log` (0600): time, service, method, path, status, ms. No token, no query string, no key. |
 | Hardening | Core dumps off; on macOS the daemon requests `PT_DENY_ATTACH` (not tested by the test suite). |
 
@@ -46,8 +46,8 @@ allowlist, swaps the token for the real key, forwards over HTTPS and returns the
 
 - **Anything running as you can use an unlocked service**, within its allowlist — like ssh-agent. It cannot get the
   key through credproxy.
-- **Other user accounts on the Mac** can reach the port. On a Mac shared with other people, use a random token and keep
-  that config out of any repo.
+- **Other user accounts on the Mac** can reach the port, but can't get the token (it is only handed out over the
+  control socket, to your user).
 - **Using a locked service raises a Touch ID prompt** (with age-plugin-se). Deny prompts you didn't expect.
 - **Root, or a process able to read the daemon's memory, can read the key.** Copies of it also pass through the
   HTTP client's buffers while a request is built; those are not zeroed.
@@ -96,7 +96,6 @@ listen = "127.0.0.1:7777"
 
 [services.runpod]
 secret = "runpod/api-key"                          # ~/.secrets/runpod/api-key.age
-token = "credproxy-local"                          # what clients send instead of the key
 # auth = { header = "Authorization", format = "Bearer {key}" }   # also how clients send the token
 
 [[services.runpod.routes]]
@@ -114,7 +113,7 @@ The daemon reads the config at start; after changing it, `credproxy stop` (launc
 | `credproxy status` | Running? Which services are unlocked, and for how long |
 | `credproxy unlock <service>` | Unlock now (e.g. before a long job), instead of on the first request |
 | `credproxy lock [<service>]` | Forget the key(s) now |
-| `credproxy token <service>` | Print the token, for clients that read it instead of hard-coding it |
+| `credproxy token <service>` | Print the current token (changes at every daemon start) |
 | `credproxy install` / `uninstall` | LaunchAgent on/off |
 | `credproxy stop` | Stop the daemon (locks everything; launchd starts a fresh one) |
 

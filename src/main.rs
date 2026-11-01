@@ -16,7 +16,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 const USAGE: &str = "usage:
-  credproxy token <service>       print the token clients send as their API key (from the config)
+  credproxy token <service>       print the token clients send as their API key (new at every daemon start)
   credproxy status                which services are unlocked, and for how long
   credproxy unlock <service>      unlock now (Touch ID); otherwise the first request unlocks
   credproxy lock [<service>]      forget the key(s) now
@@ -193,7 +193,17 @@ fn main() {
         s
     };
     match cmd {
-        "token" => println!("{}", cfg.services[need_service()].token),
+        "token" => {
+            let s = need_service();
+            let v = request(&sock, &json!({"op": "token", "service": s}), short)
+                .unwrap_or_else(|e| die(&e));
+            println!(
+                "{}",
+                v["token"]
+                    .as_str()
+                    .unwrap_or_else(|| die("bad answer from daemon"))
+            );
+        }
         "install" => install(&cfg_path).unwrap_or_else(|e| die(&e)),
         "unlock" => {
             let s = need_service();

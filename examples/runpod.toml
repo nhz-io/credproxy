@@ -5,10 +5,9 @@ listen = "127.0.0.1:7777"
 
 # RunPod, for a rented-GPU launcher: create, inspect and delete pods, GPU prices, billing. Nothing else.
 # Clients call http://127.0.0.1:7777/runpod/v1/... and http://127.0.0.1:7777/runpod/graphql
-# with "Authorization: Bearer <token>".
+# with "Authorization: Bearer $(credproxy token runpod)".
 [services.runpod]
 secret = "runpod/api-key"
-token = "credproxy-local"       # not a secret: accepted only from this machine (see README, Limits)
 
 [[services.runpod.routes]]
 prefix = "/v1"
