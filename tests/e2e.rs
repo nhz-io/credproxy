@@ -391,8 +391,11 @@ async fn proxies_allowed_calls_only() {
         );
     }
 
-    // unknown service
+    // unknown service: same 401 and same text as a wrong token, so service names can't be probed
     let root = &base[..base.rfind('/').unwrap()];
+    let (s1, b1) = get(&format!("{root}/other/v1/pods"), None).await;
+    let (s2, b2) = get(&format!("{base}/v1/pods"), None).await;
+    assert_eq!((s1, &b1), (s2, &b2));
     assert_eq!(
         get(&format!("{root}/other/v1/pods"), Some(&tok)).await.0,
         401
@@ -594,6 +597,7 @@ async fn lock_aborts_a_pending_unlock() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert_eq!(marked(), 2, "age and its plugin are running");
+    assert!(String::from_utf8_lossy(&env.cli(&["status"]).stdout).contains("fake: unlocking"));
     assert!(String::from_utf8_lossy(&env.cli(&["lock", "fake"]).stdout).contains("locked: fake"));
     let (s, body) = waiting.await.unwrap();
     assert_eq!(s, 503);
@@ -601,6 +605,11 @@ async fn lock_aborts_a_pending_unlock() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(marked(), 0, "lock killed age and its plugin");
     assert!(!env.unlocked());
+    // like pressing Cancel: the next request doesn't raise a new prompt
+    let (s, body) = get(&format!("{}/v1/pods", env.base), Some(&env.token())).await;
+    assert_eq!(s, 503);
+    assert!(body.contains("retry in"), "{body}");
+    assert_eq!(marked(), 0, "no new unlock started");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -620,4 +629,79 @@ async fn second_instance_leaves_the_first_alone() {
         String::from_utf8_lossy(&env.cli(&["status"]).stdout).starts_with("running"),
         "first daemon still reachable"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn connection_limit_is_logged_and_recovers() {
+    let env = setup("12h").await;
+    let tok = env.token();
+    let port: u16 = env
+        .base
+        .trim_start_matches("http://127.0.0.1:")
+        .split('/')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    // 64 connections that never send anything (no token needed to open them)
+    let idle: Vec<_> = (0..64)
+        .map(|_| std::net::TcpStream::connect(("127.0.0.1", port)).unwrap())
+        .collect();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        reqwest::Client::new()
+            .get(format!("{}/v1/pods", env.base))
+            .send()
+            .await
+            .is_err(),
+        "over the cap"
+    );
+    assert!(
+        env.log().contains("connection limit (64) reached"),
+        "{}",
+        env.log()
+    );
+    drop(idle);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        get(&format!("{}/v1/pods", env.base), Some(&tok)).await.0,
+        200
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn busy_port_is_retried() {
+    let mut env = setup("12h").await;
+    let port: u16 = env
+        .base
+        .trim_start_matches("http://127.0.0.1:")
+        .split('/')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(env.cli(&["stop"]).status.success());
+    env.daemon.take().unwrap().wait().unwrap();
+    // something else holds the port while the daemon starts
+    let squatter = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+    env.daemon = Some(
+        Command::new(BIN)
+            .arg("serve")
+            .env("CREDPROXY_CONFIG", &env.cfg)
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(!String::from_utf8_lossy(&env.cli(&["status"]).stdout).starts_with("running"));
+    drop(squatter);
+    let mut up = false;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if String::from_utf8_lossy(&env.cli(&["status"]).stdout).starts_with("running") {
+            up = true;
+            break;
+        }
+    }
+    assert!(up, "daemon took the port once it was free");
 }

@@ -258,6 +258,18 @@ impl Vault {
         let wait = async {
             let (a, b) = tokio::join!(so.read_to_end(&mut out), se.read_to_end(&mut err));
             a.and(b).map_err(|e| e.to_string())?;
+            // age is done. Forget its process group before reaping it: once reaped, the id can be reused, and
+            // `lock` must never signal someone else's group.
+            if let Some(p) = self
+                .slots
+                .lock()
+                .unwrap()
+                .get_mut(service)
+                .and_then(|s| s.pending.as_mut())
+                .filter(|p| p.id == id)
+            {
+                p.pgid = None;
+            }
             child.wait().await.map_err(|e| e.to_string())
         };
         let status = match tokio::time::timeout(UNLOCK_TIMEOUT, wait).await {
@@ -298,6 +310,8 @@ impl Vault {
                 if let Some(g) = p.pgid {
                     kill_group(g);
                 }
+                // same as pressing Cancel: requests don't raise a new prompt for UNLOCK_BACKOFF
+                s.failed_at = Some(Instant::now());
                 p.done
                     .send_replace(Some(Err("locked while waiting for Touch ID".into())));
             }
@@ -325,8 +339,8 @@ impl Vault {
         locked
     }
 
-    /// (service, unlocked, seconds until idle lock)
-    pub fn status(&self) -> Vec<(String, bool, u64)> {
+    /// (service, "unlocked" | "unlocking" | "locked", seconds until idle lock)
+    pub fn status(&self) -> Vec<(String, &'static str, u64)> {
         let slots = self.slots.lock().unwrap();
         self.cfg
             .services
@@ -335,13 +349,16 @@ impl Vault {
                 |name| match slots.get(name).and_then(|s| s.unlocked.as_ref()) {
                     Some(u) => (
                         name.clone(),
-                        true,
+                        "unlocked",
                         self.cfg
                             .idle_lock
                             .saturating_sub(u.last_used.elapsed())
                             .as_secs(),
                     ),
-                    None => (name.clone(), false, 0),
+                    None if slots.get(name).is_some_and(|s| s.pending.is_some()) => {
+                        (name.clone(), "unlocking", 0)
+                    }
+                    None => (name.clone(), "locked", 0),
                 },
             )
             .collect()

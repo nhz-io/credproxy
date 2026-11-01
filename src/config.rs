@@ -275,6 +275,11 @@ fn check_listen(s: &str) -> Result<SocketAddr, String> {
     if !a.ip().is_loopback() {
         return Err(format!("listen {s:?}: loopback addresses only"));
     }
+    if a.port() == 0 {
+        return Err(format!(
+            "listen {s:?}: needs a fixed port (clients use a fixed URL)"
+        ));
+    }
     Ok(a)
 }
 
@@ -492,6 +497,7 @@ allow = ["GET /pods", "DELETE /pods/{id}", "GET /catalog/gpus"]
             RUNPOD.replace("runpod/api-key", "../api-key"),
             format!("listen = \"0.0.0.0:7777\"\n{RUNPOD}"),
             format!("listen = \"7777\"\n{RUNPOD}"),
+            format!("listen = \"127.0.0.1:0\"\n{RUNPOD}"),
             RUNPOD.replace("GET /pods/{id}", "GET pods"),
             RUNPOD.replace("prefix = \"/graphql\"", "prefix = \"/\""),
             format!("idle_lock = \"0h\"\n{RUNPOD}"),

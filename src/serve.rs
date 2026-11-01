@@ -38,6 +38,13 @@ fn harden() {
 pub fn run(cfg_path: &Path) -> Result<(), String> {
     let cfg = config::load(cfg_path)?;
     harden();
+    // Any panic ends the process: launchd restarts it after a crash. Without this a panic could leave a daemon
+    // that runs but fails every request (e.g. a poisoned lock) and is never restarted.
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default(info);
+        std::process::abort();
+    }));
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -47,15 +54,41 @@ pub fn run(cfg_path: &Path) -> Result<(), String> {
 
 /// At most this many client connections at once; more are closed right away.
 const MAX_CONNECTIONS: usize = 64;
+/// One request per connection, and no connection lives longer than this (unlock wait + upstream + slack).
+const CONNECTION_LIFETIME: Duration = Duration::from_secs(300);
+/// How long to keep trying the port when it's busy (e.g. the previous daemon still releasing it).
+const BIND_RETRY: Duration = Duration::from_secs(30);
+
+/// Bind the port, retrying while something else holds it. If it's our own daemon, give up at once.
+async fn bind(cfg: &Config, sock: &Path) -> Result<TcpListener, String> {
+    let start = std::time::Instant::now();
+    loop {
+        match TcpListener::bind(cfg.listen).await {
+            Ok(l) => return Ok(l),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                if UnixStream::connect(sock).await.is_ok() {
+                    return Err("already running".into());
+                }
+                if start.elapsed() >= BIND_RETRY {
+                    return Err(format!(
+                        "{}: still in use after {}s",
+                        cfg.listen,
+                        BIND_RETRY.as_secs()
+                    ));
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            Err(e) => return Err(format!("{}: {e}", cfg.listen)),
+        }
+    }
+}
 
 async fn serve(cfg: Config) -> Result<(), String> {
     private_dir(&cfg.runtime_dir)?;
     let sock = socket_path(&cfg);
     // The port is the single-instance lock: bind it before touching the socket, so a second instance fails
     // here instead of deleting the running daemon's socket.
-    let tcp = TcpListener::bind(cfg.listen)
-        .await
-        .map_err(|e| format!("{}: {e} (already running?)", cfg.listen))?;
+    let tcp = bind(&cfg, &sock).await?;
     if UnixStream::connect(&sock).await.is_ok() {
         return Err("already running".into());
     }
@@ -68,6 +101,7 @@ async fn serve(cfg: Config) -> Result<(), String> {
     let http = proxy::client();
     let stop = Arc::new(Notify::new());
     let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    let mut full_logged: Option<std::time::Instant> = None;
     log::line(
         &vault.cfg.log,
         &format!(
@@ -101,7 +135,13 @@ async fn serve(cfg: Config) -> Result<(), String> {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     continue;
                 };
-                let Ok(permit) = slots.clone().try_acquire_owned() else { continue };
+                let Ok(permit) = slots.clone().try_acquire_owned() else {
+                    if full_logged.is_none_or(|t| t.elapsed() >= Duration::from_secs(60)) {
+                        log::line(&vault.cfg.log, &format!("- connection limit ({MAX_CONNECTIONS}) reached: refusing connections"));
+                        full_logged = Some(std::time::Instant::now());
+                    }
+                    continue;
+                };
                 let (vault, http) = (vault.clone(), http.clone());
                 tokio::spawn(async move {
                     let _permit = permit;
@@ -109,11 +149,12 @@ async fn serve(cfg: Config) -> Result<(), String> {
                         let (vault, http) = (vault.clone(), http.clone());
                         async move { Ok::<_, std::convert::Infallible>(proxy::handle(vault, http, req).await) }
                     });
-                    let _ = http1::Builder::new()
+                    let conn = http1::Builder::new()
                         .timer(TokioTimer::new())
                         .header_read_timeout(Duration::from_secs(10))
-                        .serve_connection(TokioIo::new(conn), svc)
-                        .await;
+                        .keep_alive(false)
+                        .serve_connection(TokioIo::new(conn), svc);
+                    let _ = tokio::time::timeout(CONNECTION_LIFETIME, conn).await;
                 });
             }
             a = ctl.accept() => {
@@ -169,7 +210,7 @@ async fn control(conn: UnixStream, vault: Arc<Vault>, stop: Arc<Notify>) {
             let services: Vec<Value> = vault
                 .status()
                 .into_iter()
-                .map(|(name, unlocked, left)| json!({"name": name, "unlocked": unlocked, "locks_in_secs": left}))
+                .map(|(name, state, left)| json!({"name": name, "state": state, "locks_in_secs": left}))
                 .collect();
             json!({"ok": true, "pid": std::process::id(), "listen": vault.cfg.listen.to_string(), "services": services})
         }

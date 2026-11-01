@@ -74,6 +74,20 @@ fn plist_path() -> PathBuf {
     home().join(format!("Library/LaunchAgents/{LABEL}.plist"))
 }
 
+/// A macOS notification, only when launchd runs us (never from tests or a terminal).
+fn notify_if_launchd(msg: &str) {
+    if std::env::var("XPC_SERVICE_NAME").as_deref() != Ok(LABEL) {
+        return;
+    }
+    let quoted = msg.replace('\\', "\\\\").replace('"', "\\\"");
+    let _ = Command::new("/usr/bin/osascript")
+        .args([
+            "-e",
+            &format!("display notification \"{quoted}\" with title \"credproxy\""),
+        ])
+        .status();
+}
+
 fn launchctl(args: &[&str]) -> bool {
     Command::new("/bin/launchctl")
         .args(args)
@@ -190,9 +204,10 @@ fn main() {
     let cfg_path = config_path();
     if cmd == "serve" {
         if let Err(e) = serve::run(&cfg_path) {
-            // Exit 0 on purpose: launchd restarts only on failure, and a bad config or a busy port won't fix
-            // itself by retrying every 10 s. The message is in credproxy.err.log.
+            // Exit 0 on purpose: launchd restarts only after a crash, and a bad config won't fix itself by
+            // restarting every 10 s. The message is in credproxy.err.log, and a notification says so.
             eprintln!("credproxy: {e}");
+            notify_if_launchd(&format!("credproxy is not running: {e}"));
         }
         return;
     }
@@ -201,8 +216,19 @@ fn main() {
         if !launchctl(&["kickstart", "-k", &target]) {
             die("not installed (credproxy install)");
         }
-        println!("restarted");
-        return;
+        // kickstart returns once launchd started it; check it actually came up (a bad config exits at once)
+        let sock = config::load(&cfg_path).map(|c| serve::socket_path(&c));
+        for _ in 0..30 {
+            std::thread::sleep(Duration::from_millis(100));
+            if sock
+                .as_ref()
+                .is_ok_and(|s| request(s, &json!({"op": "status"}), Duration::from_secs(2)).is_ok())
+            {
+                println!("restarted");
+                return;
+            }
+        }
+        die("did not come up; see ~/Library/Logs/credproxy.err.log");
     }
     if cmd == "uninstall" {
         uninstall();
@@ -277,15 +303,19 @@ fn main() {
                 );
                 for s in v["services"].as_array().into_iter().flatten() {
                     let name = s["name"].as_str().unwrap_or("?");
-                    if s["unlocked"] == json!(true) {
-                        let left = s["locks_in_secs"].as_u64().unwrap_or(0);
-                        println!(
-                            "  {name}: unlocked, locks in {}h{:02}m",
-                            left / 3600,
-                            left / 60 % 60
-                        );
-                    } else {
-                        println!("  {name}: locked");
+                    match s["state"].as_str().unwrap_or("?") {
+                        "unlocked" => {
+                            let left = s["locks_in_secs"].as_u64().unwrap_or(0);
+                            println!(
+                                "  {name}: unlocked, locks in {}h{:02}m",
+                                left / 3600,
+                                left / 60 % 60
+                            );
+                        }
+                        "unlocking" => {
+                            println!("  {name}: unlocking (waiting for Touch ID / password)")
+                        }
+                        other => println!("  {name}: {other}"),
                     }
                 }
             }

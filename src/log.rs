@@ -2,7 +2,7 @@
 
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -30,23 +30,44 @@ pub fn now() -> String {
     )
 }
 
-/// One append handle for the process, opened on first use (the daemon only ever logs to one file).
-static FILE: Mutex<Option<std::fs::File>> = Mutex::new(None);
+/// Rotate at this size into one `.1` file, so the log never takes more than about twice this.
+const MAX_LOG: u64 = 1 << 20;
+
+/// One append handle for the process, with the path it belongs to.
+static FILE: Mutex<Option<(PathBuf, std::fs::File)>> = Mutex::new(None);
+
+fn open(path: &Path) -> Option<std::fs::File> {
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)
+        .ok()
+}
 
 pub fn line(path: &Path, msg: &str) {
-    let mut f = FILE.lock().unwrap_or_else(|e| e.into_inner());
-    if f.is_none() {
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        *f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o600)
-            .open(path)
-            .ok();
+    write_line(path, msg, MAX_LOG)
+}
+
+fn write_line(path: &Path, msg: &str, max: u64) {
+    let mut cur = FILE.lock().unwrap_or_else(|e| e.into_inner());
+    // (Re)open when there's no handle, the path changed, or the file was deleted or moved away.
+    if cur.as_ref().is_none_or(|(p, _)| p != path) || !path.exists() {
+        *cur = open(path).map(|f| (path.to_path_buf(), f));
     }
-    if let Some(f) = f.as_mut() {
+    if cur
+        .as_ref()
+        .is_some_and(|(_, f)| f.metadata().is_ok_and(|m| m.len() >= max))
+    {
+        let mut old = path.as_os_str().to_owned();
+        old.push(".1");
+        let _ = std::fs::rename(path, old);
+        *cur = open(path).map(|f| (path.to_path_buf(), f));
+    }
+    if let Some((_, f)) = cur.as_mut() {
         let _ = writeln!(f, "{} {msg}", now());
     }
 }
@@ -58,5 +79,28 @@ mod tests {
         let n = super::now();
         assert_eq!(n.len(), 20);
         assert!(n.starts_with("20") && n.ends_with('Z'));
+    }
+
+    #[test]
+    fn rotates_and_survives_deletion() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("x.log");
+        for i in 0..20 {
+            super::write_line(&p, &format!("line {i}"), 200);
+        }
+        let main = std::fs::read_to_string(&p).unwrap();
+        let old = std::fs::read_to_string(dir.path().join("x.log.1")).unwrap();
+        assert!(
+            main.len() < 200 + 40 && old.len() < 200 + 40,
+            "both files stay near the limit"
+        );
+        assert!(main.contains("line 19"));
+        std::fs::remove_file(&p).unwrap();
+        super::write_line(&p, "after delete", 200);
+        assert!(
+            std::fs::read_to_string(&p)
+                .unwrap()
+                .contains("after delete")
+        );
     }
 }

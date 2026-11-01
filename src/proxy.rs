@@ -135,12 +135,10 @@ pub async fn handle(
     let res = if ok {
         forward(&vault, &http, &service, &method, &rest, req).await
     } else {
+        // same text as for an unknown service
         reply(
             StatusCode::UNAUTHORIZED,
-            &format!(
-                "send the credproxy token as the API key ({})",
-                svc.auth_header
-            ),
+            "send the credproxy token as the API key",
         )
     };
     let status = res.status().as_u16();
