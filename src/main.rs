@@ -22,7 +22,8 @@ const USAGE: &str = "usage:
   credproxy lock [<service>]      forget the key(s) now
   credproxy install               LaunchAgent: start at login, restart if it exits
   credproxy uninstall             remove the LaunchAgent
-  credproxy stop                  stop the daemon (locks everything; launchd starts it again)
+  credproxy restart               restart the daemon (locks everything; reloads the config)
+  credproxy stop                  stop the daemon until `restart` or the next login
   credproxy serve                 run the daemon in the foreground
 
 config: $CREDPROXY_CONFIG or ~/.config/credproxy/config.toml";
@@ -104,7 +105,8 @@ fn plist(exe: &str, config: Option<&str>, err_log: &str) -> String {
         "\t</array>",
         &format!("\t<key>EnvironmentVariables</key>\n\t<dict>\n{env}\t</dict>"),
         "\t<key>RunAtLoad</key>\n\t<true/>",
-        "\t<key>KeepAlive</key>\n\t<true/>",
+        // Restart only after a crash: a clean exit (stop, or a startup error such as a bad config) stays down.
+        "\t<key>KeepAlive</key>\n\t<dict>\n\t\t<key>SuccessfulExit</key>\n\t\t<false/>\n\t</dict>",
         "\t<key>ProcessType</key>\n\t<string>Interactive</string>",
         &format!("\t<key>StandardErrorPath</key>\n\t<string>{}</string>", xml(err_log)),
         "</dict>",
@@ -113,8 +115,26 @@ fn plist(exe: &str, config: Option<&str>, err_log: &str) -> String {
     .join("\n")
 }
 
+/// The path launchd should run: Homebrew's stable link when it points to this binary, since the resolved
+/// path (`Caskroom/credproxy/<version>/…`) disappears on the next upgrade.
+fn launch_path(exe: &Path) -> PathBuf {
+    let me = std::fs::canonicalize(exe).ok();
+    let prefixes = [
+        std::env::var("HOMEBREW_PREFIX").ok(),
+        Some("/opt/homebrew".into()),
+        Some("/usr/local".into()),
+    ];
+    for p in prefixes.into_iter().flatten() {
+        let link = Path::new(&p).join("bin/credproxy");
+        if me.is_some() && std::fs::canonicalize(&link).ok() == me {
+            return link;
+        }
+    }
+    exe.to_path_buf()
+}
+
 fn install(cfg_path: &Path) -> Result<(), String> {
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let exe = launch_path(&std::env::current_exe().map_err(|e| e.to_string())?);
     let config =
         std::env::var_os("CREDPROXY_CONFIG").map(|_| cfg_path.to_string_lossy().into_owned());
     let plist = plist(
@@ -170,8 +190,18 @@ fn main() {
     let cfg_path = config_path();
     if cmd == "serve" {
         if let Err(e) = serve::run(&cfg_path) {
-            die(&e);
+            // Exit 0 on purpose: launchd restarts only on failure, and a bad config or a busy port won't fix
+            // itself by retrying every 10 s. The message is in credproxy.err.log.
+            eprintln!("credproxy: {e}");
         }
+        return;
+    }
+    if cmd == "restart" {
+        let target = format!("gui/{}/{LABEL}", unsafe { libc::getuid() });
+        if !launchctl(&["kickstart", "-k", &target]) {
+            die("not installed (credproxy install)");
+        }
+        println!("restarted");
         return;
     }
     if cmd == "uninstall" {
@@ -280,6 +310,10 @@ mod tests {
             assert!(
                 !text.contains('\\'),
                 "no escape sequences left in the plist"
+            );
+            assert!(
+                text.contains("<key>SuccessfulExit</key>"),
+                "restart only after a crash"
             );
             let p = dir.path().join("io.nhz.credproxy.plist");
             std::fs::write(&p, &text).unwrap();

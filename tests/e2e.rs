@@ -49,13 +49,28 @@ async fn upstream(hits: Arc<AtomicUsize>) -> u16 {
                                 .get(n)
                                 .map(|v| v.to_str().unwrap().to_string())
                         };
+                        let (method, path, query) = (
+                            req.method().to_string(),
+                            req.uri().path().to_string(),
+                            req.uri().query().map(str::to_string),
+                        );
+                        let (auth, ua, cookie, x, ctype, enc) = (
+                            h("authorization"),
+                            h("user-agent"),
+                            h("cookie"),
+                            h("x-extra"),
+                            h("content-type"),
+                            h("accept-encoding"),
+                        );
+                        let body = req.into_body().collect().await.unwrap().to_bytes();
                         let v = serde_json::json!({
-                            "method": req.method().as_str(), "path": req.uri().path(), "query": req.uri().query(),
-                            "auth": h("authorization"), "ua": h("user-agent"), "cookie": h("cookie"), "x": h("x-extra"),
+                            "method": method, "path": path, "query": query, "auth": auth, "ua": ua, "cookie": cookie,
+                            "x": x, "ctype": ctype, "accept_encoding": enc, "body": String::from_utf8_lossy(&body),
                         });
-                        let _ = req.into_body().collect().await;
+                        let gzip = path.ends_with("/gzip");
                         Ok::<_, std::convert::Infallible>(
                             hyper::Response::builder()
+                                .header("content-encoding", if gzip { "gzip" } else { "identity" })
                                 .header("content-type", "application/json")
                                 .body(Full::new(Bytes::from(v.to_string())))
                                 .unwrap(),
@@ -90,6 +105,11 @@ fn free_port() -> u16 {
 }
 
 async fn setup(idle: &str) -> Env {
+    setup_with(idle, None).await
+}
+
+/// `fake_age`: a shell script used instead of `age` (it ignores its arguments).
+async fn setup_with(idle: &str, fake_age: Option<&str>) -> Env {
     let dir = tempfile::Builder::new().prefix("cp").tempdir().unwrap();
     let d = dir.path();
     let hits = Arc::new(AtomicUsize::new(0));
@@ -122,7 +142,7 @@ async fn setup(idle: &str) -> Env {
         format!(
             r#"idle_lock = "{idle}"
 listen = "127.0.0.1:{listen}"
-identity = "{d}/id.txt"
+{age_line}identity = "{d}/id.txt"
 secrets_dir = "{d}/secrets"
 runtime_dir = "{d}/run"
 log = "{d}/credproxy.log"
@@ -140,7 +160,20 @@ prefix = "/v1"
 upstream = "http://127.0.0.1:{port}/v1"
 allow = ["GET /pods", "GET /pods/{{id}}", "POST /pods", "GET /billing/pods"]
 "#,
-            d = d.display()
+            d = d.display(),
+            age_line = match fake_age {
+                Some(script) => {
+                    let p = d.join("fake-age");
+                    std::fs::write(&p, format!("#!/bin/sh\n{script}\n")).unwrap();
+                    std::fs::set_permissions(
+                        &p,
+                        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+                    )
+                    .unwrap();
+                    format!("age = \"{}\"\n", p.display())
+                }
+                None => String::new(),
+            },
         ),
     )
     .unwrap();
@@ -320,6 +353,27 @@ async fn proxies_allowed_calls_only() {
     .await;
     assert_eq!(s, 200, "{body}");
     assert!(body.contains("\"/gql\""));
+    // only the checked request goes upstream: no query string, JSON content type, canonical body
+    let r = reqwest::Client::new()
+        .post(format!("{base}/graphql?query=mutation%7BpodTerminate%7D"))
+        .header("authorization", format!("Bearer {tok}"))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(r#"{"query":"mutation { x }","query":"{ gpuTypes { id } }","operationName":null}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    let v: serde_json::Value = serde_json::from_str(&r.text().await.unwrap()).unwrap();
+    assert!(
+        v["query"].is_null(),
+        "query string must not reach a GraphQL upstream"
+    );
+    assert_eq!(v["ctype"], "application/json");
+    assert_eq!(v["body"], r#"{"query":"{ gpuTypes { id } }"}"#);
+    assert_eq!(v["accept_encoding"], "identity");
+    // a compressed reply is refused (the key couldn't be scrubbed from it)
+    let (s, body) = get(&format!("{base}/v1/pods/gzip"), Some(&tok)).await;
+    assert_eq!(s, 502, "{body}");
     for q in [
         "mutation { podTerminate(input: {podId: \"x\"}) }",
         "{ myself { pubKey } }",
@@ -341,7 +395,7 @@ async fn proxies_allowed_calls_only() {
     let root = &base[..base.rfind('/').unwrap()];
     assert_eq!(
         get(&format!("{root}/other/v1/pods"), Some(&tok)).await.0,
-        404
+        401
     );
 
     // log: method/path/status only — no key, token or query
@@ -489,5 +543,81 @@ async fn token_changes_on_restart() {
     assert_eq!(
         get(&format!("{}/v1/pods", env.base), Some(&new)).await.0,
         200
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unlock_survives_a_client_that_gives_up() {
+    // age that takes 2 s (a slow Touch ID); the client waits only 0.5 s
+    let env = setup_with("12h", Some("sleep 2; echo fk_slow_key")).await;
+    let tok = env.token();
+    let quick = reqwest::Client::builder()
+        .timeout(Duration::from_millis(500))
+        .build()
+        .unwrap();
+    let r = quick
+        .get(format!("{}/v1/pods", env.base))
+        .header("authorization", format!("Bearer {tok}"))
+        .send()
+        .await;
+    assert!(r.is_err(), "client should have timed out");
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert!(
+        env.unlocked(),
+        "the unlock finished although its client left"
+    );
+    assert!(env.log().contains("fake unlocked"), "{}", env.log());
+    assert_eq!(
+        get(&format!("{}/v1/pods", env.base), Some(&tok)).await.0,
+        200
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lock_aborts_a_pending_unlock() {
+    // age whose "plugin" never answers: two marked sleeps in age's process group
+    let env = setup_with("12h", Some("sleep 47101 & sleep 47102")).await;
+    let tok = env.token();
+    let url = format!("{}/v1/pods", env.base);
+    let waiting = tokio::spawn(async move { get(&url, Some(&tok)).await });
+    let marked = || {
+        let o = Command::new("pgrep")
+            .args(["-f", "sleep 4710[12]"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&o.stdout).lines().count()
+    };
+    for _ in 0..30 {
+        if marked() == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(marked(), 2, "age and its plugin are running");
+    assert!(String::from_utf8_lossy(&env.cli(&["lock", "fake"]).stdout).contains("locked: fake"));
+    let (s, body) = waiting.await.unwrap();
+    assert_eq!(s, 503);
+    assert!(body.contains("locked"), "{body}");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(marked(), 0, "lock killed age and its plugin");
+    assert!(!env.unlocked());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn second_instance_leaves_the_first_alone() {
+    let env = setup("12h").await;
+    let o = Command::new(BIN)
+        .arg("serve")
+        .env("CREDPROXY_CONFIG", &env.cfg)
+        .output()
+        .unwrap();
+    assert!(
+        o.status.success(),
+        "startup errors exit 0, so launchd doesn't loop on them"
+    );
+    assert!(String::from_utf8_lossy(&o.stderr).contains("already running"));
+    assert!(
+        String::from_utf8_lossy(&env.cli(&["status"]).stdout).starts_with("running"),
+        "first daemon still reachable"
     );
 }

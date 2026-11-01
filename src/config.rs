@@ -155,12 +155,15 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
     let s = s.trim();
     let (num, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len()));
     let n: u64 = num.parse().map_err(|_| format!("bad duration {s:?}"))?;
-    let secs = match unit {
-        "s" => n,
-        "m" => n * 60,
-        "h" => n * 3600,
+    let mult = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3600,
         _ => return Err(format!("bad duration {s:?} (use e.g. 30s, 15m, 12h)")),
     };
+    let secs = n
+        .checked_mul(mult)
+        .ok_or(format!("duration {s:?} is too large"))?;
     if secs == 0 {
         return Err("duration must be > 0".into());
     }
@@ -295,8 +298,10 @@ pub fn parse(text: &str) -> Result<Config, String> {
                 "service {name}: secret must be a relative path like \"{name}/api-key\""
             ));
         }
-        if !s.auth.format.contains("{key}") {
-            return Err(format!("service {name}: auth.format must contain {{key}}"));
+        if s.auth.format.matches("{key}").count() != 1 {
+            return Err(format!(
+                "service {name}: auth.format must contain {{key}} exactly once"
+            ));
         }
         if s.auth.header.is_empty()
             || !s
@@ -492,6 +497,8 @@ allow = ["GET /pods", "DELETE /pods/{id}", "GET /catalog/gpus"]
             format!("idle_lock = \"0h\"\n{RUNPOD}"),
             format!("idle_lock = \"12\"\n{RUNPOD}"),
             format!("{RUNPOD}\n[services.runpod.auth]\nformat = \"Bearer\""),
+            format!("{RUNPOD}\n[services.runpod.auth]\nformat = \"{{key}}:{{key}}\""),
+            format!("idle_lock = \"99999999999999999h\"\n{RUNPOD}"),
             format!("bogus = 1\n{RUNPOD}"),
         ];
         for b in bad {

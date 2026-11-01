@@ -2,22 +2,38 @@
 //! in memory: random at every daemon start, handed out over the control socket.
 
 use crate::config::Config;
+use crate::log;
 use std::collections::HashMap;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
 use tokio::io::AsyncReadExt;
+use tokio::sync::watch;
 use zeroize::Zeroizing;
 
 /// After a failed unlock (Touch ID denied, timeout), requests don't prompt again for this long;
 /// `credproxy unlock` still does. Stops retrying clients from raising prompt after prompt.
 pub const UNLOCK_BACKOFF: Duration = Duration::from_secs(30);
+/// How long an unlock waits for the Touch ID / password prompt.
+pub const UNLOCK_TIMEOUT: Duration = Duration::from_secs(120);
 
 struct Unlocked {
     key: Zeroizing<String>,
     last_used: Instant,
+}
+
+/// Outcome of one unlock job, shared by every request waiting for it.
+type Outcome = Option<Result<(), String>>;
+
+/// An unlock in progress. It runs as its own task, so a waiting client that goes away doesn't cancel it;
+/// `lock` and `stop` do (they kill age and its plugin, which closes the prompt).
+struct Pending {
+    id: u64,
+    pgid: Option<libc::pid_t>,
+    done: Arc<watch::Sender<Outcome>>,
 }
 
 #[derive(Default)]
@@ -25,12 +41,13 @@ struct Slot {
     token: String,
     unlocked: Option<Unlocked>,
     failed_at: Option<Instant>,
+    pending: Option<Pending>,
 }
 
 pub struct Vault {
     pub cfg: Config,
     slots: Mutex<HashMap<String, Slot>>,
-    unlocking: tokio::sync::Mutex<()>,
+    next_job: AtomicU64,
 }
 
 /// The runtime dir must be ours and private.
@@ -52,6 +69,10 @@ fn new_token() -> String {
     let mut b = [0u8; 32];
     getrandom::fill(&mut b).expect("getrandom");
     b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+fn kill_group(pgid: libc::pid_t) {
+    unsafe { libc::kill(-pgid, libc::SIGKILL) };
 }
 
 /// age output → key: one line of visible ASCII (anything else could split a header).
@@ -90,7 +111,7 @@ impl Vault {
         Vault {
             cfg,
             slots: Mutex::new(slots),
-            unlocking: tokio::sync::Mutex::new(()),
+            next_job: AtomicU64::new(1),
         }
     }
 
@@ -110,60 +131,98 @@ impl Vault {
             .map(|s| s.token.clone())
     }
 
-    fn cached(&self, service: &str) -> Option<Zeroizing<String>> {
-        let mut slots = self.slots.lock().unwrap();
-        let u = slots.get_mut(service)?.unlocked.as_mut()?;
-        u.last_used = Instant::now();
-        Some(u.key.clone())
+    /// The service's key, unlocking first if needed. Requests share one unlock job per service and only wait
+    /// for it. `force` (explicit `credproxy unlock`) ignores the back-off after a failed unlock.
+    pub async fn key(
+        self: &Arc<Self>,
+        service: &str,
+        force: bool,
+    ) -> Result<Zeroizing<String>, String> {
+        if !self.cfg.services.contains_key(service) {
+            return Err(format!("unknown service {service:?}"));
+        }
+        loop {
+            let mut done = {
+                let mut slots = self.slots.lock().unwrap();
+                let slot = slots.entry(service.to_string()).or_default();
+                if let Some(u) = slot.unlocked.as_mut() {
+                    u.last_used = Instant::now();
+                    return Ok(u.key.clone());
+                }
+                match &slot.pending {
+                    Some(p) => p.done.subscribe(),
+                    None => {
+                        if let Some(t) = slot
+                            .failed_at
+                            .filter(|t| !force && t.elapsed() < UNLOCK_BACKOFF)
+                        {
+                            let left = (UNLOCK_BACKOFF - t.elapsed()).as_secs() + 1;
+                            return Err(format!(
+                                "locked: last unlock failed; retry in {left}s or run `credproxy unlock {service}`"
+                            ));
+                        }
+                        let id = self.next_job.fetch_add(1, Ordering::Relaxed);
+                        let (tx, rx) = watch::channel(None);
+                        let done = Arc::new(tx);
+                        slot.pending = Some(Pending {
+                            id,
+                            pgid: None,
+                            done: done.clone(),
+                        });
+                        tokio::spawn(self.clone().unlock_job(service.to_string(), id, done));
+                        rx
+                    }
+                }
+            };
+            let outcome = done
+                .wait_for(|o| o.is_some())
+                .await
+                .map_err(|_| "unlock aborted".to_string())?
+                .clone()
+                .unwrap();
+            // Ok: loop round to take the key from the slot (it may already be locked again).
+            outcome?;
+        }
     }
 
-    /// The service's key, decrypting first if locked (one at a time). `force` ignores the back-off.
-    pub async fn key(&self, service: &str, force: bool) -> Result<Zeroizing<String>, String> {
-        if let Some(k) = self.cached(service) {
-            return Ok(k);
-        }
-        let svc = self
-            .cfg
-            .services
-            .get(service)
-            .ok_or(format!("unknown service {service:?}"))?;
-        let _one = self.unlocking.lock().await;
-        if let Some(k) = self.cached(service) {
-            return Ok(k);
-        }
-        let failed = self
-            .slots
-            .lock()
-            .unwrap()
-            .get(service)
-            .and_then(|s| s.failed_at);
-        if let Some(t) = failed.filter(|t| !force && t.elapsed() < UNLOCK_BACKOFF) {
-            let left = (UNLOCK_BACKOFF - t.elapsed()).as_secs() + 1;
-            return Err(format!(
-                "locked: last unlock failed; retry in {left}s or run `credproxy unlock {service}`"
-            ));
-        }
-        let res = self.decrypt(svc.secret.as_path()).await;
+    async fn unlock_job(
+        self: Arc<Self>,
+        service: String,
+        id: u64,
+        done: Arc<watch::Sender<Outcome>>,
+    ) {
+        let res = self.decrypt(&service, id).await;
         let mut slots = self.slots.lock().unwrap();
-        let slot = slots.entry(service.to_string()).or_default();
-        match res {
+        let slot = slots.entry(service.clone()).or_default();
+        // A `lock` while we waited removed our job (and already told the waiters): drop the result.
+        if slot.pending.as_ref().is_none_or(|p| p.id != id) {
+            return;
+        }
+        slot.pending = None;
+        let outcome = match res {
             Ok(key) => {
                 slot.failed_at = None;
                 slot.unlocked = Some(Unlocked {
-                    key: key.clone(),
+                    key,
                     last_used: Instant::now(),
                 });
-                Ok(key)
+                log::line(&self.cfg.log, &format!("{service} unlocked"));
+                Ok(())
             }
             Err(e) => {
                 slot.failed_at = Some(Instant::now());
+                log::line(&self.cfg.log, &format!("{service} unlock failed: {e}"));
                 Err(e)
             }
-        }
+        };
+        done.send_replace(Some(outcome));
     }
 
-    async fn decrypt(&self, secret: &Path) -> Result<Zeroizing<String>, String> {
-        let file = self.cfg.secrets_dir.join(secret);
+    async fn decrypt(&self, service: &str, id: u64) -> Result<Zeroizing<String>, String> {
+        let file = self
+            .cfg
+            .secrets_dir
+            .join(&self.cfg.services[service].secret);
         let mut child = tokio::process::Command::new(&self.cfg.age)
             .arg("-d")
             .arg("-i")
@@ -173,27 +232,41 @@ impl Vault {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
-            // own process group: on timeout the age plugin (a child of age) goes too
+            // own process group: age's plugin (its child) is killed with it
             .process_group(0)
             .spawn()
             .map_err(|e| format!("cannot run {}: {e}", self.cfg.age))?;
         let pgid = child.id().map(|p| p as libc::pid_t);
-        let mut out = Zeroizing::new(Vec::new());
+        {
+            let mut slots = self.slots.lock().unwrap();
+            match slots.get_mut(service).and_then(|s| s.pending.as_mut()) {
+                Some(p) if p.id == id => p.pgid = pgid,
+                // locked before age even started
+                _ => {
+                    if let Some(g) = pgid {
+                        kill_group(g);
+                    }
+                    return Err("locked".into());
+                }
+            }
+        }
+        // Room for any real key up front: growing the buffer would leave plaintext copies in freed memory.
+        let mut out = Zeroizing::new(Vec::with_capacity(64 << 10));
         let mut err = Vec::new();
-        let mut so = child.stdout.take().unwrap();
-        let mut se = child.stderr.take().unwrap();
+        let mut so = child.stdout.take().unwrap().take(64 << 10);
+        let mut se = child.stderr.take().unwrap().take(64 << 10);
         let wait = async {
             let (a, b) = tokio::join!(so.read_to_end(&mut out), se.read_to_end(&mut err));
             a.and(b).map_err(|e| e.to_string())?;
             child.wait().await.map_err(|e| e.to_string())
         };
-        let status = match tokio::time::timeout(Duration::from_secs(120), wait).await {
+        let status = match tokio::time::timeout(UNLOCK_TIMEOUT, wait).await {
             Ok(r) => r?,
             Err(_) => {
                 if let Some(g) = pgid {
-                    unsafe { libc::kill(-g, libc::SIGKILL) };
+                    kill_group(g);
                 }
-                return Err("timed out waiting for age (Touch ID not approved?)".into());
+                return Err("timed out waiting for Touch ID / password".into());
             }
         };
         if !status.success() {
@@ -210,12 +283,25 @@ impl Vault {
         to_key(&out)
     }
 
-    /// Lock one service, or all of them. Dropping the key zeroes it.
+    /// Lock one service, or all of them: forget the key (zeroed on drop) and abort a pending unlock (kills age
+    /// and its plugin, which closes the prompt). Returns the services that were unlocked or unlocking.
     pub fn lock(&self, service: Option<&str>) -> Vec<String> {
         let mut slots = self.slots.lock().unwrap();
         let mut locked = Vec::new();
         for (name, s) in slots.iter_mut() {
-            if service.is_none_or(|x| x == name) && s.unlocked.take().is_some() {
+            if service.is_some_and(|x| x != name) {
+                continue;
+            }
+            let had_key = s.unlocked.take().is_some();
+            let pending = s.pending.take();
+            if let Some(p) = &pending {
+                if let Some(g) = p.pgid {
+                    kill_group(g);
+                }
+                p.done
+                    .send_replace(Some(Err("locked while waiting for Touch ID".into())));
+            }
+            if had_key || pending.is_some() {
                 locked.push(name.clone());
             }
         }

@@ -2,7 +2,9 @@
 
 use graphql_parser::query::{Definition, OperationDefinition, Selection, parse_query};
 
-pub fn check(body: &[u8], allowed: &[String]) -> Result<(), String> {
+/// Checks the request and returns the body to send upstream: the validated fields only, re-serialised, so the
+/// upstream can't parse anything other than what was checked (duplicate keys, extra keys, odd encodings).
+pub fn check(body: &[u8], allowed: &[String]) -> Result<Vec<u8>, String> {
     let v: serde_json::Value =
         serde_json::from_slice(body).map_err(|_| "body is not JSON".to_string())?;
     let obj = v.as_object().ok_or("body is not a JSON object")?;
@@ -41,7 +43,13 @@ pub fn check(body: &[u8], allowed: &[String]) -> Result<(), String> {
             _ => return Err("fragments are not allowed".into()),
         }
     }
-    Ok(())
+    let mut out = serde_json::Map::new();
+    for k in ["query", "variables", "operationName"] {
+        if let Some(v) = obj.get(k).filter(|v| !v.is_null()) {
+            out.insert(k.to_string(), v.clone());
+        }
+    }
+    Ok(serde_json::to_vec(&out).expect("json"))
 }
 
 #[cfg(test)]
@@ -55,6 +63,23 @@ mod tests {
                 .as_bytes(),
             &["gpuTypes".to_string()],
         )
+        .map(|_| ())
+    }
+
+    #[test]
+    fn forwards_only_what_was_checked() {
+        let allowed = ["gpuTypes".to_string()];
+        // serde_json keeps the last of duplicate keys; the re-serialised body has only that one
+        let body = br#"{"query":"mutation { podTerminate(input: {podId: \"x\"}) }","query":"{ gpuTypes { id } }"}"#;
+        let out: serde_json::Value =
+            serde_json::from_slice(&check(body, &allowed).unwrap()).unwrap();
+        assert_eq!(out, serde_json::json!({"query": "{ gpuTypes { id } }"}));
+        let body = br#"{"query":"{ gpuTypes { id } }","variables":{"a":1},"operationName":null}"#;
+        let out = String::from_utf8(check(body, &allowed).unwrap()).unwrap();
+        assert_eq!(
+            out,
+            r#"{"query":"{ gpuTypes { id } }","variables":{"a":1}}"#
+        );
     }
 
     #[test]

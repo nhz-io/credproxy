@@ -28,18 +28,19 @@ allowlist, swaps the token for the real key, forwards over HTTPS and returns the
 
 | Piece | How |
 |---|---|
-| Daemon | LaunchAgent (`credproxy install`): starts at login, locked; restarted if it exits. |
+| Daemon | LaunchAgent (`credproxy install`): starts at login, locked; restarted after a crash, not after a clean exit (`stop`, or a startup error such as a bad config, which goes to `credproxy.err.log`). The port is the single-instance lock. |
 | URL | `http://<listen>/<service>/<route prefix>/…`, `listen` fixed (default `127.0.0.1:7777`, loopback only). |
 | Host check | Every request must say `Host: 127.0.0.1:<port>` (or `localhost:<port>`), else 403. A DNS-rebinding web page reaches 127.0.0.1 under its own domain name, which the browser puts in `Host`. |
 | Token | Per service, random (256 bits) at every daemon start, **in memory only**: never written to disk. Clients get it with `credproxy token <service>` (control socket below) and send it in the service's own auth header (e.g. `Authorization: Bearer <token>`); compared in constant time. Missing or wrong → 401. After a daemon restart the old token gets 401: fetch the token at the start of a run, and again on a 401. |
-| Unlock | On the first allowed request for a locked service (or `credproxy unlock`): `age -d -i <identity> <secrets_dir>/<secret>.age`, plaintext read from a pipe into memory (zeroed on lock). One line of printable ASCII. A failed unlock (Touch ID denied) blocks new prompts from requests for 30 s. |
+| Unlock | On the first allowed request for a locked service (or `credproxy unlock`), one unlock job per service runs `age -d -i <identity> <secrets_dir>/<secret>.age` in its own process group; every request that needs the key waits for that job. A client that gives up doesn't cancel it. The plaintext is read from a pipe into a preallocated buffer (zeroed on lock). One line of printable ASCII. A failed unlock (Touch ID denied, 2-minute timeout) blocks new prompts from requests for 30 s. |
 | Order | Host → token → allowlist → key. A request that would be refused never triggers an unlock. |
-| Lock | After `idle_lock` without use (default 12 h), on `credproxy lock [service]`, and when the daemon exits. |
-| Allowlist | Per route: `METHOD /path/{param}` rules (`{param}` = one segment of `[A-Za-z0-9._-]`, never `.`/`..`), or a GraphQL endpoint where only one `query` operation whose top-level fields are all listed passes (no mutations, subscriptions or fragments). Anything else → 403, never sent upstream. |
-| Upstream | HTTPS only (plain HTTP only to 127.0.0.1, for tests), no redirects followed, own `User-Agent: credproxy/<version>`, 60 s timeout. Only `Content-Type` and `Accept` are forwarded from the client; its auth header, cookies and other headers are dropped. Request body ≤ 1 MiB, response ≤ 16 MiB. |
+| Lock | After `idle_lock` without use (default 12 h), on `credproxy lock [service]`, and when the daemon exits. A lock during a pending unlock aborts it: age and its plugin are killed, which closes the prompt. |
+| Allowlist | Per route: `METHOD /path/{param}` rules (`{param}` = one segment of `[A-Za-z0-9._-]`, never `.`/`..`), or a GraphQL endpoint where only one `query` operation whose top-level fields are all listed passes (no mutations, subscriptions or fragments). Anything else → 403, never sent upstream. For GraphQL only the checked request is sent: `{query, variables, operationName}` re-serialised as JSON, `Content-Type: application/json`, no query string — so the upstream can't read anything that wasn't checked. |
+| Upstream | HTTPS only (plain HTTP only to 127.0.0.1, for tests), no redirects followed, own `User-Agent: credproxy/<version>`, `Accept-Encoding: identity` (a compressed reply is refused: the key couldn't be scrubbed from it), 60 s timeout. Only `Content-Type` and `Accept` are forwarded from the client; its auth header, cookies and other headers are dropped. Request body ≤ 1 MiB, response ≤ 16 MiB. |
 | Reply | Status, `Content-Type` and body, with every verbatim copy of the key replaced by `[REDACTED]`. |
 | Control | Unix socket `ctl.sock` (0600) in a 0700 runtime dir, peer uid checked: token, status, unlock, lock, stop. |
 | Log | `~/Library/Logs/credproxy.log` (0600): time, service, method, path, status, ms. No token, no query string, no key. |
+| Limits | At most 64 client connections at once; request headers within 10 s. Unknown services get the same 401 as a wrong token. |
 | Hardening | Core dumps off; on macOS the daemon requests `PT_DENY_ATTACH` (not tested by the test suite). |
 
 ## Limits (read these)
@@ -104,7 +105,7 @@ upstream = "https://rest.runpod.io/v1"
 allow = ["GET /pods", "POST /pods", "GET /pods/{id}", "DELETE /pods/{id}", "GET /billing/pods"]
 ```
 
-The daemon reads the config at start; after changing it, `credproxy stop` (launchd starts it again).
+The daemon reads the config at start; after changing it, `credproxy restart`.
 
 ## Use
 
@@ -115,7 +116,8 @@ The daemon reads the config at start; after changing it, `credproxy stop` (launc
 | `credproxy lock [<service>]` | Forget the key(s) now |
 | `credproxy token <service>` | Print the current token (changes at every daemon start) |
 | `credproxy install` / `uninstall` | LaunchAgent on/off |
-| `credproxy stop` | Stop the daemon (locks everything; launchd starts a fresh one) |
+| `credproxy restart` | Restart the daemon: locks everything, reloads the config, new token |
+| `credproxy stop` | Stop it until `restart` or the next login |
 
 ## License
 

@@ -113,12 +113,16 @@ pub async fn handle(
             "Host must be this proxy's loopback address",
         );
     }
+    // Unknown services get the same 401 as a wrong token: callers without one can't list what's configured.
     let Some(svc) = vault.cfg.services.get(&service) else {
         log::line(
             &vault.cfg.log,
-            &format!("- {method} - 404 (no such service)"),
+            &format!("- {method} - 401 (no such service)"),
         );
-        return reply(StatusCode::NOT_FOUND, "no such service");
+        return reply(
+            StatusCode::UNAUTHORIZED,
+            "send the credproxy token as the API key",
+        );
     };
     let rest = if rest == "/" { String::new() } else { rest };
     let shown = if rest.is_empty() {
@@ -152,7 +156,7 @@ pub async fn handle(
 
 /// Allowlist first, then the key (unlocking if needed): a refused call never raises a Touch ID prompt.
 async fn forward(
-    vault: &Vault,
+    vault: &Arc<Vault>,
     http: &reqwest::Client,
     service: &str,
     method: &str,
@@ -168,12 +172,15 @@ async fn forward(
         Ok(b) => b.to_bytes(),
         Err(_) => return reply(StatusCode::PAYLOAD_TOO_LARGE, "request body too large"),
     };
-    if let Some(fields) = &route.graphql_queries {
+    // GraphQL: send only the checked request, as JSON, without the client's query string or content type.
+    let graphql = route.graphql_queries.is_some();
+    let body = if let Some(fields) = &route.graphql_queries {
         if method != "POST" || !sub.is_empty() {
             return reply(StatusCode::FORBIDDEN, "GraphQL: POST to the endpoint only");
         }
-        if let Err(e) = graphql::check(&body, fields) {
-            return reply(StatusCode::FORBIDDEN, &format!("GraphQL: {e}"));
+        match graphql::check(&body, fields) {
+            Ok(canonical) => Bytes::from(canonical),
+            Err(e) => return reply(StatusCode::FORBIDDEN, &format!("GraphQL: {e}")),
         }
     } else {
         let p = if sub.is_empty() { "/" } else { sub.as_str() };
@@ -183,7 +190,8 @@ async fn forward(
                 &format!("{method} {} not allowed", loggable(p)),
             );
         }
-    }
+        body
+    };
 
     let key = match vault.key(service, false).await {
         Ok(k) => k,
@@ -191,7 +199,7 @@ async fn forward(
     };
     let key = &key;
     let mut url = format!("{}{sub}", route.upstream);
-    if let Some(q) = parts.uri.query() {
+    if let Some(q) = parts.uri.query().filter(|_| !graphql) {
         url.push('?');
         url.push_str(q);
     }
@@ -203,14 +211,19 @@ async fn forward(
         return reply(StatusCode::INTERNAL_SERVER_ERROR, "bad auth header");
     };
     auth_value.set_sensitive(true);
-    // Only these client headers go upstream; cookies, auth and anything else are dropped.
+    // Only these client headers go upstream; cookies, auth and anything else are dropped. Replies must come back
+    // uncompressed, or the key couldn't be scrubbed from them.
     let mut out = http
         .request(m, &url)
-        .header(svc.auth_header.as_str(), auth_value);
-    for h in ["content-type", "accept"] {
-        if let Some(v) = parts.headers.get(h) {
-            out = out.header(h, v.clone());
-        }
+        .header(svc.auth_header.as_str(), auth_value)
+        .header("accept-encoding", "identity");
+    if graphql {
+        out = out.header("content-type", "application/json");
+    } else if let Some(v) = parts.headers.get("content-type") {
+        out = out.header("content-type", v.clone());
+    }
+    if let Some(v) = parts.headers.get("accept") {
+        out = out.header("accept", v.clone());
     }
     if !body.is_empty() {
         out = out.body(body);
@@ -229,6 +242,13 @@ async fn forward(
         }
     };
     let status = res.status();
+    if res
+        .headers()
+        .get("content-encoding")
+        .is_some_and(|e| !e.as_bytes().eq_ignore_ascii_case(b"identity"))
+    {
+        return reply(StatusCode::BAD_GATEWAY, "upstream sent a compressed reply");
+    }
     let ctype = res.headers().get("content-type").cloned();
     let mut buf = Vec::new();
     loop {

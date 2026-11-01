@@ -3,6 +3,7 @@
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// UTC "YYYY-MM-DDTHH:MM:SSZ" without a date crate (civil-from-days).
@@ -29,16 +30,23 @@ pub fn now() -> String {
     )
 }
 
+/// One append handle for the process, opened on first use (the daemon only ever logs to one file).
+static FILE: Mutex<Option<std::fs::File>> = Mutex::new(None);
+
 pub fn line(path: &Path, msg: &str) {
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
+    let mut f = FILE.lock().unwrap_or_else(|e| e.into_inner());
+    if f.is_none() {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        *f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(path)
+            .ok();
     }
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(path)
-    {
+    if let Some(f) = f.as_mut() {
         let _ = writeln!(f, "{} {msg}", now());
     }
 }

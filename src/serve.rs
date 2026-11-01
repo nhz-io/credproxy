@@ -7,7 +7,7 @@ use crate::proxy;
 use crate::vault::{Vault, private_dir};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use serde_json::{Value, json};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, UnixListener, UnixStream};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, Semaphore};
 
 pub fn socket_path(cfg: &Config) -> PathBuf {
     cfg.runtime_dir.join("ctl.sock")
@@ -45,16 +45,21 @@ pub fn run(cfg_path: &Path) -> Result<(), String> {
         .block_on(serve(cfg))
 }
 
+/// At most this many client connections at once; more are closed right away.
+const MAX_CONNECTIONS: usize = 64;
+
 async fn serve(cfg: Config) -> Result<(), String> {
     private_dir(&cfg.runtime_dir)?;
     let sock = socket_path(&cfg);
+    // The port is the single-instance lock: bind it before touching the socket, so a second instance fails
+    // here instead of deleting the running daemon's socket.
+    let tcp = TcpListener::bind(cfg.listen)
+        .await
+        .map_err(|e| format!("{}: {e} (already running?)", cfg.listen))?;
     if UnixStream::connect(&sock).await.is_ok() {
         return Err("already running".into());
     }
     let _ = std::fs::remove_file(&sock);
-    let tcp = TcpListener::bind(cfg.listen)
-        .await
-        .map_err(|e| format!("{}: {e}", cfg.listen))?;
     let ctl = UnixListener::bind(&sock).map_err(|e| format!("{}: {e}", sock.display()))?;
     std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600))
         .map_err(|e| e.to_string())?;
@@ -62,6 +67,7 @@ async fn serve(cfg: Config) -> Result<(), String> {
     let vault = Arc::new(Vault::new(cfg));
     let http = proxy::client();
     let stop = Arc::new(Notify::new());
+    let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     log::line(
         &vault.cfg.log,
         &format!(
@@ -90,18 +96,31 @@ async fn serve(cfg: Config) -> Result<(), String> {
     loop {
         tokio::select! {
             a = tcp.accept() => {
-                let Ok((conn, _)) = a else { continue };
+                let Ok((conn, _)) = a else {
+                    // e.g. out of file descriptors: don't spin
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                };
+                let Ok(permit) = slots.clone().try_acquire_owned() else { continue };
                 let (vault, http) = (vault.clone(), http.clone());
                 tokio::spawn(async move {
+                    let _permit = permit;
                     let svc = service_fn(move |req| {
                         let (vault, http) = (vault.clone(), http.clone());
                         async move { Ok::<_, std::convert::Infallible>(proxy::handle(vault, http, req).await) }
                     });
-                    let _ = http1::Builder::new().serve_connection(TokioIo::new(conn), svc).await;
+                    let _ = http1::Builder::new()
+                        .timer(TokioTimer::new())
+                        .header_read_timeout(Duration::from_secs(10))
+                        .serve_connection(TokioIo::new(conn), svc)
+                        .await;
                 });
             }
             a = ctl.accept() => {
-                let Ok((conn, _)) = a else { continue };
+                let Ok((conn, _)) = a else {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                };
                 let (vault, stop) = (vault.clone(), stop.clone());
                 tokio::spawn(async move { control(conn, vault, stop).await });
             }
@@ -132,10 +151,7 @@ async fn control(conn: UnixStream, vault: Arc<Vault>, stop: Arc<Notify>) {
     let service = req.get("service").and_then(|s| s.as_str());
     let res = match (req.get("op").and_then(|o| o.as_str()), service) {
         (Some("unlock"), Some(s)) => match vault.key(s, true).await {
-            Ok(_) => {
-                log::line(&vault.cfg.log, &format!("{s} unlocked"));
-                json!({"ok": true})
-            }
+            Ok(_) => json!({"ok": true}),
             Err(e) => json!({"ok": false, "error": e}),
         },
         (Some("token"), Some(s)) => match vault.token(s) {
