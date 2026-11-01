@@ -502,6 +502,11 @@ async fn failed_unlock_backs_off() {
         body.contains("retry in"),
         "no new prompt during back-off: {body}"
     );
+    let status = String::from_utf8(env.cli(&["status"]).stdout).unwrap();
+    assert!(
+        status.contains("fake: locked (no new prompt for"),
+        "{status}"
+    );
     let o = env.cli(&["unlock", "fake"]);
     assert!(!o.status.success());
     assert!(
@@ -704,4 +709,19 @@ async fn busy_port_is_retried() {
         }
     }
     assert!(up, "daemon took the port once it was free");
+}
+
+#[test]
+fn restart_refuses_a_broken_config() {
+    // fails on the config before touching launchd, so this never restarts the real daemon
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("config.toml");
+    std::fs::write(&cfg, "idle_lock = \"soon\"\n").unwrap();
+    let o = Command::new(BIN)
+        .arg("restart")
+        .env("CREDPROXY_CONFIG", &cfg)
+        .output()
+        .unwrap();
+    assert!(!o.status.success());
+    assert!(String::from_utf8_lossy(&o.stderr).contains("not restarting"));
 }

@@ -339,7 +339,8 @@ impl Vault {
         locked
     }
 
-    /// (service, "unlocked" | "unlocking" | "locked", seconds until idle lock)
+    /// (service, state, seconds): "unlocked" (seconds until idle lock), "unlocking", "paused" (locked after a
+    /// refused unlock: seconds until requests may prompt again), or "locked".
     pub fn status(&self) -> Vec<(String, &'static str, u64)> {
         let slots = self.slots.lock().unwrap();
         self.cfg
@@ -358,7 +359,18 @@ impl Vault {
                     None if slots.get(name).is_some_and(|s| s.pending.is_some()) => {
                         (name.clone(), "unlocking", 0)
                     }
-                    None => (name.clone(), "locked", 0),
+                    None => match slots
+                        .get(name)
+                        .and_then(|s| s.failed_at)
+                        .filter(|t| t.elapsed() < UNLOCK_BACKOFF)
+                    {
+                        Some(t) => (
+                            name.clone(),
+                            "paused",
+                            (UNLOCK_BACKOFF - t.elapsed()).as_secs() + 1,
+                        ),
+                        None => (name.clone(), "locked", 0),
+                    },
                 },
             )
             .collect()

@@ -212,18 +212,21 @@ fn main() {
         return;
     }
     if cmd == "restart" {
+        // Check the config first: a restart with a broken one would replace a working daemon with none.
+        let cfg = config::load(&cfg_path).unwrap_or_else(|e| {
+            die(&format!(
+                "{e}\nnot restarting: the running daemon keeps its current config"
+            ))
+        });
         let target = format!("gui/{}/{LABEL}", unsafe { libc::getuid() });
         if !launchctl(&["kickstart", "-k", &target]) {
             die("not installed (credproxy install)");
         }
         // kickstart returns once launchd started it; check it actually came up (a bad config exits at once)
-        let sock = config::load(&cfg_path).map(|c| serve::socket_path(&c));
+        let sock = serve::socket_path(&cfg);
         for _ in 0..30 {
             std::thread::sleep(Duration::from_millis(100));
-            if sock
-                .as_ref()
-                .is_ok_and(|s| request(s, &json!({"op": "status"}), Duration::from_secs(2)).is_ok())
-            {
+            if request(&sock, &json!({"op": "status"}), Duration::from_secs(2)).is_ok() {
                 println!("restarted");
                 return;
             }
@@ -315,6 +318,10 @@ fn main() {
                         "unlocking" => {
                             println!("  {name}: unlocking (waiting for Touch ID / password)")
                         }
+                        "paused" => println!(
+                            "  {name}: locked (no new prompt for {}s after a refused unlock; `credproxy unlock {name}` to retry now)",
+                            s["locks_in_secs"].as_u64().unwrap_or(0)
+                        ),
                         other => println!("  {name}: {other}"),
                     }
                 }

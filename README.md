@@ -28,7 +28,7 @@ allowlist, swaps the token for the real key, forwards over HTTPS and returns the
 
 | Piece | How |
 |---|---|
-| Daemon | LaunchAgent (`credproxy install`): starts at login, locked. If port is busy it retries for 30 s. launchd restarts it after a crash (any panic ends the process, so it never runs half-broken), not after a clean exit: `stop`, or a startup error such as a bad config, which goes to `credproxy.err.log` and shows a notification. |
+| Daemon | LaunchAgent (`credproxy install`): starts at login, locked. If the port is busy it retries for 30 s. launchd restarts it after a crash (any panic ends the process, so it never runs half-broken), not after a clean exit: `stop`, or a startup error such as a bad config, which goes to `credproxy.err.log` and shows a notification. |
 | URL | `http://<listen>/<service>/<route prefix>/…`, `listen` fixed (default `127.0.0.1:7777`, loopback only). |
 | Host check | Every request must say `Host: 127.0.0.1:<port>` (or `localhost:<port>`), else 403. A DNS-rebinding web page reaches 127.0.0.1 under its own domain name, which the browser puts in `Host`. |
 | Token | Per service, random (256 bits) at every daemon start, **in memory only**: never written to disk. Clients get it with `credproxy token <service>` (control socket below) and send it in the service's own auth header (e.g. `Authorization: Bearer <token>`); compared in constant time. Missing or wrong → 401. After a daemon restart the old token gets 401: fetch the token at the start of a run, and again on a 401. |
