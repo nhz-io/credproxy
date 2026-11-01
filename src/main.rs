@@ -82,47 +82,47 @@ fn launchctl(args: &[&str]) -> bool {
         .is_ok_and(|s| s.success())
 }
 
-fn install(cfg_path: &Path) -> Result<(), String> {
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+/// The LaunchAgent: `<exe> serve` at login, restarted if it exits.
+fn plist(exe: &str, config: Option<&str>, err_log: &str) -> String {
     let mut env = String::from(
         "\t\t<key>PATH</key>\n\t\t<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>\n",
     );
-    if std::env::var_os("CREDPROXY_CONFIG").is_some() {
+    if let Some(c) = config {
         env += &format!(
             "\t\t<key>CREDPROXY_CONFIG</key>\n\t\t<string>{}</string>\n",
-            xml(&cfg_path.to_string_lossy())
+            xml(c)
         );
     }
-    let plist = format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-\t<key>Label</key>
-\t<string>{LABEL}</string>
-\t<key>ProgramArguments</key>
-\t<array>
-\t\t<string>{}</string>
-\t\t<string>serve</string>
-\t</array>
-\t<key>EnvironmentVariables</key>
-\t<dict>
-{env}\t</dict>
-\t<key>RunAtLoad</key>
-\t<true/>
-\t<key>KeepAlive</key>
-\t<true/>
-\t<key>ProcessType</key>
-\t<string>Interactive</string>
-\t<key>StandardErrorPath</key>
-\t<string>{}</string>
-</dict>
-</plist>
-"#,
-        xml(&exe.to_string_lossy()),
-        xml(&home()
+    [
+        r#"<?xml version="1.0" encoding="UTF-8"?>"#,
+        r#"<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">"#,
+        r#"<plist version="1.0">"#,
+        "<dict>",
+        &format!("\t<key>Label</key>\n\t<string>{LABEL}</string>"),
+        "\t<key>ProgramArguments</key>\n\t<array>",
+        &format!("\t\t<string>{}</string>\n\t\t<string>serve</string>", xml(exe)),
+        "\t</array>",
+        &format!("\t<key>EnvironmentVariables</key>\n\t<dict>\n{env}\t</dict>"),
+        "\t<key>RunAtLoad</key>\n\t<true/>",
+        "\t<key>KeepAlive</key>\n\t<true/>",
+        "\t<key>ProcessType</key>\n\t<string>Interactive</string>",
+        &format!("\t<key>StandardErrorPath</key>\n\t<string>{}</string>", xml(err_log)),
+        "</dict>",
+        "</plist>\n",
+    ]
+    .join("\n")
+}
+
+fn install(cfg_path: &Path) -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let config =
+        std::env::var_os("CREDPROXY_CONFIG").map(|_| cfg_path.to_string_lossy().into_owned());
+    let plist = plist(
+        &exe.to_string_lossy(),
+        config.as_deref(),
+        &home()
             .join("Library/Logs/credproxy.err.log")
-            .to_string_lossy()),
+            .to_string_lossy(),
     );
     let path = plist_path();
     std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
@@ -267,5 +267,32 @@ fn main() {
             Err(_) => println!("not running"),
         },
         _ => die(USAGE),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn plist_is_valid() {
+        let dir = tempfile::tempdir().unwrap();
+        for config in [None, Some("/tmp/a & b/config.toml")] {
+            let text = super::plist("/opt/homebrew/bin/credproxy", config, "/tmp/err.log");
+            assert!(
+                !text.contains('\\'),
+                "no escape sequences left in the plist"
+            );
+            let p = dir.path().join("io.nhz.credproxy.plist");
+            std::fs::write(&p, &text).unwrap();
+            let lint = std::process::Command::new("/usr/bin/plutil")
+                .arg("-lint")
+                .arg(&p)
+                .output()
+                .unwrap();
+            assert!(
+                lint.status.success(),
+                "{}\n{text}",
+                String::from_utf8_lossy(&lint.stdout)
+            );
+        }
     }
 }

@@ -173,8 +173,11 @@ impl Vault {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
+            // own process group: on timeout the age plugin (a child of age) goes too
+            .process_group(0)
             .spawn()
             .map_err(|e| format!("cannot run {}: {e}", self.cfg.age))?;
+        let pgid = child.id().map(|p| p as libc::pid_t);
         let mut out = Zeroizing::new(Vec::new());
         let mut err = Vec::new();
         let mut so = child.stdout.take().unwrap();
@@ -184,9 +187,15 @@ impl Vault {
             a.and(b).map_err(|e| e.to_string())?;
             child.wait().await.map_err(|e| e.to_string())
         };
-        let status = tokio::time::timeout(Duration::from_secs(120), wait)
-            .await
-            .map_err(|_| "timed out waiting for age (Touch ID not approved?)".to_string())??;
+        let status = match tokio::time::timeout(Duration::from_secs(120), wait).await {
+            Ok(r) => r?,
+            Err(_) => {
+                if let Some(g) = pgid {
+                    unsafe { libc::kill(-g, libc::SIGKILL) };
+                }
+                return Err("timed out waiting for age (Touch ID not approved?)".into());
+            }
+        };
         if !status.success() {
             // age's own message (no plaintext on failure); keep the last line only
             let msg = String::from_utf8_lossy(&err);
