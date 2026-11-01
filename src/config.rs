@@ -383,7 +383,31 @@ graphql_queries = ["gpuTypes"]
 prefix = "/"
 upstream = "https://rest.runpod.io/v1/"
 allow = ["GET /pods", "POST /pods", "GET /pods/{id}", "DELETE /pods/{id}", "GET /billing/pods"]
+[[services.runpod.routes]]
+prefix = "/v2"
+upstream = "https://api.runpod.io/v2"
+allow = ["GET /pods", "DELETE /pods/{id}", "GET /catalog/gpus"]
 "#;
+
+    #[test]
+    fn longest_prefix_wins() {
+        let c = parse(RUNPOD).unwrap();
+        let s = &c.services["runpod"];
+        let (r, rest) = s.route("/v2/pods").unwrap();
+        assert_eq!(
+            (r.upstream.as_str(), rest.as_str()),
+            ("https://api.runpod.io/v2", "/pods")
+        );
+        assert_eq!(s.route("/v2").unwrap().0.prefix, "/v2");
+        assert_eq!(s.route("/v2x/pods").unwrap().0.prefix, "");
+        assert!(allowed(&c, "GET", "/v2/catalog/gpus"));
+        assert!(
+            !allowed(&c, "GET", "/catalog/gpus"),
+            "v1 route has no catalog"
+        );
+        assert!(!allowed(&c, "POST", "/v2/pods"), "per-route allowlists");
+        assert!(!allowed(&c, "GET", "/v2/user"));
+    }
 
     fn allowed(c: &Config, method: &str, path: &str) -> bool {
         let s = &c.services["runpod"];

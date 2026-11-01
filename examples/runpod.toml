@@ -16,3 +16,12 @@ graphql_queries = ["gpuTypes"]
 prefix = "/"
 upstream = "https://rest.runpod.io/v1"
 allow = ["GET /pods", "POST /pods", "GET /pods/{id}", "DELETE /pods/{id}", "GET /billing/pods"]
+
+# runpodctl (REST v2 on api.runpod.io), through a wrapper that sets its URLs to the proxy: pod list/get/create/delete, billing pods,
+# gpu list. Read from runpodctl main (2026-11-01): pod get also reads the account SSH keys; pod create may read the
+# catalog (placement) and polls GET /pods/{id} with --wait.
+[[services.runpod.routes]]
+prefix = "/v2"
+upstream = "https://api.runpod.io/v2"
+allow = ["GET /pods", "POST /pods", "GET /pods/{id}", "DELETE /pods/{id}", "GET /billing/pods",
+         "GET /catalog/gpus", "GET /catalog/cpus", "GET /catalog/datacenters", "GET /account/ssh-keys"]
