@@ -3,32 +3,19 @@
 idle_lock = "12h"
 listen = "127.0.0.1:7777"
 
-# RunPod: what a rented-GPU launcher and runpodctl need (create, inspect, delete pods; prices; billing). Nothing else.
+# RunPod, for a rented-GPU launcher: create, inspect and delete pods, GPU prices, billing. Nothing else.
+# Clients call http://127.0.0.1:7777/runpod/v1/... and http://127.0.0.1:7777/runpod/graphql
+# with "Authorization: Bearer <token>".
 [services.runpod]
 secret = "runpod/api-key"
-
-# Clients get these (`credproxy env`, launchd): runpodctl reads all four; the token is their "API key".
-[services.runpod.env]
-RUNPOD_API_URL = "{base}/v1"
-RUNPOD_GRAPHQL_URL = "{base}/graphql"
-RUNPOD_REST_V2_URL = "{base}/v2"
-RUNPOD_INVOKE_URL = "{base}/invoke"     # no route: serverless invocation is refused
-RUNPOD_API_KEY = "{token}"
-
-[[services.runpod.routes]]
-prefix = "/graphql"
-upstream = "https://api.runpod.io/graphql"
-graphql_queries = ["gpuTypes"]
+token = "credproxy-local"       # not a secret: accepted only from this machine (see README, Limits)
 
 [[services.runpod.routes]]
 prefix = "/v1"
 upstream = "https://rest.runpod.io/v1"
 allow = ["GET /pods", "POST /pods", "GET /pods/{id}", "DELETE /pods/{id}", "GET /billing/pods"]
 
-# runpodctl (REST v2 on api.runpod.io): pod list/get/create/delete, billing pods, gpu list. Read from runpodctl main
-# (2026-11-01): pod get also reads the account SSH keys; pod create may read the catalog and polls GET /pods/{id}.
 [[services.runpod.routes]]
-prefix = "/v2"
-upstream = "https://api.runpod.io/v2"
-allow = ["GET /pods", "POST /pods", "GET /pods/{id}", "DELETE /pods/{id}", "GET /billing/pods",
-         "GET /catalog/gpus", "GET /catalog/cpus", "GET /catalog/datacenters", "GET /account/ssh-keys"]
+prefix = "/graphql"
+upstream = "https://api.runpod.io/graphql"
+graphql_queries = ["gpuTypes"]

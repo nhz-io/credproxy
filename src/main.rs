@@ -16,11 +16,10 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 const USAGE: &str = "usage:
-  credproxy env                   client variables (URLs + token) as `export` lines, for shell profiles
+  credproxy token <service>       print the token clients send as their API key (from the config)
   credproxy status                which services are unlocked, and for how long
   credproxy unlock <service>      unlock now (Touch ID); otherwise the first request unlocks
   credproxy lock [<service>]      forget the key(s) now
-  credproxy rotate <service>      new token (old one stops working); new shells and apps get it
   credproxy install               LaunchAgent: start at login, restart if it exits
   credproxy uninstall             remove the LaunchAgent
   credproxy stop                  stop the daemon (locks everything; launchd starts it again)
@@ -58,10 +57,6 @@ fn request(sock: &Path, req: &Value, timeout: Duration) -> Result<Value, String>
     } else {
         Err(v["error"].as_str().unwrap_or("failed").to_string())
     }
-}
-
-fn sh_quote(v: &str) -> String {
-    format!("'{}'", v.replace('\'', "'\\''"))
 }
 
 fn xml(v: &str) -> String {
@@ -198,14 +193,7 @@ fn main() {
         s
     };
     match cmd {
-        "env" => {
-            for name in cfg.services.keys() {
-                let token = vault::token(&cfg, name).unwrap_or_else(|e| die(&e));
-                for (k, v) in cfg.client_env(name, &token) {
-                    println!("export {k}={}", sh_quote(&v));
-                }
-            }
-        }
+        "token" => println!("{}", cfg.services[need_service()].token),
         "install" => install(&cfg_path).unwrap_or_else(|e| die(&e)),
         "unlock" => {
             let s = need_service();
@@ -217,17 +205,6 @@ fn main() {
             )
             .unwrap_or_else(|e| die(&e));
             println!("unlocked: {s}");
-        }
-        "rotate" => {
-            let s = need_service();
-            match request(&sock, &json!({"op": "rotate", "service": s}), short) {
-                Ok(_) => {}
-                Err(_) if UnixStream::connect(&sock).is_err() => {
-                    vault::rotate_file(&cfg, s).unwrap_or_else(|e| die(&e));
-                }
-                Err(e) => die(&e),
-            }
-            println!("rotated: {s} (open a new shell, or `eval \"$(credproxy env)\"`)");
         }
         "lock" => match request(&sock, &json!({"op": "lock", "service": service}), short) {
             Ok(v) => {

@@ -69,6 +69,24 @@ fn presented<'a>(headers: &'a hyper::HeaderMap, header: &str, format: &str) -> O
         .strip_suffix(post.as_bytes())
 }
 
+/// Only requests addressed to this proxy by its loopback name. A DNS-rebinding page reaches 127.0.0.1 under its
+/// own domain name, which the browser always puts in `Host`, so it never gets past this.
+fn host_ok(headers: &hyper::HeaderMap, listen: std::net::SocketAddr) -> bool {
+    let Some(h) = headers
+        .get(hyper::header::HOST)
+        .and_then(|h| h.to_str().ok())
+    else {
+        return false;
+    };
+    let port = listen.port();
+    let ip = if listen.is_ipv6() {
+        format!("[{}]", listen.ip())
+    } else {
+        listen.ip().to_string()
+    };
+    h == format!("{ip}:{port}") || h.eq_ignore_ascii_case(&format!("localhost:{port}"))
+}
+
 pub async fn handle(
     vault: Arc<Vault>,
     http: reqwest::Client,
@@ -84,6 +102,16 @@ pub async fn handle(
         Some((s, r)) => (s.to_string(), format!("/{r}")),
         None => (String::new(), String::new()),
     };
+    if !host_ok(req.headers(), vault.cfg.listen) {
+        log::line(
+            &vault.cfg.log,
+            &format!("- {method} - 403 (Host is not this proxy)"),
+        );
+        return reply(
+            StatusCode::FORBIDDEN,
+            "Host must be this proxy's loopback address",
+        );
+    }
     let Some(svc) = vault.cfg.services.get(&service) else {
         log::line(
             &vault.cfg.log,
@@ -228,6 +256,29 @@ async fn forward(
 #[cfg(test)]
 mod tests {
     use super::scrub;
+
+    #[test]
+    fn host_must_be_the_proxy() {
+        let listen: std::net::SocketAddr = "127.0.0.1:7777".parse().unwrap();
+        let h = |v: &str| {
+            let mut m = hyper::HeaderMap::new();
+            m.insert(hyper::header::HOST, v.parse().unwrap());
+            m
+        };
+        for ok in ["127.0.0.1:7777", "localhost:7777", "LocalHost:7777"] {
+            assert!(super::host_ok(&h(ok), listen), "{ok}");
+        }
+        for bad in [
+            "evil.example:7777",
+            "127.0.0.1:7778",
+            "127.0.0.1",
+            "localhost",
+            "127.0.0.1.evil.example:7777",
+        ] {
+            assert!(!super::host_ok(&h(bad), listen), "{bad}");
+        }
+        assert!(!super::host_ok(&hyper::HeaderMap::new(), listen));
+    }
 
     #[test]
     fn scrubs_every_copy() {

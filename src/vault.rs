@@ -1,10 +1,9 @@
-//! Keys in memory (age decrypts on first use: one Touch ID), stable per-service tokens on disk, idle lock.
+//! Keys in memory: age decrypts on first use (one Touch ID), idle lock.
 
 use crate::config::Config;
 use std::collections::HashMap;
-use std::io::Write;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
@@ -22,7 +21,6 @@ struct Unlocked {
 
 #[derive(Default)]
 struct Slot {
-    token: String,
     unlocked: Option<Unlocked>,
     failed_at: Option<Instant>,
 }
@@ -33,7 +31,7 @@ pub struct Vault {
     unlocking: tokio::sync::Mutex<()>,
 }
 
-/// The runtime/state dirs must be ours and private.
+/// The runtime dir must be ours and private.
 pub fn private_dir(dir: &Path) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
@@ -46,57 +44,6 @@ pub fn private_dir(dir: &Path) -> Result<(), String> {
         ));
     }
     Ok(())
-}
-
-fn new_token() -> String {
-    let mut b = [0u8; 32];
-    getrandom::fill(&mut b).expect("getrandom");
-    b.iter().map(|x| format!("{x:02x}")).collect()
-}
-
-fn token_path(cfg: &Config, service: &str) -> PathBuf {
-    cfg.state_dir.join("tokens").join(service)
-}
-
-fn write_token(path: &Path, token: &str) -> Result<(), String> {
-    let tmp = path.with_extension("new");
-    let _ = std::fs::remove_file(&tmp);
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&tmp)
-        .map_err(|e| format!("{}: {e}", tmp.display()))?;
-    f.write_all(token.as_bytes()).map_err(|e| e.to_string())?;
-    std::fs::rename(&tmp, path).map_err(|e| format!("{}: {e}", path.display()))
-}
-
-/// The service's token, created on first use. 64 hex chars in <state_dir>/tokens/<service> (0600).
-pub fn token(cfg: &Config, service: &str) -> Result<String, String> {
-    let path = token_path(cfg, service);
-    private_dir(path.parent().unwrap())?;
-    match std::fs::read_to_string(&path) {
-        Ok(t) if t.len() == 64 && t.bytes().all(|b| b.is_ascii_hexdigit()) => Ok(t),
-        Ok(_) => Err(format!(
-            "{}: not a token; `credproxy rotate {service}` replaces it",
-            path.display()
-        )),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let t = new_token();
-            write_token(&path, &t)?;
-            Ok(t)
-        }
-        Err(e) => Err(format!("{}: {e}", path.display())),
-    }
-}
-
-/// A new token for the service; the old one stops working.
-pub fn rotate_file(cfg: &Config, service: &str) -> Result<String, String> {
-    let path = token_path(cfg, service);
-    private_dir(path.parent().unwrap())?;
-    let t = new_token();
-    write_token(&path, &t)?;
-    Ok(t)
 }
 
 /// age output → key: one line of visible ASCII (anything else could split a header).
@@ -118,44 +65,20 @@ fn to_key(raw: &[u8]) -> Result<Zeroizing<String>, String> {
 }
 
 impl Vault {
-    pub fn new(cfg: Config) -> Result<Self, String> {
-        let mut slots = HashMap::new();
-        for name in cfg.services.keys() {
-            slots.insert(
-                name.clone(),
-                Slot {
-                    token: token(&cfg, name)?,
-                    ..Slot::default()
-                },
-            );
-        }
-        Ok(Vault {
+    pub fn new(cfg: Config) -> Self {
+        Vault {
             cfg,
-            slots: Mutex::new(slots),
+            slots: Mutex::new(HashMap::new()),
             unlocking: tokio::sync::Mutex::new(()),
-        })
+        }
     }
 
     /// Does `presented` equal the service's token? Constant time; unknown services never match.
     pub fn check_token(&self, service: &str, presented: &[u8]) -> bool {
-        let slots = self.slots.lock().unwrap();
-        slots
+        self.cfg
+            .services
             .get(service)
             .is_some_and(|s| bool::from(s.token.as_bytes().ct_eq(presented)))
-    }
-
-    pub fn rotate(&self, service: &str) -> Result<String, String> {
-        if !self.cfg.services.contains_key(service) {
-            return Err(format!("unknown service {service:?}"));
-        }
-        let t = rotate_file(&self.cfg, service)?;
-        self.slots
-            .lock()
-            .unwrap()
-            .entry(service.to_string())
-            .or_default()
-            .token = t.clone();
-        Ok(t)
     }
 
     fn cached(&self, service: &str) -> Option<Zeroizing<String>> {
@@ -313,36 +236,5 @@ mod tests {
         assert!(to_key(b"a b").is_err());
         assert!(to_key(b"abc\nX-Evil: 1").is_err());
         assert!(to_key("ключ".as_bytes()).is_err());
-    }
-
-    #[test]
-    fn tokens_are_random_hex() {
-        let (a, b) = (new_token(), new_token());
-        assert_eq!(a.len(), 64);
-        assert_ne!(a, b);
-        assert!(a.bytes().all(|c| c.is_ascii_hexdigit()));
-    }
-
-    #[test]
-    fn token_file_is_stable_private_and_rotates() {
-        let dir = tempfile::tempdir().unwrap();
-        let cfg = crate::config::parse(&format!(
-            "state_dir = \"{}\"\n[services.x]\nsecret = \"x/k\"\n[[services.x.routes]]\nprefix = \"/\"\nupstream = \"https://example.com\"\nallow = [\"GET /x\"]\n",
-            dir.path().display()
-        ))
-        .unwrap();
-        let a = token(&cfg, "x").unwrap();
-        assert_eq!(token(&cfg, "x").unwrap(), a);
-        let p = token_path(&cfg, "x");
-        assert_eq!(std::fs::metadata(&p).unwrap().mode() & 0o777, 0o600);
-        assert_eq!(
-            std::fs::metadata(p.parent().unwrap()).unwrap().mode() & 0o777,
-            0o700
-        );
-        let b = rotate_file(&cfg, "x").unwrap();
-        assert_ne!(a, b);
-        assert_eq!(token(&cfg, "x").unwrap(), b);
-        std::fs::write(&p, "junk").unwrap();
-        assert!(token(&cfg, "x").is_err());
     }
 }

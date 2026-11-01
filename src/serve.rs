@@ -1,5 +1,5 @@
 //! The daemon: HTTP on the fixed loopback address for proxied calls, Unix control socket (0700 dir) for
-//! unlock/lock/rotate/status. Normally run by launchd (`credproxy install`).
+//! unlock/lock/status. Normally run by launchd (`credproxy install`).
 
 use crate::config::{self, Config};
 use crate::log;
@@ -59,7 +59,7 @@ async fn serve(cfg: Config) -> Result<(), String> {
     std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600))
         .map_err(|e| e.to_string())?;
 
-    let vault = Arc::new(Vault::new(cfg)?);
+    let vault = Arc::new(Vault::new(cfg));
     let http = proxy::client();
     let stop = Arc::new(Notify::new());
     log::line(
@@ -134,13 +134,6 @@ async fn control(conn: UnixStream, vault: Arc<Vault>, stop: Arc<Notify>) {
         (Some("unlock"), Some(s)) => match vault.key(s, true).await {
             Ok(_) => {
                 log::line(&vault.cfg.log, &format!("{s} unlocked"));
-                json!({"ok": true})
-            }
-            Err(e) => json!({"ok": false, "error": e}),
-        },
-        (Some("rotate"), Some(s)) => match vault.rotate(s) {
-            Ok(_) => {
-                log::line(&vault.cfg.log, &format!("{s} token rotated"));
                 json!({"ok": true})
             }
             Err(e) => json!({"ok": false, "error": e}),

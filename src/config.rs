@@ -23,8 +23,6 @@ struct RawConfig {
     log: String,
     #[serde(default = "default_listen")]
     listen: String,
-    #[serde(default = "default_state_dir")]
-    state_dir: String,
     #[serde(default)]
     services: BTreeMap<String, RawService>,
 }
@@ -33,8 +31,7 @@ struct RawConfig {
 #[serde(deny_unknown_fields)]
 struct RawService {
     secret: String,
-    #[serde(default)]
-    env: BTreeMap<String, String>,
+    token: String,
     #[serde(default)]
     auth: RawAuth,
     routes: Vec<RawRoute>,
@@ -89,9 +86,6 @@ fn default_log() -> String {
 fn default_listen() -> String {
     "127.0.0.1:7777".into()
 }
-fn default_state_dir() -> String {
-    "~/Library/Application Support/credproxy".into()
-}
 fn default_header() -> String {
     "Authorization".into()
 }
@@ -109,16 +103,14 @@ pub struct Config {
     pub log: PathBuf,
     /// Loopback address clients call: http://<listen>/<service>/<route prefix>/...
     pub listen: SocketAddr,
-    /// Holds tokens/<service> (0600): the stable per-service token clients present as their API key.
-    pub state_dir: PathBuf,
     pub services: BTreeMap<String, Service>,
 }
 
 #[derive(Debug)]
 pub struct Service {
     pub secret: PathBuf,
-    /// Variables for clients: values may use {base} (http://<listen>/<service>) and {token}.
-    pub env: BTreeMap<String, String>,
+    /// What clients send in place of the key. Not a secret: only accepted from this machine (see proxy.rs).
+    pub token: String,
     pub auth_header: String,
     pub auth_format: String,
     pub routes: Vec<Route>,
@@ -182,12 +174,6 @@ fn valid_name(s: &str) -> bool {
     !s.is_empty()
         && s.bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-}
-
-fn valid_env(s: &str) -> bool {
-    let mut b = s.bytes();
-    matches!(b.next(), Some(c) if c.is_ascii_uppercase() || c == b'_')
-        && b.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'_')
 }
 
 /// A path segment that may stand in for `{param}`: plain ids only, never `.`/`..` or anything encoded.
@@ -292,28 +278,6 @@ fn check_listen(s: &str) -> Result<SocketAddr, String> {
     Ok(a)
 }
 
-impl Config {
-    /// Base URL of a service: http://<listen>/<service>
-    pub fn base_url(&self, service: &str) -> String {
-        format!("http://{}/{service}", self.listen)
-    }
-
-    /// The service's client variables with {base} and {token} filled in.
-    pub fn client_env(&self, service: &str, token: &str) -> Vec<(String, String)> {
-        let base = self.base_url(service);
-        self.services[service]
-            .env
-            .iter()
-            .map(|(k, v)| {
-                (
-                    k.clone(),
-                    v.replace("{base}", &base).replace("{token}", token),
-                )
-            })
-            .collect()
-    }
-}
-
 pub fn load(path: &Path) -> Result<Config, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
     parse(&text).map_err(|e| format!("{}: {e}", path.display()))
@@ -334,9 +298,12 @@ pub fn parse(text: &str) -> Result<Config, String> {
                 "service {name}: secret must be a relative path like \"{name}/api-key\""
             ));
         }
-        if let Some(k) = s.env.keys().find(|k| !valid_env(k)) {
+        if s.token.is_empty()
+            || s.token.len() > 256
+            || !s.token.bytes().all(|b| (0x21..=0x7e).contains(&b))
+        {
             return Err(format!(
-                "service {name}: env {k:?} is not an environment variable name"
+                "service {name}: token must be 1-256 printable characters without spaces (e.g. \"credproxy-local\")"
             ));
         }
         if !s.auth.format.contains("{key}") {
@@ -397,7 +364,7 @@ pub fn parse(text: &str) -> Result<Config, String> {
             name.clone(),
             Service {
                 secret: PathBuf::from(format!("{}.age", s.secret)),
-                env: s.env,
+                token: s.token,
                 auth_header: s.auth.header,
                 auth_format: s.auth.format,
                 routes,
@@ -412,7 +379,6 @@ pub fn parse(text: &str) -> Result<Config, String> {
         runtime_dir: expand(&raw.runtime_dir),
         log: expand(&raw.log),
         listen: check_listen(&raw.listen)?,
-        state_dir: expand(&raw.state_dir),
         services,
     })
 }
@@ -424,7 +390,7 @@ mod tests {
     const RUNPOD: &str = r#"
 [services.runpod]
 secret = "runpod/api-key"
-env = { RUNPOD_API_URL = "{base}/v1", RUNPOD_API_KEY = "{token}" }
+token = "credproxy-local"
 [[services.runpod.routes]]
 prefix = "/graphql"
 upstream = "https://api.runpod.io/graphql"
@@ -442,18 +408,15 @@ allow = ["GET /pods", "DELETE /pods/{id}", "GET /catalog/gpus"]
     #[test]
     fn example_config_parses() {
         let c = parse(include_str!("../examples/runpod.toml")).unwrap();
-        let env = c.client_env("runpod", "tok");
-        assert!(env.contains(&(
-            "RUNPOD_REST_V2_URL".to_string(),
-            "http://127.0.0.1:7777/runpod/v2".to_string()
-        )));
-        assert!(env.contains(&("RUNPOD_API_KEY".to_string(), "tok".to_string())));
         let s = &c.services["runpod"];
+        assert_eq!(s.token, "credproxy-local");
+        assert_eq!(c.listen.to_string(), "127.0.0.1:7777");
         assert_eq!(
             s.route("/v1/pods").unwrap().0.upstream,
             "https://rest.runpod.io/v1"
         );
-        assert!(s.route("/invoke/x").is_none() && s.route("/pods").is_none());
+        assert!(s.route("/graphql").unwrap().0.graphql_queries.is_some());
+        assert!(s.route("/v2/pods").is_none() && s.route("/pods").is_none());
     }
 
     #[test]
@@ -492,16 +455,6 @@ allow = ["GET /pods", "DELETE /pods/{id}", "GET /catalog/gpus"]
         assert_eq!(s.secret, PathBuf::from("runpod/api-key.age"));
         assert_eq!(s.auth_format, "Bearer {key}");
         assert_eq!(c.listen.to_string(), "127.0.0.1:7777");
-        assert_eq!(
-            c.client_env("runpod", "tok"),
-            [
-                ("RUNPOD_API_KEY".to_string(), "tok".to_string()),
-                (
-                    "RUNPOD_API_URL".to_string(),
-                    "http://127.0.0.1:7777/runpod/v1".to_string()
-                ),
-            ]
-        );
         let (r, rest) = s.route("/graphql").unwrap();
         assert!(r.graphql_queries.is_some());
         assert_eq!(rest, "");
@@ -546,7 +499,8 @@ allow = ["GET /pods", "DELETE /pods/{id}", "GET /catalog/gpus"]
         let bad = [
             RUNPOD.replace("https://api.runpod.io", "http://api.runpod.io"),
             RUNPOD.replace("runpod/api-key", "../api-key"),
-            RUNPOD.replace("RUNPOD_API_URL", "runpod-url"),
+            RUNPOD.replace("token = \"credproxy-local\"", "token = \"two words\""),
+            RUNPOD.replace("token = \"credproxy-local\"\n", ""),
             format!("listen = \"0.0.0.0:7777\"\n{RUNPOD}"),
             format!("listen = \"7777\"\n{RUNPOD}"),
             RUNPOD.replace("GET /pods/{id}", "GET pods"),

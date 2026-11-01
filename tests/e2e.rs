@@ -125,12 +125,11 @@ listen = "127.0.0.1:{listen}"
 identity = "{d}/id.txt"
 secrets_dir = "{d}/secrets"
 runtime_dir = "{d}/run"
-state_dir = "{d}/state"
 log = "{d}/credproxy.log"
 
 [services.fake]
 secret = "fake/api-key"
-env = {{ FAKE_API_URL = "{{base}}/v1", FAKE_API_KEY = "{{token}}" }}
+token = "test-local-token"
 
 [[services.fake.routes]]
 prefix = "/graphql"
@@ -179,22 +178,13 @@ impl Env {
             .unwrap()
     }
 
-    /// FAKE_API_KEY from `credproxy env`: the token clients present.
+    /// The token clients send, as `credproxy token` prints it.
     fn token(&self) -> String {
-        let out = String::from_utf8(
-            sh(Command::new(BIN)
-                .arg("env")
-                .env("CREDPROXY_CONFIG", &self.cfg))
-            .stdout,
-        )
-        .unwrap();
-        let line = out
-            .lines()
-            .find(|l| l.starts_with("export FAKE_API_KEY="))
-            .expect("FAKE_API_KEY");
-        line.trim_start_matches("export FAKE_API_KEY=")
-            .trim_matches('\'')
-            .to_string()
+        let out = sh(Command::new(BIN)
+            .args(["token", "fake"])
+            .env("CREDPROXY_CONFIG", &self.cfg))
+        .stdout;
+        String::from_utf8(out).unwrap().trim().to_string()
     }
 
     fn log(&self) -> String {
@@ -238,7 +228,24 @@ async fn post(url: &str, token: &str, body: serde_json::Value) -> (u16, String) 
 async fn proxies_allowed_calls_only() {
     let env = setup("12h").await;
     let (base, tok) = (env.base.clone(), env.token());
-    assert_eq!(env.token(), tok, "token is stable");
+    assert_eq!(tok, "test-local-token");
+
+    // a request that names another host (DNS rebinding) is refused before anything else, and never unlocks
+    let port = base
+        .trim_start_matches("http://127.0.0.1:")
+        .split('/')
+        .next()
+        .unwrap()
+        .to_string();
+    let r = reqwest::Client::new()
+        .get(format!("{base}/v1/pods"))
+        .header("host", format!("evil.example:{port}"))
+        .header("authorization", format!("Bearer {tok}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 403);
+    assert!(r.text().await.unwrap().contains("Host"));
 
     // no token / wrong token: 401, and no unlock (no Touch ID for strangers)
     assert_eq!(get(&format!("{base}/v1/pods"), None).await.0, 401);
@@ -354,13 +361,6 @@ async fn proxies_allowed_calls_only() {
     assert!(String::from_utf8_lossy(&env.cli(&["lock", "fake"]).stdout).contains("locked: fake"));
     assert!(!env.unlocked());
     assert_eq!(get(&format!("{base}/v1/pods"), Some(&tok)).await.0, 200);
-
-    // rotate: old token refused, new one works
-    assert!(env.cli(&["rotate", "fake"]).status.success());
-    let new = env.token();
-    assert_ne!(new, tok);
-    assert_eq!(get(&format!("{base}/v1/pods"), Some(&tok)).await.0, 401);
-    assert_eq!(get(&format!("{base}/v1/pods"), Some(&new)).await.0, 200);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -372,21 +372,12 @@ async fn key_not_in_argv_env_or_files() {
         200
     );
     assert!(env.unlocked());
-    // a client shell with the env; ps -E shows argv + environment of every process we can see
-    let o = Command::new("sh")
-        .args([
-            "-c",
-            &format!("eval \"$({BIN} env)\"; ps -E -ww -ax -o pid=,command="),
-        ])
-        .env("CREDPROXY_CONFIG", &env.cfg)
+    // ps -E shows argv + environment of every process we can see
+    let o = Command::new("ps")
+        .args(["-E", "-ww", "-ax", "-o", "pid=,command="])
         .output()
         .unwrap();
     let out = String::from_utf8_lossy(&o.stdout);
-    assert!(
-        out.contains(&format!("FAKE_API_KEY={tok}")),
-        "client env carries the token"
-    );
-    assert!(out.contains("FAKE_API_URL=http://127.0.0.1:"));
     assert!(!out.contains(&env.key), "key visible in ps -E");
     // not vacuous: the daemon is in the listing, with its environment
     assert!(
