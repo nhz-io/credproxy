@@ -1,0 +1,18 @@
+# credproxy: services whose API keys it holds (sealed in ~/.secrets/<secret>.age) and what each may call.
+# Copy to ~/.config/credproxy/config.toml. Seal the key first: age -R <recipients> -o ~/.secrets/runpod/api-key.age
+idle_lock = "12h"
+
+# RunPod: what a rented-GPU launcher needs (create, inspect, delete pods; prices; billing). Nothing else.
+[services.runpod]
+secret = "runpod/api-key"
+env = "RUNPOD_PROXY"
+
+[[services.runpod.routes]]
+prefix = "/graphql"
+upstream = "https://api.runpod.io/graphql"
+graphql_queries = ["gpuTypes"]
+
+[[services.runpod.routes]]
+prefix = "/"
+upstream = "https://rest.runpod.io/v1"
+allow = ["GET /pods", "POST /pods", "GET /pods/{id}", "DELETE /pods/{id}", "GET /billing/pods"]
