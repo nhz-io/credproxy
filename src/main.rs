@@ -153,7 +153,7 @@ fn uninstall() {
         &format!("gui/{}/{LABEL}", unsafe { libc::getuid() }),
     ]);
     let _ = std::fs::remove_file(plist_path());
-    println!("uninstalled (tokens in the state dir are kept)");
+    println!("uninstalled");
 }
 
 fn main() {

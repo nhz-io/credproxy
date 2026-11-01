@@ -1,4 +1,5 @@
-//! The HTTP side: http://127.0.0.1:<port>/<token>/<path> → allowlist → upstream with the key added → scrubbed reply.
+//! The HTTP side: http://127.0.0.1:<port>/<service>/<route>/... with the token in the service's auth header → Host and token
+//! check → allowlist → upstream with the key in place of the token → scrubbed reply.
 
 use crate::graphql;
 use crate::log;
