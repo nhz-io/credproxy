@@ -25,8 +25,6 @@ struct RawConfig {
     listen: String,
     #[serde(default = "default_state_dir")]
     state_dir: String,
-    #[serde(default = "default_true")]
-    launchd_env: bool,
     #[serde(default)]
     services: BTreeMap<String, RawService>,
 }
@@ -94,9 +92,6 @@ fn default_listen() -> String {
 fn default_state_dir() -> String {
     "~/Library/Application Support/credproxy".into()
 }
-fn default_true() -> bool {
-    true
-}
 fn default_header() -> String {
     "Authorization".into()
 }
@@ -116,8 +111,6 @@ pub struct Config {
     pub listen: SocketAddr,
     /// Holds tokens/<service> (0600): the stable per-service token clients present as their API key.
     pub state_dir: PathBuf,
-    /// Publish each service's env (URLs + token) with `launchctl setenv`, so apps started later inherit it.
-    pub launchd_env: bool,
     pub services: BTreeMap<String, Service>,
 }
 
@@ -420,7 +413,6 @@ pub fn parse(text: &str) -> Result<Config, String> {
         log: expand(&raw.log),
         listen: check_listen(&raw.listen)?,
         state_dir: expand(&raw.state_dir),
-        launchd_env: raw.launchd_env,
         services,
     })
 }

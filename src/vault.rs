@@ -144,14 +144,6 @@ impl Vault {
             .is_some_and(|s| bool::from(s.token.as_bytes().ct_eq(presented)))
     }
 
-    pub fn token(&self, service: &str) -> Option<String> {
-        self.slots
-            .lock()
-            .unwrap()
-            .get(service)
-            .map(|s| s.token.clone())
-    }
-
     pub fn rotate(&self, service: &str) -> Result<String, String> {
         if !self.cfg.services.contains_key(service) {
             return Err(format!("unknown service {service:?}"));

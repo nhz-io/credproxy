@@ -35,19 +35,6 @@ fn harden() {
     }
 }
 
-/// `launchctl setenv` each client variable of `service`, so apps started from now on inherit them.
-pub fn publish_env(cfg: &Config, service: &str, token: &str) {
-    for (k, v) in cfg.client_env(service, token) {
-        let ok = std::process::Command::new("/bin/launchctl")
-            .args(["setenv", &k, &v])
-            .status()
-            .is_ok_and(|s| s.success());
-        if !ok {
-            log::line(&cfg.log, &format!("- launchctl setenv {k} failed"));
-        }
-    }
-}
-
 pub fn run(cfg_path: &Path) -> Result<(), String> {
     let cfg = config::load(cfg_path)?;
     harden();
@@ -73,11 +60,6 @@ async fn serve(cfg: Config) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
 
     let vault = Arc::new(Vault::new(cfg)?);
-    if vault.cfg.launchd_env {
-        for s in vault.cfg.services.keys() {
-            publish_env(&vault.cfg, s, &vault.token(s).unwrap_or_default());
-        }
-    }
     let http = proxy::client();
     let stop = Arc::new(Notify::new());
     log::line(
@@ -157,10 +139,7 @@ async fn control(conn: UnixStream, vault: Arc<Vault>, stop: Arc<Notify>) {
             Err(e) => json!({"ok": false, "error": e}),
         },
         (Some("rotate"), Some(s)) => match vault.rotate(s) {
-            Ok(t) => {
-                if vault.cfg.launchd_env {
-                    publish_env(&vault.cfg, s, &t);
-                }
+            Ok(_) => {
                 log::line(&vault.cfg.log, &format!("{s} token rotated"));
                 json!({"ok": true})
             }

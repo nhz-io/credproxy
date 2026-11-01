@@ -31,7 +31,7 @@ forwards over HTTPS and returns the reply with the key scrubbed out. The token i
 | Daemon | LaunchAgent (`credproxy install`): starts at login, locked; restarted if it exits. |
 | URL | `http://<listen>/<service>/<route prefix>/…`, `listen` fixed (default `127.0.0.1:7777`, loopback only). |
 | Token | Per service, 256-bit random, in `<state_dir>/tokens/<service>` (0600, dir 0700); stable until `credproxy rotate`. The client sends it in the service's own auth header (e.g. `Authorization: Bearer <token>`); compared in constant time. Missing or wrong → 401. |
-| Client env | Per service `[env]` templates (`{base}`, `{token}`). The daemon publishes them with `launchctl setenv` at start and on rotate (apps launched later inherit them); `credproxy env` prints them as `export` lines for shell profiles. |
+| Client env | Per service `[env]` templates (`{base}`, `{token}`); `credproxy env` prints them as `export` lines. Set them only where they're used (shell profile, a tool's own config), not globally: crash and telemetry reports of unrelated apps can include environment variables. |
 | Unlock | On the first allowed request for a locked service (or `credproxy unlock`): `age -d -i <identity> <secrets_dir>/<secret>.age`, plaintext read from a pipe into memory (zeroed on lock). One line of printable ASCII. A failed unlock (Touch ID denied) blocks new prompts from requests for 30 s. |
 | Order | Token → allowlist → key. A request that would be refused never triggers an unlock. |
 | Lock | After `idle_lock` without use (default 12 h), on `credproxy lock [service]`, and when the daemon exits. |
@@ -44,8 +44,8 @@ forwards over HTTPS and returns the reply with the key scrubbed out. The token i
 
 ## Limits (read these)
 
-- **The token is in every process's environment** (by design, so every tool finds it) and in the token file. Anything
-  running as you can read it and use the proxy within the allowlist — like ssh-agent. It cannot get the key through
+- **The token is in the environment of the shells and tools you give it to**, and in the token file. Anything
+  running as you can read the file and use the proxy within the allowlist — like ssh-agent. It cannot get the key through
   credproxy.
 - **Using a locked service raises a Touch ID prompt** (with age-plugin-se). Deny prompts you didn't expect.
 - **Root, or a process able to read the daemon's memory, can read the key.** Copies of it also pass through the
@@ -54,8 +54,6 @@ forwards over HTTPS and returns the reply with the key scrubbed out. The token i
 - **Scrubbing catches the key verbatim only**, not encoded forms (base64, URL-encoded).
 - **The allowlist covers method and path.** Query strings and REST request bodies are passed through unchecked, so
   an allowed `POST /pods` can create any pod the API allows.
-- **`launchctl setenv` reaches apps started after it**, not ones already running; shells get the variables from
-  `credproxy env` in the profile.
 
 ## Install
 
@@ -96,8 +94,7 @@ launchd.
 ```toml
 idle_lock = "12h"                                  # s, m or h
 listen = "127.0.0.1:7777"
-# launchd_env = true                               # defaults shown
-# age = "age"
+# age = "age"                                      # defaults shown
 # identity = "~/.config/age/se-identity.txt"
 # secrets_dir = "~/.secrets"
 # state_dir = "~/Library/Application Support/credproxy"
@@ -128,8 +125,8 @@ The daemon reads the config at start; after changing it, `credproxy stop` (launc
 | `credproxy unlock <service>` | Unlock now (e.g. before a long job), instead of on the first request |
 | `credproxy lock [<service>]` | Forget the key(s) now |
 | `credproxy rotate <service>` | New token; the old one stops working. New shells and apps get it |
-| `credproxy env [--launchctl]` | Client variables as `export` lines, or set them in launchd |
-| `credproxy install` / `uninstall` | LaunchAgent on/off (`uninstall` also unsets the launchd variables) |
+| `credproxy env` | Client variables as `export` lines (for `eval` in a shell profile) |
+| `credproxy install` / `uninstall` | LaunchAgent on/off |
 | `credproxy stop` | Stop the daemon (locks everything; launchd starts a fresh one) |
 
 ## License

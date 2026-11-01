@@ -16,13 +16,13 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 const USAGE: &str = "usage:
-  credproxy env [--launchctl]     client variables (URLs + token) as `export` lines; --launchctl sets them in launchd
+  credproxy env                   client variables (URLs + token) as `export` lines, for shell profiles
   credproxy status                which services are unlocked, and for how long
   credproxy unlock <service>      unlock now (Touch ID); otherwise the first request unlocks
   credproxy lock [<service>]      forget the key(s) now
   credproxy rotate <service>      new token (old one stops working); new shells and apps get it
   credproxy install               LaunchAgent: start at login, restart if it exits
-  credproxy uninstall             remove the LaunchAgent and the launchd variables
+  credproxy uninstall             remove the LaunchAgent
   credproxy stop                  stop the daemon (locks everything; launchd starts it again)
   credproxy serve                 run the daemon in the foreground
 
@@ -152,19 +152,12 @@ fn install(cfg_path: &Path) -> Result<(), String> {
     ))
 }
 
-fn uninstall(cfg: Option<&config::Config>) {
+fn uninstall() {
     launchctl(&[
         "bootout",
         &format!("gui/{}/{LABEL}", unsafe { libc::getuid() }),
     ]);
     let _ = std::fs::remove_file(plist_path());
-    if let Some(cfg) = cfg {
-        for svc in cfg.services.values() {
-            for k in svc.env.keys() {
-                launchctl(&["unsetenv", k]);
-            }
-        }
-    }
     println!("uninstalled (tokens in the state dir are kept)");
 }
 
@@ -187,7 +180,7 @@ fn main() {
         return;
     }
     if cmd == "uninstall" {
-        uninstall(config::load(&cfg_path).ok().as_ref());
+        uninstall();
         return;
     }
     let cfg = config::load(&cfg_path).unwrap_or_else(|e| die(&e));
@@ -206,15 +199,10 @@ fn main() {
     };
     match cmd {
         "env" => {
-            let launchd = service == Some("--launchctl");
             for name in cfg.services.keys() {
                 let token = vault::token(&cfg, name).unwrap_or_else(|e| die(&e));
-                if launchd {
-                    serve::publish_env(&cfg, name, &token);
-                } else {
-                    for (k, v) in cfg.client_env(name, &token) {
-                        println!("export {k}={}", sh_quote(&v));
-                    }
+                for (k, v) in cfg.client_env(name, &token) {
+                    println!("export {k}={}", sh_quote(&v));
                 }
             }
         }

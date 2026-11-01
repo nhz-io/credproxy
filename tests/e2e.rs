@@ -122,7 +122,6 @@ async fn setup(idle: &str) -> Env {
         format!(
             r#"idle_lock = "{idle}"
 listen = "127.0.0.1:{listen}"
-launchd_env = false
 identity = "{d}/id.txt"
 secrets_dir = "{d}/secrets"
 runtime_dir = "{d}/run"
