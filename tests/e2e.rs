@@ -528,6 +528,11 @@ async fn token_changes_on_restart() {
     );
     assert!(env.cli(&["stop"]).status.success());
     env.daemon.take().unwrap().wait().unwrap();
+    let hint = env.cli(&["token", "fake"]);
+    assert!(
+        String::from_utf8_lossy(&hint.stderr).contains("credproxy restart"),
+        "stopped daemon: hint says restart"
+    );
     env.daemon = Some(
         Command::new(BIN)
             .arg("serve")

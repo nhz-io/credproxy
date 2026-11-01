@@ -340,7 +340,7 @@ impl Vault {
     }
 
     /// (service, state, seconds): "unlocked" (seconds until idle lock), "unlocking", "paused" (locked after a
-    /// refused unlock: seconds until requests may prompt again), or "locked".
+    /// refused or failed unlock: seconds until requests may prompt again), or "locked".
     pub fn status(&self) -> Vec<(String, &'static str, u64)> {
         let slots = self.slots.lock().unwrap();
         self.cfg

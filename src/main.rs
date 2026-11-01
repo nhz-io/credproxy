@@ -20,7 +20,7 @@ const USAGE: &str = "usage:
   credproxy status                which services are unlocked, and for how long
   credproxy unlock <service>      unlock now (Touch ID); otherwise the first request unlocks
   credproxy lock [<service>]      forget the key(s) now
-  credproxy install               LaunchAgent: start at login, restart if it exits
+  credproxy install               LaunchAgent: start at login, restart after a crash
   credproxy uninstall             remove the LaunchAgent
   credproxy restart               restart the daemon (locks everything; reloads the config)
   credproxy stop                  stop the daemon until `restart` or the next login
@@ -42,8 +42,10 @@ fn config_path() -> PathBuf {
 }
 
 fn request(sock: &Path, req: &Value, timeout: Duration) -> Result<Value, String> {
-    let mut s =
-        UnixStream::connect(sock).map_err(|_| "not running (credproxy install)".to_string())?;
+    let mut s = UnixStream::connect(sock).map_err(|_| {
+        "not running (`credproxy restart`; `credproxy install` if it was never installed)"
+            .to_string()
+    })?;
     s.set_read_timeout(Some(timeout))
         .map_err(|e| e.to_string())?;
     s.write_all(format!("{req}\n").as_bytes())
@@ -97,7 +99,7 @@ fn launchctl(args: &[&str]) -> bool {
         .is_ok_and(|s| s.success())
 }
 
-/// The LaunchAgent: `<exe> serve` at login, restarted if it exits.
+/// The LaunchAgent: `<exe> serve` at login, restarted after a crash (not after a clean exit).
 fn plist(exe: &str, config: Option<&str>, err_log: &str) -> String {
     let mut env = String::from(
         "\t\t<key>PATH</key>\n\t\t<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>\n",
@@ -319,7 +321,7 @@ fn main() {
                             println!("  {name}: unlocking (waiting for Touch ID / password)")
                         }
                         "paused" => println!(
-                            "  {name}: locked (no new prompt for {}s after a refused unlock; `credproxy unlock {name}` to retry now)",
+                            "  {name}: locked (no new prompt for {}s after a refused or failed unlock, see the log; `credproxy unlock {name}` to retry now)",
                             s["locks_in_secs"].as_u64().unwrap_or(0)
                         ),
                         other => println!("  {name}: {other}"),
