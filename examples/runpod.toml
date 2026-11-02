@@ -14,7 +14,8 @@ secret = "runpod/api-key"
 prefix = "/v1"
 upstream = "https://rest.runpod.io/v1"
 allow = [
-  "GET /pods", "POST /pods", "GET /pods/{id}", "DELETE /pods/{id}", "GET /billing/pods",
+  "GET /pods", "POST /pods", "GET /pods/{id}", "DELETE /pods/{id}", "POST /pods/{id}/start", "POST /pods/{id}/stop",
+  "GET /billing/pods", "GET /templates",
   "GET /networkvolumes", "POST /networkvolumes", "GET /networkvolumes/{id}", "DELETE /networkvolumes/{id}",
 ]
 

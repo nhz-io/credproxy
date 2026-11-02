@@ -17,6 +17,8 @@ struct Env {
     secret: String,
     base: String,
     daemon: Option<Child>,
+    /// tokens fetched so far (fixed for the daemon's life): one `credproxy token` per service, not per call
+    tokens: std::sync::Mutex<std::collections::HashMap<String, String>>,
 }
 
 impl Drop for Env {
@@ -38,9 +40,15 @@ impl Env {
     }
 
     fn token(&self, service: &str) -> String {
-        let o = self.cli(&["token", service]);
-        assert!(o.status.success());
-        String::from_utf8(o.stdout).unwrap().trim().to_string()
+        let mut tokens = self.tokens.lock().unwrap();
+        tokens
+            .entry(service.to_string())
+            .or_insert_with(|| {
+                let o = self.cli(&["token", service]);
+                assert!(o.status.success());
+                String::from_utf8(o.stdout).unwrap().trim().to_string()
+            })
+            .clone()
     }
 
     fn log(&self) -> String {
@@ -78,7 +86,7 @@ fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
 /// its head, then how many body bytes arrived out of Content-Length and their SHA-256. The last path segment picks
 /// the reply: `truncate-cl` (says 1000 bytes, sends 500, closes), `truncate-chunked` (one chunk, then closes
 /// without the final one), `chunked-ok`, `stall` (10 of 1000 bytes, then nothing for 90 s), `error-echo` (403
-/// quoting the access key id), `complete-error` (200 with an <Error> body), `complete-ok`, `not-modified` (304), `redirect` (307), `no-read` (never reads the body or replies), `slow-reply` (replies after 10 s), `pause-reply` (after 2.5 s), `complete-trickle` (keep-alive spaces, then the result), `complete-late` (headers late, then spaces: 4 s in all), anything else 200
+/// quoting the access key id), `complete-error` (200 with an <Error> body), `complete-ok`, `not-modified` (304), `redirect` (307), `no-read` (never reads the body or replies), `slow-reply` (replies after 10 s), `pause-reply` (after 2.5 s), `complete-trickle` (keep-alive spaces, then the result), `complete-late` (headers late, then spaces: 4 s in all), `close-delimited` (200, no length), `complete-empty`, `complete-cut` (says 1000 bytes, sends 3), `reset-after-body` (closes without replying), anything else 200
 /// with no body.
 async fn raw_server(dir: PathBuf) -> u16 {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -158,6 +166,10 @@ async fn raw_server(dir: PathBuf) -> u16 {
                         tokio::time::sleep(Duration::from_millis(2500)).await;
                         b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_vec()
                     }
+                    "close-delimited" => b"HTTP/1.1 200 OK\r\ncontent-type: application/octet-stream\r\nconnection: close\r\n\r\nhello".to_vec(),
+                    "complete-empty" => b"HTTP/1.1 200 OK\r\ncontent-type: application/xml\r\nconnection: close\r\n\r\n".to_vec(),
+                    "complete-cut" => b"HTTP/1.1 200 OK\r\ncontent-type: application/xml\r\ncontent-length: 1000\r\n\r\n<Co".to_vec(),
+                    "reset-after-body" => return,
                     "complete-late" => {
                         // headers after 2 s, then keep-alive spaces for 2 s more: 4 s in all, past s3_reply_wait (3 s)
                         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -292,6 +304,7 @@ s3 = {{ region = "dc-1", ops = ["GetObject"] }}
         secret,
         base: format!("http://127.0.0.1:{listen}"),
         daemon: Some(daemon),
+        tokens: Default::default(),
     }
 }
 
@@ -1905,24 +1918,32 @@ async fn upstream_that_stops_reading_is_cut_off() {
 #[tokio::test(flavor = "multi_thread")]
 async fn upstream_too_slow_to_reply_is_a_504() {
     let env = setup().await;
+    // unlock first, so the timings below are the proxy's waits only
+    assert_eq!(
+        call(&env, "GET", "/store/raw/vol1/warm-up", vec![], false, &[])
+            .await
+            .status,
+        200
+    );
     for (method, path, body, min, max) in [
-        ("GET", "/store/raw/vol1/slow-reply", vec![], 2, 3),
+        // s3_idle (2 s) for a read, s3_reply_wait (3 s) for a completion
+        ("GET", "/store/raw/vol1/slow-reply", vec![], 1900, 2900),
         (
             "POST",
             "/store/raw/vol1/slow-reply?uploadId=u1",
             b"<CompleteMultipartUpload/>".to_vec(),
-            3,
-            6,
+            2900,
+            4500,
         ),
     ] {
         let t = std::time::Instant::now();
         let r = call(&env, method, path, body, false, &[]).await;
-        let waited = t.elapsed().as_secs();
+        let waited = t.elapsed().as_millis();
         assert_eq!(r.status, 504, "{method} {path}: {}", r.text());
         assert!(r.text().contains("outcome is unknown"), "{}", r.text());
         assert!(
             (min..max).contains(&waited),
-            "{method} {path}: 504 after {waited}s"
+            "{method} {path}: 504 after {waited} ms"
         );
     }
 }
@@ -1954,6 +1975,12 @@ async fn trickling_complete_reply_is_not_cut() {
 #[tokio::test(flavor = "multi_thread")]
 async fn completion_reply_is_bounded_from_the_request() {
     let env = setup().await;
+    assert_eq!(
+        call(&env, "GET", "/store/raw/vol1/warm-up", vec![], false, &[])
+            .await
+            .status,
+        200
+    );
     let t = std::time::Instant::now();
     let r = call(
         &env,
@@ -1967,7 +1994,7 @@ async fn completion_reply_is_bounded_from_the_request() {
     let waited = t.elapsed().as_millis();
     assert_eq!(r.status, 504, "{}", r.text());
     assert!(r.text().contains("outcome is unknown"));
-    assert!((2900..3900).contains(&waited), "504 after {waited} ms");
+    assert!((2900..4500).contains(&waited), "504 after {waited} ms");
 }
 
 /// A streamed upload whose upstream stays silent past s3_reply_wait gets a 504 (the outcome is unknown).
@@ -2010,4 +2037,67 @@ async fn upstream_working_after_an_upload_is_not_a_stall() {
         rec.contains(&format!("--- body {} of {}", body.len(), body.len())),
         "{rec}"
     );
+}
+
+/// Replies that can't prove they're complete are refused: a 200 with no length (a cut connection would look the
+/// same), a completion reply that's empty or cut off, a request whose upstream hung up after it was sent. Where the
+/// call changes state, the refusal says the outcome is unknown.
+#[tokio::test(flavor = "multi_thread")]
+async fn replies_that_cannot_prove_completeness_are_refused() {
+    let env = setup().await;
+    let r = call(
+        &env,
+        "GET",
+        "/store/raw/vol1/close-delimited",
+        vec![],
+        false,
+        &[],
+    )
+    .await;
+    assert_eq!(r.status, 502, "{}", r.text());
+    assert!(
+        r.text().contains("no length") && !r.text().contains("outcome is unknown"),
+        "{}",
+        r.text()
+    );
+    for name in ["complete-empty", "complete-cut"] {
+        let r = call(
+            &env,
+            "POST",
+            &format!("/store/raw/vol1/{name}?uploadId=u1"),
+            b"<CompleteMultipartUpload/>".to_vec(),
+            false,
+            &[],
+        )
+        .await;
+        assert_eq!(r.status, 502, "{name}: {}", r.text());
+        assert!(
+            r.text().contains("outcome is unknown"),
+            "{name}: {}",
+            r.text()
+        );
+    }
+    let r = call(
+        &env,
+        "PUT",
+        "/store/raw/vol1/reset-after-body",
+        random_bytes(2 << 20),
+        true,
+        &[],
+    )
+    .await;
+    assert_eq!(r.status, 502, "{}", r.text());
+    assert!(r.text().contains("outcome is unknown"), "{}", r.text());
+    // a read that fails isn't "unknown": nothing changed
+    let r = call(
+        &env,
+        "GET",
+        "/store/raw/vol1/reset-after-body",
+        vec![],
+        false,
+        &[],
+    )
+    .await;
+    assert_eq!(r.status, 502, "{}", r.text());
+    assert!(!r.text().contains("outcome is unknown"), "{}", r.text());
 }

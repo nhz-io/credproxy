@@ -22,6 +22,10 @@ pub const MAX_RESPONSE: usize = 16 << 20;
 /// Largest S3 request body (one PutObject or UploadPart). RunPod's limit per part is 500 MB.
 pub const MAX_S3_BODY: u64 = 512 << 20;
 pub const USER_AGENT: &str = concat!("credproxy/", env!("CARGO_PKG_VERSION"));
+/// Upstream TCP connect (DNS included), for both clients.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// How S3 refusals and failures after a state-changing request may have reached the upstream say so.
+const OUTCOME_UNKNOWN: &str = "the outcome is unknown (it may still complete); check the object (HEAD, ListParts) before retrying";
 /// Whole upstream call for key-in-header routes.
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(60);
 /// A client that takes this long to send a small (key-in-header) body is refused. S3 calls use the config's
@@ -107,7 +111,7 @@ pub struct Clients {
 fn api_builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(Duration::from_secs(30))
+        .connect_timeout(CONNECT_TIMEOUT)
         .user_agent(USER_AGENT)
         .no_proxy()
 }
@@ -602,7 +606,9 @@ async fn forward_s3(
         Ok(k) => k,
         Err(e) => return reply(StatusCode::SERVICE_UNAVAILABLE, &e),
     };
-    progress.touch();
+    // connecting to the upstream (and TLS) comes before any byte can move: expected silence too
+    let idle_limit = vault.cfg.s3_idle;
+    progress.quiet_for(CONNECT_TIMEOUT + idle_limit);
     let Some((access_key, secret)) = key.split_once('\n') else {
         return reply(StatusCode::INTERNAL_SERVER_ERROR, "bad key");
     };
@@ -648,19 +654,23 @@ async fn forward_s3(
     }
     // Once the whole request is out, the upstream may be silent before replying: up to s3_reply_wait where it
     // has real work to do (storing an upload, assembling a multipart upload), s3_idle otherwise.
-    let idle_limit = vault.cfg.s3_idle;
     let reply_limit = if target.op.streams_body() || target.op == s3::Op::CompleteMultipartUpload {
         vault.cfg.s3_reply_wait
     } else {
         idle_limit
     };
     let (sent_tx, sent_rx) = tokio::sync::oneshot::channel::<()>();
+    // once a state-changing request has gone out, a failure can't tell whether the upstream acted on it
+    let changes = method != "GET" && method != "HEAD";
+    let sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
     // called once the last request byte has been handed on: from then on silence is the upstream working
     let mut on_sent = {
         let progress = progress.clone();
+        let sent = sent.clone();
         let mut sent_tx = Some(sent_tx);
         move || {
             if let Some(t) = sent_tx.take() {
+                sent.store(true, std::sync::atomic::Ordering::Relaxed);
                 progress.quiet_for(reply_limit + idle_limit);
                 let _ = t.send(());
             }
@@ -709,13 +719,21 @@ async fn forward_s3(
     let res = tokio::select! {
         r = out.send() => match r {
             Ok(r) => r,
+            Err(_) if changes && sent.load(std::sync::atomic::Ordering::Relaxed) => {
+                return reply(
+                    StatusCode::BAD_GATEWAY,
+                    &format!("upstream failed after the request was sent: {OUTCOME_UNKNOWN}"),
+                );
+            }
             Err(e) => return upstream_failed(&e),
         },
         _ = no_reply => {
             return reply(
                 StatusCode::GATEWAY_TIMEOUT,
-                "upstream sent no reply in time (s3_idle, or s3_reply_wait for uploads and completions): the \
-                 outcome is unknown (it may still complete); check the object (HEAD, ListParts) before retrying",
+                &format!(
+                    "upstream sent no reply in time (s3_idle, or s3_reply_wait for uploads and completions): \
+                     {OUTCOME_UNKNOWN}"
+                ),
             );
         }
     };
@@ -749,23 +767,57 @@ async fn forward_s3(
         let read = read_reply(res, &secrets, None);
         let (status, ctype, body) = match tokio::time::timeout(left, read).await {
             Ok(Ok(r)) => r,
-            Ok(Err(r)) => return r,
+            Ok(Err(_)) => {
+                return reply(
+                    StatusCode::BAD_GATEWAY,
+                    &format!(
+                        "the upstream's CompleteMultipartUpload reply broke off or was unreadable: {OUTCOME_UNKNOWN}"
+                    ),
+                );
+            }
             Err(_) => {
                 return reply(
                     StatusCode::GATEWAY_TIMEOUT,
-                    "upstream did not finish CompleteMultipartUpload within s3_reply_wait: the outcome is \
-                     unknown (it may still complete); check the object (HEAD, ListParts) before retrying",
+                    &format!(
+                        "upstream did not finish CompleteMultipartUpload within s3_reply_wait: {OUTCOME_UNKNOWN}"
+                    ),
                 );
             }
         };
         progress.touch();
-        let failed = body.windows(7).any(|w| w == b"<Error>");
-        let status = if failed {
-            StatusCode::BAD_GATEWAY
-        } else {
-            status
-        };
+        // success is the result element, not just the absence of <Error>: an empty or cut-off body is no proof
+        let has = |tag: &[u8]| body.windows(tag.len()).any(|w| w == tag);
+        if has(b"<Error>") {
+            return reply_with(StatusCode::BAD_GATEWAY, ctype, body);
+        }
+        if !has(b"<CompleteMultipartUploadResult") {
+            return reply(
+                StatusCode::BAD_GATEWAY,
+                &format!(
+                    "the upstream's CompleteMultipartUpload reply has no result: {OUTCOME_UNKNOWN}"
+                ),
+            );
+        }
         return reply_with(status, ctype, body);
+    }
+    // A body that ends when the connection closes can't be told from one cut short: only replies that say how
+    // long they are (or are chunked, with an end marker) stream through.
+    let chunked = res.headers().get_all("transfer-encoding").iter().any(|v| {
+        v.as_bytes()
+            .to_ascii_lowercase()
+            .windows(7)
+            .any(|w| w == b"chunked")
+    });
+    let bodiless = method == "HEAD" || res.status() == reqwest::StatusCode::NO_CONTENT;
+    if !bodiless && !chunked && res.headers().get("content-length").is_none() {
+        let msg = if changes {
+            format!(
+                "upstream reply has no length, so a cut-off one couldn't be told apart: {OUTCOME_UNKNOWN}"
+            )
+        } else {
+            "upstream reply has no length, so a cut-off one couldn't be told apart".to_string()
+        };
+        return reply(StatusCode::BAD_GATEWAY, &msg);
     }
     let mut b = Response::builder().status(res.status().as_u16());
     for n in S3_REPLY_HEADERS {
