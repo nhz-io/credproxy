@@ -335,8 +335,9 @@ async fn buffered_reply(mut res: reqwest::Response, secrets: &[&[u8]]) -> Respon
     b.body(full(clean(&buf))).unwrap()
 }
 
-/// Client headers an S3 call may carry upstream (all signed). Others are dropped: notably `x-amz-copy-source`
-/// (CopyObject, UploadPartCopy) and the client's own auth.
+/// Client headers an S3 call may carry upstream (all signed). Other headers are dropped, except `x-amz-*` ones,
+/// which refuse the call (see S3_CLIENT_AMZ_OK): dropping `x-amz-copy-source` would turn a CopyObject into an
+/// empty PutObject that overwrites its destination.
 const S3_REQUEST_HEADERS: [&str; 5] = [
     "content-type",
     "content-md5",
@@ -344,9 +345,14 @@ const S3_REQUEST_HEADERS: [&str; 5] = [
     "if-match",
     "if-none-match",
 ];
+/// The only `x-amz-*` headers a client may send: the payload hash, and two the signature replaces anyway.
+const S3_CLIENT_AMZ_OK: [&str; 3] = ["x-amz-content-sha256", "x-amz-date", "x-amz-user-agent"];
 /// Upstream headers a successful S3 reply keeps (multipart needs the ETag).
-const S3_REPLY_HEADERS: [&str; 6] = [
+const S3_REPLY_HEADERS: [&str; 9] = [
     "content-type",
+    "content-encoding",
+    "content-disposition",
+    "cache-control",
     "content-length",
     "content-range",
     "accept-ranges",
@@ -385,6 +391,17 @@ async fn forward_s3(
         );
     }
     let (parts, body) = req.into_parts();
+    // A header-selected variant (copy, SSE, tagging, metadata, checksums) is refused rather than silently changed.
+    if let Some(h) = parts
+        .headers
+        .keys()
+        .find(|h| h.as_str().starts_with("x-amz-") && !S3_CLIENT_AMZ_OK.contains(&h.as_str()))
+    {
+        return reply(
+            StatusCode::FORBIDDEN,
+            &format!("header {} not allowed", h.as_str()),
+        );
+    }
     let claimed = match parts
         .headers
         .get("x-amz-content-sha256")

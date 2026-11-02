@@ -328,11 +328,17 @@ fn check_s3(r: RawS3) -> Result<S3Route, String> {
         .iter()
         .map(|o| Op::from_name(o).ok_or(format!("unknown s3 operation {o:?}")))
         .collect::<Result<Vec<_>, _>>()?;
-    if r.key_prefixes
-        .iter()
-        .any(|p| p.is_empty() || p.starts_with('/') || p.chars().any(char::is_control))
-    {
-        return Err("s3.key_prefixes: non-empty, without a leading /".into());
+    if r.key_prefixes.iter().any(|p| {
+        p.starts_with('/')
+            || !p.ends_with('/')
+            || p.chars().any(char::is_control)
+            || p.trim_end_matches('/')
+                .split('/')
+                .any(|s| s.is_empty() || s == "." || s == "..")
+    }) {
+        return Err(
+            "s3.key_prefixes: directories like \"runs/\" (ending in /, no leading /)".into(),
+        );
     }
     Ok(S3Route {
         region: r.region,
@@ -631,7 +637,10 @@ s3 = { region = "EU-RO-1", ops = ["GetObject", "PutObject"] }
             S3.replace("EU-RO-1", "eu/ro"),
             S3.replace("service = \"s3\"", "service = \"S3\""),
             S3.replace("s3 = {", "allow = [\"GET /x\"]\ns3 = {"),
-            S3.replace("ops = [", "key_prefixes = [\"/x\"], ops = ["),
+            S3.replace("ops = [", "key_prefixes = [\"/x/\"], ops = ["),
+            S3.replace("ops = [", "key_prefixes = [\"runs\"], ops = ["),
+            S3.replace("ops = [", "key_prefixes = [\"a/../b/\"], ops = ["),
+            S3.replace("ops = [", "key_prefixes = [\"/\"], ops = ["),
             format!(
                 "{S3}[[services.runpod-s3.routes]]\nprefix = \"/v1\"\nupstream = \"https://x\"\nallow = [\"GET /x\"]\n"
             ),

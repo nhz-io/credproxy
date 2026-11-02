@@ -555,20 +555,22 @@ async fn refuses_what_is_not_allowed() {
         assert_eq!(r.status, status, "{v}: {}", r.text());
     }
 
-    // CopyObject: the copy-source header is dropped, so this is a plain PutObject of the (empty) body
-    let r = call(
-        &env,
-        "PUT",
-        "/store/dc-1/vol1/copy.txt",
-        vec![],
-        false,
-        &[("x-amz-copy-source", "/vol1/private.txt")],
-    )
-    .await;
-    assert_eq!(r.status, 200, "{}", r.text());
+    // header-selected variants are refused, not turned into something else (CopyObject would become an empty
+    // PutObject over the destination)
+    std::fs::write(env.dir.path().join("store/vol1/dst.txt"), "keep").unwrap();
+    for h in [
+        ("x-amz-copy-source", "/vol1/private.txt"),
+        ("x-amz-meta-a", "1"),
+        ("x-amz-tagging", "a=1"),
+        ("x-amz-server-side-encryption", "AES256"),
+        ("x-amz-checksum-crc32", "AAAAAA=="),
+    ] {
+        let r = call(&env, "PUT", "/store/dc-1/vol1/dst.txt", vec![], false, &[h]).await;
+        assert_eq!(r.status, 403, "{h:?}: {}", r.text());
+    }
     assert_eq!(
-        std::fs::read(env.dir.path().join("store/vol1/copy.txt")).unwrap(),
-        b""
+        std::fs::read(env.dir.path().join("store/vol1/dst.txt")).unwrap(),
+        b"keep"
     );
 
     // no token, another service's token

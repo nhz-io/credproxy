@@ -111,6 +111,20 @@ fn valid_key(k: &str) -> bool {
             .all(|s| !s.is_empty() && s != "." && s != "..")
 }
 
+/// A ListObjectsV2 prefix: like a key, but it may end in a partial segment or `/`, and may be empty.
+fn valid_prefix(p: &str) -> bool {
+    if p.is_empty() {
+        return true;
+    }
+    let body = p.strip_suffix('/').unwrap_or(p);
+    p.len() <= 1024
+        && !p.chars().any(char::is_control)
+        && !body.is_empty()
+        && body
+            .split('/')
+            .all(|s| !s.is_empty() && s != "." && s != "..")
+}
+
 /// Which allowed S3 call this is, or why not. `prefixes`, if any, limit object keys and list prefixes.
 pub fn classify(
     method: &str,
@@ -178,11 +192,12 @@ pub fn classify(
                 ],
             ) && get("list-type") == Some("2") =>
         {
-            if !prefixes.is_empty() {
-                let p = get("prefix").unwrap_or("");
-                if !prefixes.iter().any(|x| p.starts_with(x.as_str())) {
-                    return Err("list prefix outside the allowed prefixes".into());
-                }
+            let p = get("prefix").unwrap_or("");
+            if !valid_prefix(p) {
+                return Err("bad list prefix".into());
+            }
+            if !prefixes.is_empty() && !prefixes.iter().any(|x| p.starts_with(x.as_str())) {
+                return Err("list prefix outside the allowed prefixes".into());
             }
             Op::ListObjectsV2
         }
@@ -411,6 +426,12 @@ mod tests {
         assert!(classify("GET", "/vol", Some("list-type=2&prefix=runs/x"), &p).is_ok());
         assert!(classify("GET", "/vol", Some("list-type=2"), &p).is_err());
         assert!(classify("GET", "/vol", Some("list-type=2&prefix=r"), &p).is_err());
+        assert!(classify("GET", "/vol", Some("list-type=2&prefix=runs/../x/"), &p).is_err());
+        assert!(classify("GET", "/vol", Some("list-type=2&prefix=runs%2F..%2Fx"), &p).is_err());
+        assert!(classify("GET", "/vol", Some("list-type=2&prefix=runs//"), &p).is_err());
+        assert!(classify("GET", "/vol", Some("list-type=2&prefix=runs/a"), &p).is_ok());
+        assert!(classify("GET", "/vol", Some("list-type=2&prefix=.."), &[]).is_err());
+        assert!(classify("GET", "/vol", Some("list-type=2&prefix="), &[]).is_ok());
     }
 
     #[test]
