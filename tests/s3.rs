@@ -1267,6 +1267,12 @@ async fn stalled_download_is_cut_off() {
         (1..6).contains(&waited),
         "cut off after {waited}s (s3_idle is 2s)"
     );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let log = env.log();
+    assert!(
+        log.contains("store GET /raw/vol1/stall cut off: no progress for 2s"),
+        "{log}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1764,6 +1770,12 @@ async fn stalled_upload_is_cut_off() {
         "cut off after {waited}s (s3_idle is 2s)"
     );
     drop(c);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let log = env.log();
+    assert!(
+        log.contains("store PUT /raw/vol1/stalled-up cut off: no progress for 2s"),
+        "{log}"
+    );
 }
 
 /// boto3 configured as the README says, through the proxy (put, get, head, multipart upload_file and
@@ -1831,7 +1843,11 @@ async fn client_that_stops_reading_is_cut_off() {
     let done = tokio::time::timeout(Duration::from_secs(20), c.read_to_end(&mut got)).await;
     assert!(done.is_ok(), "the proxy kept the stalled download open");
     assert!(got.len() < body.len(), "the whole body arrived anyway");
-    assert!(env.log().contains("reply broke off") || got.len() < body.len());
+    let log = env.log();
+    assert!(
+        log.contains("store GET /dc-1/vol1/unread.bin cut off: no progress for 2s"),
+        "{log}"
+    );
 }
 
 /// An upstream that stops accepting an upload's bytes (and never replies) is cut off.
@@ -1852,6 +1868,12 @@ async fn upstream_that_stops_reading_is_cut_off() {
     assert!(
         (1..10).contains(&waited),
         "cut off after {waited}s (s3_idle is 2s)"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let log = env.log();
+    assert!(
+        log.contains("store PUT /raw/vol1/no-read cut off: no progress for 2s"),
+        "{log}"
     );
 }
 

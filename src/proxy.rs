@@ -8,7 +8,7 @@ use crate::log;
 use crate::s3;
 use crate::vault::Vault;
 use bytes::Bytes;
-use futures_util::{Stream, StreamExt, TryStreamExt};
+use futures_util::TryStreamExt;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full, Limited, StreamBody};
 use hyper::body::{Frame, Incoming};
@@ -26,7 +26,8 @@ pub const USER_AGENT: &str = concat!("credproxy/", env!("CARGO_PKG_VERSION"));
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(60);
 /// A client that takes this long to send a small (key-in-header) body is refused. S3 calls use the config's
 /// `s3_idle` and `s3_reply_wait` instead (defaults 60 s and 2 h: RunPod's docs say a CompleteMultipartUpload of a
-/// 10 GB+ file can take long and suggest a 2 h read timeout); they have no overall time limit.
+/// 10 GB+ file can take long and suggest a 2 h read timeout), enforced by the connection watchdog (serve.rs);
+/// they have no overall time limit.
 const IDLE: Duration = Duration::from_secs(60);
 
 /// What a connection's watchdog (serve.rs) needs to know: whether it carries an allowed S3 call, when bytes last
@@ -37,6 +38,8 @@ pub struct Progress {
 
 struct ProgressState {
     s3: bool,
+    /// "service METHOD path" of the S3 call, for the log line if the watchdog cuts it
+    label: Option<String>,
     last: tokio::time::Instant,
     quiet_until: Option<tokio::time::Instant>,
 }
@@ -46,6 +49,7 @@ impl Default for Progress {
         Progress {
             state: std::sync::Mutex::new(ProgressState {
                 s3: false,
+                label: None,
                 last: tokio::time::Instant::now(),
                 quiet_until: None,
             }),
@@ -58,10 +62,15 @@ impl Progress {
         self.state.lock().unwrap().s3
     }
 
-    pub(crate) fn mark_s3(&self) {
+    pub(crate) fn mark_s3(&self, label: String) {
         let mut s = self.state.lock().unwrap();
         s.s3 = true;
+        s.label = Some(label);
         s.last = tokio::time::Instant::now();
+    }
+
+    pub fn label(&self) -> String {
+        self.state.lock().unwrap().label.clone().unwrap_or_default()
     }
 
     /// Bytes moved.
@@ -127,24 +136,6 @@ fn reply(status: StatusCode, msg: &str) -> Response<Body> {
         .header("content-type", "text/plain; charset=utf-8")
         .body(full(format!("credproxy: {msg}\n")))
         .unwrap()
-}
-
-/// `s`, failing with "idle timeout" when no item arrives for `limit`.
-fn idle<S, T, E>(s: S, limit: Duration) -> impl Stream<Item = Result<T, BoxError>> + Send + 'static
-where
-    S: Stream<Item = Result<T, E>> + Send + 'static,
-    E: Into<BoxError>,
-    T: Send + 'static,
-{
-    futures_util::stream::unfold(Some(Box::pin(s)), move |state| async move {
-        let mut s = state?;
-        match tokio::time::timeout(limit, s.next()).await {
-            Ok(Some(Ok(x))) => Some((Ok(x), Some(s))),
-            Ok(Some(Err(e))) => Some((Err(e.into()), None)),
-            Ok(None) => None,
-            Err(_) => Some((Err("idle timeout".into()), None)),
-        }
-    })
 }
 
 /// Replace every occurrence of `key` in `body`.
@@ -596,8 +587,11 @@ async fn forward_s3(
         }
     };
 
-    // allowed: from now on the watchdog (not the short limit) decides, and a Touch ID prompt is expected silence
-    progress.mark_s3();
+    // allowed: from now on the watchdog (not the short limit) decides, and a Touch ID prompt is expected silence.
+    // The watchdog is the one place S3 stalls are handled, in both directions: it also sees a client that stops
+    // reading or an upstream that stops accepting, where nothing polls the streams.
+    let what = format!("{service} {method} {}{}", route.prefix, log::printable(sub));
+    progress.mark_s3(what.clone());
     progress.quiet_for(crate::vault::UNLOCK_TIMEOUT + Duration::from_secs(10));
     let key = match vault.key(service, false).await {
         Ok(k) => k,
@@ -661,20 +655,16 @@ async fn forward_s3(
             }
         }
     };
+    if !matches!(payload, Payload::Stream(..)) {
+        on_sent();
+    }
     out = match payload {
         // hyper sends no Content-Length for an empty body; some S3 front ends answer a bodiless POST/PUT with 411
         Payload::Small(b, _) if b.is_empty() && matches!(method, "POST" | "PUT") => {
-            on_sent();
             out.header("content-length", "0")
         }
-        Payload::Small(b, _) if b.is_empty() => {
-            on_sent();
-            out
-        }
-        Payload::Small(b, _) => {
-            on_sent();
-            out.body(b)
-        }
+        Payload::Small(b, _) if b.is_empty() => out,
+        Payload::Small(b, _) => out.body(b),
         Payload::Stream(body, n, _) => {
             // counted, not waited for: hyper stops polling the body once Content-Length bytes are out, so the
             // stream's own end may never be seen
@@ -683,7 +673,7 @@ async fn forward_s3(
             }
             let progress = progress.clone();
             let mut sent = 0u64;
-            let chunks = idle(body.into_data_stream(), idle_limit).inspect_ok(move |b: &Bytes| {
+            let chunks = body.into_data_stream().inspect_ok(move |b: &Bytes| {
                 progress.touch();
                 sent += b.len() as u64;
                 if sent >= n {
@@ -708,7 +698,11 @@ async fn forward_s3(
             Err(e) => return upstream_failed(&e),
         },
         _ = no_reply => {
-            return reply(StatusCode::GATEWAY_TIMEOUT, "upstream sent no reply in time (s3_reply_wait)");
+            return reply(
+                StatusCode::GATEWAY_TIMEOUT,
+                "upstream sent no reply within s3_reply_wait of the request: the outcome is unknown (it may still \
+                 complete); check the object (HEAD, ListParts) before retrying",
+            );
         }
     };
     progress.touch();
@@ -746,18 +740,18 @@ async fn forward_s3(
             b = b.header(n, v.clone());
         }
     }
-    // The request is logged when the reply starts; a reply that breaks off later gets its own line.
-    let (log_file, what) = (
-        vault.cfg.log.clone(),
-        format!("{service} {method} {}{}", route.prefix, log::printable(sub)),
-    );
+    // The request is logged when the reply starts; a reply the upstream breaks off later gets its own line (a
+    // stalled one is cut and logged by the watchdog).
+    let log_file = vault.cfg.log.clone();
     let moved = progress.clone();
-    let stream = idle(res.bytes_stream(), idle_limit)
+    let stream = res
+        .bytes_stream()
+        .map_err(BoxError::from)
         .inspect_ok(move |_: &Bytes| moved.touch())
         .inspect_err(move |_: &BoxError| {
             log::line(
                 &log_file,
-                &format!("{what} reply broke off (stalled or upstream closed)"),
+                &format!("{what} reply broke off (upstream closed)"),
             )
         })
         .map_ok(Frame::data);
@@ -767,50 +761,6 @@ async fn forward_s3(
 #[cfg(test)]
 mod tests {
     use super::scrub;
-    use futures_util::StreamExt;
-    use std::time::Duration;
-
-    /// Items at the given gaps (seconds), then silence.
-    fn gaps(
-        gaps: &'static [u64],
-    ) -> impl futures_util::Stream<Item = Result<u32, std::io::Error>> + Send {
-        futures_util::stream::unfold(0usize, move |i| async move {
-            if i < gaps.len() {
-                tokio::time::sleep(Duration::from_secs(gaps[i])).await;
-                Some((Ok(i as u32), i + 1))
-            } else {
-                std::future::pending::<()>().await;
-                None
-            }
-        })
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn idle_passes_slow_but_moving_streams() {
-        let s = super::idle(gaps(&[59, 59, 59, 59]), Duration::from_secs(60)).take(4);
-        let got: Vec<_> = s.map(|r| r.unwrap()).collect().await;
-        assert_eq!(got, [0, 1, 2, 3]);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn idle_cuts_off_a_stalled_stream() {
-        let start = tokio::time::Instant::now();
-        let mut s = Box::pin(super::idle(gaps(&[1, 5]), Duration::from_secs(60)));
-        assert_eq!(s.next().await.unwrap().unwrap(), 0);
-        assert_eq!(s.next().await.unwrap().unwrap(), 1);
-        let e = s.next().await.unwrap().unwrap_err();
-        assert_eq!(e.to_string(), "idle timeout");
-        assert_eq!(start.elapsed(), Duration::from_secs(66));
-        assert!(s.next().await.is_none(), "nothing after the error");
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn idle_ends_after_an_upstream_error() {
-        let s = futures_util::stream::iter([Ok(1u32), Err(std::io::Error::other("broken")), Ok(2)]);
-        let got: Vec<_> = super::idle(s, Duration::from_secs(60)).collect().await;
-        assert_eq!(got.len(), 2);
-        assert!(got[1].is_err());
-    }
 
     /// The protocol a client built from `builder` picks with a TLS server that offers both h2 and http/1.1.
     async fn negotiated(builder: reqwest::ClientBuilder) -> Vec<u8> {

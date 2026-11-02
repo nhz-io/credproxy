@@ -64,17 +64,18 @@ const BIND_RETRY: Duration = Duration::from_secs(30);
 /// silence. The watchdog sees what the streams' own idle timers can't: a client that stops reading or an upstream
 /// that stops accepting, where nothing polls those streams. Dropping the future closes the connection, and with
 /// it any upstream request in flight.
+/// Returns true if it cut the connection.
 async fn within_lifetime<F: std::future::Future>(
     conn: F,
     progress: &proxy::Progress,
     idle: Duration,
-) {
+) -> bool {
     tokio::pin!(conn);
     let start = tokio::time::Instant::now();
     let every = (idle / 4).clamp(Duration::from_millis(50), Duration::from_secs(1));
     loop {
         tokio::select! {
-            _ = &mut conn => return,
+            _ = &mut conn => return false,
             _ = tokio::time::sleep(every) => {
                 let over = if progress.is_s3() {
                     progress.stalled(idle)
@@ -82,7 +83,7 @@ async fn within_lifetime<F: std::future::Future>(
                     start.elapsed() >= CONNECTION_LIFETIME
                 };
                 if over {
-                    return;
+                    return true;
                 }
             }
         }
@@ -173,7 +174,7 @@ async fn serve(cfg: Config) -> Result<(), String> {
                     continue;
                 };
                 let (vault, http) = (vault.clone(), http.clone());
-                let s3_idle = vault.cfg.s3_idle;
+                let (s3_idle, log_file) = (vault.cfg.s3_idle, vault.cfg.log.clone());
                 tokio::spawn(async move {
                     let _permit = permit;
                     let progress = Arc::new(proxy::Progress::default());
@@ -190,7 +191,14 @@ async fn serve(cfg: Config) -> Result<(), String> {
                     // boxed to a concrete type: passed generically, the connection future trips a rustc
                     // limitation when proving the spawned task Send
                     let conn: std::pin::Pin<Box<dyn std::future::Future<Output = _> + Send>> = Box::pin(conn);
-                    within_lifetime(conn, &watched, s3_idle).await;
+                    if within_lifetime(conn, &watched, s3_idle).await {
+                        let why = if watched.is_s3() {
+                            format!("{} cut off: no progress for {}s", watched.label(), s3_idle.as_secs())
+                        } else {
+                            format!("- connection closed after {}s", CONNECTION_LIFETIME.as_secs())
+                        };
+                        log::line(&log_file, &why);
+                    }
                 });
             }
             a = ctl.accept() => {
@@ -271,12 +279,18 @@ mod tests {
     ) -> Duration {
         tokio::spawn(drive);
         let start = tokio::time::Instant::now();
-        within_lifetime(
-            std::future::pending::<()>(),
-            &progress,
-            Duration::from_secs(60),
+        // bounded (simulated time, longer than any case here): a watchdog that never fires fails, not hangs
+        let cut = tokio::time::timeout(
+            Duration::from_secs(12 * 3600),
+            within_lifetime(
+                std::future::pending::<()>(),
+                &progress,
+                Duration::from_secs(60),
+            ),
         )
-        .await;
+        .await
+        .expect("the watchdog never cut a dead connection");
+        assert!(cut);
         start.elapsed()
     }
 
@@ -290,7 +304,7 @@ mod tests {
     async fn s3_connections_live_while_they_move() {
         // bytes every 59 s for 3 hours, then nothing: cut 60 s after the last bytes, not at any fixed time
         let p = Arc::new(Progress::default());
-        p.mark_s3();
+        p.mark_s3("t".into());
         let q = p.clone();
         let t = lives(p, async move {
             for _ in 0..183 {
@@ -305,7 +319,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn s3_connection_stalled_from_the_start_is_cut_after_a_minute() {
         let p = Arc::new(Progress::default());
-        p.mark_s3();
+        p.mark_s3("t".into());
         assert_eq!(lives(p, async {}).await, Duration::from_secs(60));
     }
 
@@ -313,12 +327,12 @@ mod tests {
     async fn expected_silence_is_not_a_stall() {
         // e.g. the upstream assembling a big multipart upload: quiet for up to 2 h, then 60 s more of nothing
         let p = Arc::new(Progress::default());
-        p.mark_s3();
+        p.mark_s3("t".into());
         p.quiet_for(Duration::from_secs(7200));
         assert_eq!(lives(p.clone(), async {}).await, Duration::from_secs(7200));
         // and bytes arriving during it end the quiet period early
         let p = Arc::new(Progress::default());
-        p.mark_s3();
+        p.mark_s3("t".into());
         p.quiet_for(Duration::from_secs(7200));
         let q = p.clone();
         let t = lives(p, async move {
@@ -332,14 +346,15 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_connection_that_ends_is_not_held() {
         let p = Progress::default();
-        p.mark_s3();
+        p.mark_s3("t".into());
         let start = tokio::time::Instant::now();
-        within_lifetime(
+        let cut = within_lifetime(
             tokio::time::sleep(Duration::from_secs(10)),
             &p,
             Duration::from_secs(60),
         )
         .await;
+        assert!(!cut);
         assert_eq!(start.elapsed(), Duration::from_secs(10));
     }
 }

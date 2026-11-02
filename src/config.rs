@@ -379,6 +379,14 @@ fn check_listen(s: &str) -> Result<SocketAddr, String> {
     Ok(a)
 }
 
+fn bounded(s: &str, what: &str, max: Duration) -> Result<Duration, String> {
+    let d = parse_duration(s).map_err(|e| format!("{what}: {e}"))?;
+    if d > max {
+        return Err(format!("{what}: at most {}h", max.as_secs() / 3600));
+    }
+    Ok(d)
+}
+
 pub fn load(path: &Path) -> Result<Config, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
     parse(&text).map_err(|e| format!("{}: {e}", path.display()))
@@ -516,9 +524,13 @@ pub fn parse(text: &str) -> Result<Config, String> {
     }
     Ok(Config {
         idle_lock: parse_duration(&raw.idle_lock)?,
-        s3_idle: parse_duration(&raw.s3_idle).map_err(|e| format!("s3_idle: {e}"))?,
-        s3_reply_wait: parse_duration(&raw.s3_reply_wait)
-            .map_err(|e| format!("s3_reply_wait: {e}"))?,
+        // bounded: they are added to clock readings, which must not overflow
+        s3_idle: bounded(&raw.s3_idle, "s3_idle", Duration::from_secs(24 * 3600))?,
+        s3_reply_wait: bounded(
+            &raw.s3_reply_wait,
+            "s3_reply_wait",
+            Duration::from_secs(7 * 24 * 3600),
+        )?,
         age: raw.age,
         identity: expand(&raw.identity),
         secrets_dir: expand(&raw.secrets_dir),
@@ -629,6 +641,9 @@ allow = ["GET /pods", "DELETE /pods/{id}", "GET /catalog/gpus"]
             (Duration::from_secs(2), Duration::from_secs(300))
         );
         assert!(parse(&format!("s3_idle = \"0s\"\n{RUNPOD}")).is_err());
+        assert!(parse(&format!("s3_idle = \"25h\"\n{RUNPOD}")).is_err());
+        assert!(parse(&format!("s3_reply_wait = \"99999999999999h\"\n{RUNPOD}")).is_err());
+        assert!(parse(&format!("s3_reply_wait = \"168h\"\n{RUNPOD}")).is_ok());
         let s = &c.services["runpod"];
         assert_eq!(s.secret, PathBuf::from("runpod/api-key.age"));
         assert_eq!(s.auth_format, "Bearer {key}");
