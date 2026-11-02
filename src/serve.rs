@@ -128,8 +128,8 @@ async fn serve(cfg: Config) -> Result<(), String> {
     std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600))
         .map_err(|e| e.to_string())?;
 
-    let vault = Arc::new(Vault::new(cfg));
-    let http = proxy::clients(vault.cfg.s3_connect_timeout);
+    let http = proxy::clients(cfg.s3_connect_timeout);
+    let vault = Arc::new(Vault::new(cfg, http.api.clone()));
     let stop = Arc::new(Notify::new());
     let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     let mut full_logged: Option<std::time::Instant> = None;

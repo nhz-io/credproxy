@@ -151,7 +151,8 @@ fn to_key(raw: &[u8], lines: usize) -> Result<Zeroizing<String>, String> {
 }
 
 impl Vault {
-    pub fn new(cfg: Config) -> Self {
+    /// `http`: the client for B2's authorize call (the proxy's own API client).
+    pub fn new(cfg: Config, http: reqwest::Client) -> Self {
         let slots = cfg
             .services
             .keys()
@@ -169,7 +170,7 @@ impl Vault {
             cfg,
             slots: Mutex::new(slots),
             next_job: AtomicU64::new(1),
-            http: crate::proxy::api_client(),
+            http,
         }
     }
 
@@ -562,7 +563,7 @@ allow = ["GET /x"]
 "#,
         )
         .unwrap();
-        let v = Vault::new(cfg);
+        let v = Vault::new(cfg, reqwest::Client::new());
         let past = SystemTime::now() - Duration::from_secs(1);
         let unlocked = |expires, last_used| Unlocked {
             secret: Secret::Key(Zeroizing::new("x".into())),

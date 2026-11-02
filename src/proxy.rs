@@ -119,11 +119,6 @@ fn api_builder() -> reqwest::ClientBuilder {
         .no_proxy()
 }
 
-/// The client for small calls credproxy makes itself (B2's authorize).
-pub fn api_client() -> reqwest::Client {
-    api_builder().build().expect("http client")
-}
-
 fn s3_builder(connect: Duration) -> reqwest::ClientBuilder {
     api_builder().http1_only().connect_timeout(connect)
 }

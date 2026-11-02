@@ -2,7 +2,8 @@
 //! (authorize, API calls, downloads) on 127.0.0.1.
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Either, Full, StreamBody};
+use hyper::body::Frame;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
@@ -60,6 +61,28 @@ fn json_reply(status: u16, v: Value) -> hyper::Response<Full<Bytes>> {
         .unwrap()
 }
 
+type Slow = StreamBody<
+    std::pin::Pin<
+        Box<dyn futures_util::Stream<Item = Result<Frame<Bytes>, std::convert::Infallible>> + Send>,
+    >,
+>;
+
+/// A 404 whose body comes in five pieces, 0.5 s apart.
+fn slow_404() -> hyper::Response<Either<Full<Bytes>, Slow>> {
+    let pieces = futures_util::stream::unfold(0, |i| async move {
+        if i == 5 {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        Some((Ok(Frame::data(Bytes::from_static(b"missing "))), i + 1))
+    });
+    hyper::Response::builder()
+        .status(404)
+        .header("content-type", "text/plain")
+        .body(Either::Right(StreamBody::new(Box::pin(pieces) as _)))
+        .unwrap()
+}
+
 async fn fake_b2(state: Arc<Mutex<B2State>>) -> u16 {
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = l.local_addr().unwrap().port();
@@ -71,6 +94,10 @@ async fn fake_b2(state: Arc<Mutex<B2State>>) -> u16 {
                 let svc = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
                     let state = state.clone();
                     async move {
+                        if req.uri().path().ends_with("/slow-404") {
+                            return Ok::<_, std::convert::Infallible>(slow_404());
+                        }
+                        let r: Result<hyper::Response<Full<Bytes>>, std::convert::Infallible> = async move {
                         let h = |n: &str| {
                             req.headers()
                                 .get(n)
@@ -82,11 +109,12 @@ async fn fake_b2(state: Arc<Mutex<B2State>>) -> u16 {
                         let body = req.into_body().collect().await.unwrap().to_bytes();
                         let body = String::from_utf8_lossy(&body).to_string();
                         let delay = state.lock().unwrap().authorize_delay;
-                        if path == "/b2api/v3/b2_authorize_account" && !delay.is_zero() {
+                        let authorize = path.ends_with("/b2_authorize_account");
+                        if authorize && !delay.is_zero() {
                             tokio::time::sleep(delay).await;
                         }
                         let mut s = state.lock().unwrap();
-                        if path == "/b2api/v3/b2_authorize_account" {
+                        if authorize {
                             s.authorize_tries += 1;
                             if s.authorize_fail > 0 {
                                 s.authorize_fail -= 1;
@@ -151,7 +179,11 @@ async fn fake_b2(state: Arc<Mutex<B2State>>) -> u16 {
                                 json!({"status": 401, "code": "bad_auth_token", "message": "bad"}),
                             ));
                         }
-                        if let Some(call) = path.strip_prefix("/b2api/v3/") {
+                        if let Some(call) = path
+                            .strip_prefix("/b2api/")
+                            .and_then(|p| p.split_once('/'))
+                            .map(|(_, c)| c)
+                        {
                             let mut v = json!({"call": call, "got": serde_json::from_str::<Value>(&body).unwrap_or(Value::Null), "echo": s.token});
                             if call == "b2_create_key" {
                                 v["applicationKey"] = json!("K005NEWKEYSECRET");
@@ -187,6 +219,9 @@ async fn fake_b2(state: Arc<Mutex<B2State>>) -> u16 {
                             data
                         };
                         Ok(b.body(Full::new(Bytes::from(data))).unwrap())
+                        }
+                        .await;
+                        r.map(|r| r.map(Either::Left))
                     }
                 });
                 let _ = http1::Builder::new()
@@ -202,6 +237,8 @@ struct Env {
     dir: tempfile::TempDir,
     cfg: PathBuf,
     base: String,
+    /// the API version in call paths
+    version: String,
     secret: String,
     state: Arc<Mutex<B2State>>,
     daemon: Option<Child>,
@@ -222,6 +259,10 @@ async fn setup(relock: &str) -> Env {
 
 /// `top`: extra top-level config lines; `age_delay`: seconds `age` takes before decrypting (a slow Touch ID).
 async fn setup_with(relock: &str, top: &str, age_delay: Option<u32>) -> Env {
+    setup_version(relock, top, age_delay, "v3").await
+}
+
+async fn setup_version(relock: &str, top: &str, age_delay: Option<u32>, version: &str) -> Env {
     let dir = tempfile::Builder::new().prefix("cp").tempdir().unwrap();
     let d = dir.path();
     let state = Arc::new(Mutex::new(B2State::default()));
@@ -270,10 +311,10 @@ log = "{d}/credproxy.log"
 
 [services.b2]
 secret = "backblaze/master"
-auth = {{ b2 = {{ relock_after = "{relock}", authorize_url = "http://127.0.0.1:{port}/b2api/v3/b2_authorize_account" }} }}
+auth = {{ b2 = {{ version = "{version}", relock_after = "{relock}", authorize_url = "http://127.0.0.1:{port}/b2api/{version}/b2_authorize_account" }} }}
 
 [[services.b2.routes]]
-prefix = "/b2api/v3"
+prefix = "/b2api/{version}"
 b2 = {{ calls = ["b2_list_buckets", "b2_create_key", "b2_list_keys", "b2_list_file_names"] }}
 
 [[services.b2.routes]]
@@ -289,6 +330,7 @@ b2 = {{ download = true }}
         dir,
         cfg,
         base: format!("http://127.0.0.1:{listen}/b2"),
+        version: version.to_string(),
         secret,
         state,
         daemon: Some(daemon),
@@ -326,7 +368,7 @@ impl Env {
 
     async fn call(&self, call: &str, body: &str) -> (u16, String) {
         let r = reqwest::Client::new()
-            .post(format!("{}/b2api/v3/{call}", self.base))
+            .post(format!("{}/b2api/{}/{call}", self.base, self.version))
             .header("authorization", format!("Bearer {}", self.token()))
             .body(body.to_string())
             .send()
@@ -756,4 +798,40 @@ async fn a_front_end_5xx_doesnt_count_as_the_token_working() {
     assert_eq!(code, 502, "{body}");
     assert!(env.status().contains("b2: unlocked"));
     assert_eq!(env.st(|s| s.authorizes), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn version_v4_goes_out_as_v4() {
+    let env = setup_version("23h", "", None, "v4").await;
+    let (code, body) = env.call("b2_list_buckets", "{}").await;
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(
+        env.st(|s| s.last.clone()).unwrap().0,
+        "/b2api/v4/b2_list_buckets"
+    );
+    // the v3 path isn't served by a v4 service
+    let r = reqwest::Client::new()
+        .post(format!("{}/b2api/v3/b2_list_buckets", env.base))
+        .header("authorization", format!("Bearer {}", env.token()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 403);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slow_download_error_body_isnt_cut() {
+    // s3_idle 1s, and the fake's 404 body takes 2.5 s in five pieces
+    let env = setup_with("23h", "s3_idle = \"1s\"", None).await;
+    let r = reqwest::Client::new()
+        .get(format!("{}/file/my-bkt/slow-404", env.base))
+        .header("authorization", format!("Bearer {}", env.token()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 404);
+    assert_eq!(
+        r.text().await.unwrap(),
+        "missing missing missing missing missing "
+    );
 }

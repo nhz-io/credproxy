@@ -260,8 +260,10 @@ async fn buffered(
     service: &str,
     session: &Arc<Session>,
     res: reqwest::Response,
+    progress: Option<&Progress>,
 ) -> Response<Body> {
-    let b = match read_buffered(res, &[session.token.as_bytes()], None).await {
+    // a download's watchdog must see the error body's bytes move
+    let b = match read_buffered(res, &[session.token.as_bytes()], progress).await {
         Ok(b) => b,
         Err(r) => return r,
     };
@@ -386,7 +388,7 @@ async fn api(
         .send()
         .await;
     match res {
-        Ok(r) => buffered(vault, service, &session, r).await,
+        Ok(r) => buffered(vault, service, &session, r, None).await,
         Err(e) => upstream_failed(&e),
     }
 }
@@ -477,7 +479,7 @@ async fn download(
     if !res.status().is_success() {
         // 416 needs the size
         let range = res.headers().get("content-range").cloned();
-        let mut r = buffered(vault, service, &session, res).await;
+        let mut r = buffered(vault, service, &session, res, Some(progress)).await;
         if let Some(v) = range {
             r.headers_mut().insert("content-range", v);
         }
