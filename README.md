@@ -129,6 +129,8 @@ listen = "127.0.0.1:7777"
 [services.runpod]
 secret = "runpod/api-key"                          # ~/.secrets/runpod/api-key.age
 # auth = { header = "Authorization", format = "Bearer {key}" }   # also how clients send the token
+# auth = { header = "api_key", format = "{key}" }   # any HTTP header name, except ones credproxy sets or forwards
+#   (Content-Type, Accept, Accept-Encoding, User-Agent) and connection headers (Host, Content-Length, …)
 
 [[services.runpod.routes]]
 prefix = "/v1"                                     # longest prefix wins

@@ -242,6 +242,32 @@ fn valid_name(s: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
+/// Any HTTP header name (RFC 9110 token), e.g. `Authorization`, `X-API-Key` or `api_key`.
+fn valid_header(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+}
+
+/// Headers the auth header can't be: credproxy sets them itself, forwards them from the client, or they belong to
+/// the connection.
+const RESERVED_HEADERS: [&str; 14] = [
+    "host",
+    "content-length",
+    "transfer-encoding",
+    "connection",
+    "keep-alive",
+    "te",
+    "trailer",
+    "upgrade",
+    "proxy-connection",
+    "expect",
+    "accept-encoding",
+    "user-agent",
+    "content-type",
+    "accept",
+];
+
 /// A path segment that may stand in for `{param}`: plain ids only, never `.`/`..` or anything encoded.
 pub fn valid_param(s: &str) -> bool {
     !s.is_empty()
@@ -434,14 +460,14 @@ pub fn parse(text: &str) -> Result<Config, String> {
                 "service {name}: auth.format must contain {{key}} exactly once"
             ));
         }
-        if s.auth.header.is_empty()
-            || !s
-                .auth
-                .header
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-        {
+        if !valid_header(&s.auth.header) {
             return Err(format!("service {name}: bad auth.header"));
+        }
+        if RESERVED_HEADERS.contains(&s.auth.header.to_ascii_lowercase().as_str()) {
+            return Err(format!(
+                "service {name}: auth.header {:?} is set by credproxy or the connection",
+                s.auth.header
+            ));
         }
         if s.routes.is_empty() {
             return Err(format!("service {name}: no routes"));
@@ -450,9 +476,7 @@ pub fn parse(text: &str) -> Result<Config, String> {
         // which refuses the call)
         let h = s.auth.header.to_ascii_lowercase();
         if s.auth.sigv4.is_some()
-            && (h.starts_with("x-amz-")
-                || crate::s3::FORWARDED_HEADERS.contains(&h.as_str())
-                || ["host", "content-length", "transfer-encoding", "expect"].contains(&h.as_str()))
+            && (h.starts_with("x-amz-") || crate::s3::FORWARDED_HEADERS.contains(&h.as_str()))
         {
             return Err(format!(
                 "service {name}: auth.header {:?} can't carry the token for an S3 service",
@@ -694,6 +718,32 @@ allow = ["GET /pods", "DELETE /pods/{id}", "GET /catalog/gpus"]
         assert_eq!(rest, "/pods/abc");
         // "/graphqlx" is not under "/graphql": falls to the REST route
         assert_eq!(s.route("/graphqlx").unwrap().0.prefix, "");
+    }
+
+    #[test]
+    fn auth_header_names() {
+        let with = |h: &str| {
+            parse(&format!(
+                "{RUNPOD}\n[services.runpod.auth]\nheader = \"{h}\"\nformat = \"{{key}}\""
+            ))
+        };
+        for h in ["api_key", "X-API-Key", "x.token", "Authorization"] {
+            assert_eq!(with(h).unwrap().services["runpod"].auth_header, h);
+        }
+        for h in ["", "api key", "api:key", "ápi", "x\\\"y"] {
+            assert!(with(h).is_err(), "accepted {h:?}");
+        }
+        for h in [
+            "Host",
+            "content-length",
+            "Accept-Encoding",
+            "User-Agent",
+            "Content-Type",
+            "accept",
+            "connection",
+        ] {
+            assert!(with(h).unwrap_err().contains("set by credproxy"), "{h}");
+        }
     }
 
     #[test]

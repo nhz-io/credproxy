@@ -55,8 +55,9 @@ async fn upstream(hits: Arc<AtomicUsize>) -> u16 {
                             req.uri().path().to_string(),
                             req.uri().query().map(str::to_string),
                         );
-                        let (auth, ua, cookie, x, ctype, enc) = (
+                        let (auth, api_key, ua, cookie, x, ctype, enc) = (
                             h("authorization"),
+                            h("api_key"),
                             h("user-agent"),
                             h("cookie"),
                             h("x-extra"),
@@ -65,7 +66,7 @@ async fn upstream(hits: Arc<AtomicUsize>) -> u16 {
                         );
                         let body = req.into_body().collect().await.unwrap().to_bytes();
                         let v = serde_json::json!({
-                            "method": method, "path": path, "query": query, "auth": auth, "ua": ua, "cookie": cookie,
+                            "method": method, "path": path, "query": query, "auth": auth, "api_key": api_key, "ua": ua, "cookie": cookie,
                             "x": x, "ctype": ctype, "accept_encoding": enc, "body": String::from_utf8_lossy(&body),
                         });
                         let gzip = path.ends_with("/gzip");
@@ -138,6 +139,15 @@ graphql_queries = ["gpuTypes"]
 prefix = "/v1"
 upstream = "http://127.0.0.1:{port}/v1"
 allow = ["GET /pods", "GET /pods/{{id}}", "POST /pods", "GET /billing/pods", "GET /slash/", "GET /slash/{{id}}/", "GET /limited"]
+
+[services.underscore]
+secret = "fake/api-key"
+auth = {{ header = "api_key", format = "{{key}}" }}
+
+[[services.underscore.routes]]
+prefix = "/v1"
+upstream = "http://127.0.0.1:{port}/v1"
+allow = ["GET /pods"]
 "#,
             d = d.display(),
             age_line = match fake_age {
@@ -730,4 +740,42 @@ async fn retry_after_reaches_the_client() {
         .unwrap();
     assert_eq!(r.status(), 429);
     assert_eq!(r.headers()["retry-after"], "10");
+}
+
+/// A header name with `_` (Hyperstack's `api_key: <key>`): the client sends the token there, the upstream gets the
+/// key there and nothing in `Authorization`; other spellings of the name are not the token header.
+#[tokio::test]
+async fn underscore_auth_header() {
+    let env = setup("12h").await;
+    let base = env.base.replace("/fake", "/underscore");
+    let tok = String::from_utf8(
+        sh(Command::new(BIN)
+            .args(["token", "underscore"])
+            .env("CREDPROXY_CONFIG", &env.cfg))
+        .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    let send = |name: &'static str, value: String| {
+        let url = format!("{base}/v1/pods");
+        async move {
+            let r = reqwest::Client::new()
+                .get(url)
+                .header(name, value)
+                .send()
+                .await
+                .unwrap();
+            (r.status().as_u16(), r.text().await.unwrap())
+        }
+    };
+    let (s, body) = send("api_key", tok.clone()).await;
+    assert_eq!(s, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["api_key"], "[REDACTED]");
+    assert!(v["auth"].is_null());
+    assert!(!body.contains(&env.key) && !body.contains(&tok));
+    assert_eq!(send("api-key", tok.clone()).await.0, 401);
+    assert_eq!(send("authorization", format!("Bearer {tok}")).await.0, 401);
+    assert_eq!(send("api_key", env.token()).await.0, 401);
 }

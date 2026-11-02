@@ -1,6 +1,6 @@
 [package]
 name = "credproxy"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Local proxy that holds age-sealed API keys in memory (one Touch ID per unlock) and adds them to allowlisted requests, or signs them with AWS SigV4"
 license = "MIT"
