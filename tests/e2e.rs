@@ -134,7 +134,7 @@ graphql_queries = ["gpuTypes"]
 [[services.fake.routes]]
 prefix = "/v1"
 upstream = "http://127.0.0.1:{port}/v1"
-allow = ["GET /pods", "GET /pods/{{id}}", "POST /pods", "GET /billing/pods"]
+allow = ["GET /pods", "GET /pods/{{id}}", "POST /pods", "GET /billing/pods", "GET /slash/", "GET /slash/{{id}}/"]
 "#,
             d = d.display(),
             age_line = match fake_age {
@@ -692,4 +692,25 @@ fn restart_refuses_a_broken_config() {
         .unwrap();
     assert!(!o.status.success());
     assert!(String::from_utf8_lossy(&o.stderr).contains("not restarting"));
+}
+
+/// A rule with a trailing slash matches only that path, and the slash goes upstream as sent (Vast's API redirects
+/// "/instances" to "/instances/"; credproxy doesn't follow redirects).
+#[tokio::test(flavor = "multi_thread")]
+async fn trailing_slash_rules_match_exactly() {
+    let env = setup("12h").await;
+    let t = env.token();
+    for (path, upstream_path) in [
+        ("/v1/slash/", "/v1/slash/"),
+        ("/v1/slash/7/", "/v1/slash/7/"),
+    ] {
+        let (code, body) = get(&format!("{}{path}", env.base), Some(&t)).await;
+        assert_eq!(code, 200, "{path}: {body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["path"], upstream_path);
+    }
+    for path in ["/v1/slash", "/v1/slash/7", "/v1/slash//", "/v1/pods/"] {
+        let (code, body) = get(&format!("{}{path}", env.base), Some(&t)).await;
+        assert_eq!(code, 403, "{path}: {body}");
+    }
 }

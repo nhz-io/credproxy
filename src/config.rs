@@ -275,8 +275,13 @@ fn parse_rule(r: &str) -> Result<Rule, String> {
         return Err(format!("rule {r:?}: path must start with /"));
     }
     let mut segments = Vec::new();
-    for s in path.split('/').skip(1) {
-        if s.starts_with('{') && s.ends_with('}') && s.len() > 2 {
+    let parts: Vec<&str> = path.split('/').skip(1).collect();
+    for (i, s) in parts.iter().copied().enumerate() {
+        if s.is_empty() && i == parts.len() - 1 {
+            // a trailing slash is part of the path: "GET /instances/" matches "/instances/", not "/instances"
+            // (some APIs, e.g. Vast's, redirect one to the other, and redirects aren't followed)
+            segments.push(Segment::Literal(String::new()));
+        } else if s.starts_with('{') && s.ends_with('}') && s.len() > 2 {
             segments.push(Segment::Param);
         } else if valid_param(s) {
             segments.push(Segment::Literal(s.to_string()));
@@ -670,6 +675,25 @@ allow = ["GET /pods", "DELETE /pods/{id}", "GET /catalog/gpus"]
         ] {
             assert!(allowed(&c, m, p), "{m} {p}");
         }
+        let c2 = parse(&RUNPOD.replace(
+            "\"GET /billing/pods\"]",
+            "\"GET /billing/pods\", \"GET /instances/\", \"GET /instances/{id}/\", \"POST /instances/{id}/ssh/\"]",
+        ))
+        .unwrap();
+        for (m, p, ok) in [
+            ("GET", "/instances/", true),
+            ("GET", "/instances", false),
+            ("GET", "/instances/7/", true),
+            ("GET", "/instances/7", false),
+            ("GET", "/instances/7//", false),
+            ("GET", "/instances//", false),
+            ("POST", "/instances/7/ssh/", true),
+            ("POST", "/instances/7/ssh", false),
+        ] {
+            assert_eq!(allowed(&c2, m, p), ok, "{m} {p}");
+        }
+        // without a trailing slash in the rule, none in the path either
+        assert!(!allowed(&c, "GET", "/pods/"));
         for (m, p) in [
             ("DELETE", "/pods"),
             ("PATCH", "/pods/x"),
@@ -764,6 +788,8 @@ s3 = { region = "EU-RO-1", ops = ["GetObject", "PutObject"] }
             format!("listen = \"7777\"\n{RUNPOD}"),
             format!("listen = \"127.0.0.1:0\"\n{RUNPOD}"),
             RUNPOD.replace("GET /pods/{id}", "GET pods"),
+            RUNPOD.replace("GET /pods/{id}", "GET /pods//{id}"),
+            RUNPOD.replace("GET /pods/{id}", "GET /pods/{id}//"),
             RUNPOD.replace("prefix = \"/graphql\"", "prefix = \"/\""),
             format!("idle_lock = \"0h\"\n{RUNPOD}"),
             format!("idle_lock = \"12\"\n{RUNPOD}"),
