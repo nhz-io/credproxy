@@ -301,18 +301,16 @@ async fn api_calls_carry_the_b2_token_only() {
     );
     assert_eq!(env.st(|s| s.authorizes), 1);
 
-    // the same account is fine, another one is refused before it goes out
-    assert_eq!(
-        env.call("b2_list_buckets", r#"{"accountId": "acc123"}"#)
-            .await
-            .0,
-        200
-    );
+    // a client's own accountId, even the right one, is refused before it goes out
     let hits = env.st(|s| s.hits);
-    let (code, body) = env
-        .call("b2_list_buckets", r#"{"accountId": "other"}"#)
-        .await;
-    assert_eq!((code, body.contains("accountId")), (403, true));
+    for id in [r#"{"accountId": "acc123"}"#, r#"{"accountId": "other"}"#] {
+        let (code, body) = env.call("b2_list_buckets", id).await;
+        assert_eq!(
+            (code, body.contains("leave accountId out")),
+            (403, true),
+            "{body}"
+        );
+    }
     assert_eq!(env.call("b2_list_buckets", "[1]").await.0, 400);
     assert_eq!(env.call("b2_list_buckets", "nope").await.0, 400);
     assert_eq!(env.st(|s| s.hits), hits);
@@ -410,6 +408,11 @@ async fn refused_calls_never_unlock_or_reach_b2() {
         s.read_to_string(&mut out).await.unwrap();
         assert!(out.starts_with("HTTP/1.1 403"), "{p}: {out}");
     }
+    // a body naming the account is refused before unlocking: no prompt for a call that would be refused
+    let (code, _) = env
+        .call("b2_create_key", r#"{"accountId": "acc123"}"#)
+        .await;
+    assert_eq!(code, 403);
     assert_eq!(env.st(|s| (s.authorizes, s.hits)), (0, 0));
     assert!(env.status().contains("b2: locked"), "{}", env.status());
     // a wrong credproxy token: 401

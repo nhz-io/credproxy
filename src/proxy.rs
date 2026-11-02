@@ -43,7 +43,8 @@ pub struct Progress {
 }
 
 struct ProgressState {
-    /// Some("service METHOD path") once the connection carries an allowed S3 call (named in the log if cut)
+    /// Some("service METHOD path") once the connection carries an allowed streaming call (S3, a B2 download),
+    /// named in the log if cut
     label: Option<String>,
     last: tokio::time::Instant,
     quiet_until: Option<tokio::time::Instant>,
@@ -62,11 +63,11 @@ impl Default for Progress {
 }
 
 impl Progress {
-    pub fn is_s3(&self) -> bool {
+    pub fn is_streaming(&self) -> bool {
         self.state.lock().unwrap().label.is_some()
     }
 
-    pub(crate) fn mark_s3(&self, label: String) {
+    pub(crate) fn mark_streaming(&self, label: String) {
         let mut s = self.state.lock().unwrap();
         s.label = Some(label);
         s.last = tokio::time::Instant::now();
@@ -631,7 +632,7 @@ async fn forward_s3(
     // The watchdog is the one place S3 stalls are handled, in both directions: it also sees a client that stops
     // reading or an upstream that stops accepting, where nothing polls the streams.
     let what = format!("{service} {method} {}{}", route.prefix, log::printable(sub));
-    progress.mark_s3(what.clone());
+    progress.mark_streaming(what.clone());
     progress.quiet_for(crate::vault::UNLOCK_TIMEOUT + Duration::from_secs(10));
     let key = match vault.key(service, false).await {
         Ok(k) => k,

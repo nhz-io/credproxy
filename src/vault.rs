@@ -415,19 +415,20 @@ impl Vault {
         locked
     }
 
-    /// Lock every service unused for `idle_lock`, and B2 services whose token expires; returns their names.
-    pub fn sweep(&self) -> Vec<String> {
+    /// Lock every service unused for `idle_lock`, and B2 services whose token ends; returns their names, each
+    /// with why.
+    pub fn sweep(&self) -> Vec<(String, &'static str)> {
         let idle = self.cfg.idle_lock;
         let mut slots = self.slots.lock().unwrap();
         let mut locked = Vec::new();
         for (name, s) in slots.iter_mut() {
-            if s.unlocked
-                .as_ref()
-                .is_some_and(|u| u.last_used.elapsed() >= idle || u.expired())
-            {
-                s.unlocked = None;
-                locked.push(name.clone());
-            }
+            let why = match &s.unlocked {
+                Some(u) if u.expired() => "B2 token expired",
+                Some(u) if u.last_used.elapsed() >= idle => "idle",
+                _ => continue,
+            };
+            s.unlocked = None;
+            locked.push((name.clone(), why));
         }
         locked
     }
@@ -508,5 +509,52 @@ mod tests {
         assert!(to_key(b"user_1\n\nrps_2", 2).is_err());
         assert!(to_key(b"a\nb\nc", 2).is_err());
         assert!(to_key(b"user 1\nrps_2", 2).is_err());
+    }
+
+    #[test]
+    fn sweep_says_why() {
+        let cfg = crate::config::parse(
+            r#"
+idle_lock = "1h"
+[services.b2]
+secret = "backblaze/master"
+auth = { b2 = {} }
+[[services.b2.routes]]
+prefix = "/file"
+b2 = { download = true }
+[services.k]
+secret = "k/api-key"
+[[services.k.routes]]
+prefix = ""
+upstream = "https://example.com"
+allow = ["GET /x"]
+"#,
+        )
+        .unwrap();
+        let v = Vault::new(cfg);
+        let past = Instant::now() - Duration::from_secs(1);
+        let unlocked = |expires, last_used| Unlocked {
+            secret: Secret::Key(Zeroizing::new("x".into())),
+            last_used,
+            expires,
+        };
+        {
+            let mut slots = v.slots.lock().unwrap();
+            slots.get_mut("b2").unwrap().unlocked = Some(unlocked(Some(past), Instant::now()));
+            slots.get_mut("k").unwrap().unlocked =
+                Some(unlocked(None, Instant::now() - Duration::from_secs(3600)));
+        }
+        // an expired B2 session shows as locked before the sweep
+        assert!(v.status().contains(&("b2".to_string(), "locked", 0)));
+        let mut swept = v.sweep();
+        swept.sort();
+        assert_eq!(
+            swept,
+            [
+                ("b2".to_string(), "B2 token expired"),
+                ("k".to_string(), "idle")
+            ]
+        );
+        assert!(v.sweep().is_empty());
     }
 }

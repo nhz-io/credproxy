@@ -594,6 +594,13 @@ pub fn parse(text: &str) -> Result<Config, String> {
                 s.auth.header
             ));
         }
+        // B2 downloads forward the client's Range
+        if s.auth.b2.is_some() && h == "range" {
+            return Err(format!(
+                "service {name}: auth.header {:?} can't carry the token for a B2 service",
+                s.auth.header
+            ));
+        }
         if s.auth.sigv4.is_some() && s.auth.b2.is_some() {
             return Err(format!("service {name}: auth.sigv4 or auth.b2, not both"));
         }
@@ -1115,6 +1122,7 @@ b2 = { download = true }
                 "b2 = { authorize_url = \"http://evil.example/a\" }",
             ),
             B2.replace("b2 = {}", "b2 = {}, sigv4 = {}"),
+            B2.replace("b2 = {}", "header = \"Range\", format = \"{key}\", b2 = {}"),
             B2.replace("auth = { b2 = {} }", ""),
             B2.replace("\"b2_create_key\"", "\"B2_list\""),
             B2.replace("\"b2_create_key\"", "\"b2_\""),

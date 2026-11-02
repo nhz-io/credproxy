@@ -19,11 +19,11 @@ use std::sync::Arc;
 use std::time::Duration;
 use zeroize::Zeroizing;
 
-/// The authorize call (one small request and reply).
-const AUTHORIZE_TIMEOUT: Duration = Duration::from_secs(30);
+/// The authorize call (one small request and reply), made right after the Touch ID wait.
+pub(crate) const AUTHORIZE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Largest authorize reply read (they are a few KiB).
 const MAX_AUTHORIZE_REPLY: usize = 64 << 10;
-/// Calls that name the account: credproxy fills in `accountId` when the body leaves it out.
+/// Calls that name the account: credproxy fills in `accountId` (a client may not send one).
 const ACCOUNT_CALLS: [&str; 6] = [
     "b2_list_buckets",
     "b2_create_bucket",
@@ -307,27 +307,23 @@ async fn api(
             _ => return reply(StatusCode::BAD_REQUEST, "body must be a JSON object"),
         }
     };
+    // credproxy names the account; a client's own accountId is refused before unlocking (a refused call never
+    // raises a Touch ID prompt, and the account isn't known until then)
+    if ACCOUNT_CALLS.contains(&call) && json.get("accountId").is_some() {
+        return reply(
+            StatusCode::FORBIDDEN,
+            "leave accountId out: credproxy fills it in",
+        );
+    }
     let session = match vault.b2(service).await {
         Ok(s) => s,
         Err(e) => return reply(StatusCode::SERVICE_UNAVAILABLE, &e),
     };
     if ACCOUNT_CALLS.contains(&call) {
-        let obj = json.as_object_mut().expect("object");
-        match obj.get("accountId") {
-            None => {
-                obj.insert(
-                    "accountId".into(),
-                    Value::String(session.account_id.clone()),
-                );
-            }
-            Some(Value::String(a)) if *a == session.account_id => {}
-            Some(_) => {
-                return reply(
-                    StatusCode::FORBIDDEN,
-                    "accountId is not this service's account",
-                );
-            }
-        }
+        json.as_object_mut().expect("object").insert(
+            "accountId".into(),
+            Value::String(session.account_id.clone()),
+        );
     }
     let version = &vault.cfg.services[service]
         .b2
@@ -399,8 +395,8 @@ async fn download(
     // allowed: the watchdog decides from now on (a download runs as long as it moves), and a Touch ID prompt is
     // expected silence
     let what = format!("{service} {method} /file{}", log::printable(sub));
-    progress.mark_s3(what.clone());
-    progress.quiet_for(crate::vault::UNLOCK_TIMEOUT + Duration::from_secs(10));
+    progress.mark_streaming(what.clone());
+    progress.quiet_for(crate::vault::UNLOCK_TIMEOUT + AUTHORIZE_TIMEOUT + Duration::from_secs(10));
     let session = match vault.b2(service).await {
         Ok(s) => s,
         Err(e) => return reply(StatusCode::SERVICE_UNAVAILABLE, &e),

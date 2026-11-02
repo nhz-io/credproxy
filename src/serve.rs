@@ -77,7 +77,7 @@ async fn within_lifetime<F: std::future::Future>(
         tokio::select! {
             _ = &mut conn => return false,
             _ = tokio::time::sleep(every) => {
-                let over = if progress.is_s3() {
+                let over = if progress.is_streaming() {
                     progress.stalled(idle)
                 } else {
                     start.elapsed() >= CONNECTION_LIFETIME
@@ -149,8 +149,8 @@ async fn serve(cfg: Config) -> Result<(), String> {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(every).await;
-                for s in vault.sweep() {
-                    log::line(&vault.cfg.log, &format!("{s} locked (idle)"));
+                for (s, why) in vault.sweep() {
+                    log::line(&vault.cfg.log, &format!("{s} locked ({why})"));
                 }
             }
         })
@@ -192,7 +192,7 @@ async fn serve(cfg: Config) -> Result<(), String> {
                     // limitation when proving the spawned task Send
                     let conn: std::pin::Pin<Box<dyn std::future::Future<Output = _> + Send>> = Box::pin(conn);
                     if within_lifetime(conn, &watched, s3_idle).await {
-                        let why = if watched.is_s3() {
+                        let why = if watched.is_streaming() {
                             format!("{} cut off: no progress for {}s", watched.label(), s3_idle.as_secs())
                         } else {
                             format!("- connection closed after {}s", CONNECTION_LIFETIME.as_secs())
@@ -304,7 +304,7 @@ mod tests {
     async fn s3_connections_live_while_they_move() {
         // bytes every 59 s for 3 hours, then nothing: cut 60 s after the last bytes, not at any fixed time
         let p = Arc::new(Progress::default());
-        p.mark_s3("t".into());
+        p.mark_streaming("t".into());
         let q = p.clone();
         let t = lives(p, async move {
             for _ in 0..183 {
@@ -319,7 +319,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn s3_connection_stalled_from_the_start_is_cut_after_a_minute() {
         let p = Arc::new(Progress::default());
-        p.mark_s3("t".into());
+        p.mark_streaming("t".into());
         assert_eq!(lives(p, async {}).await, Duration::from_secs(60));
     }
 
@@ -327,12 +327,12 @@ mod tests {
     async fn expected_silence_is_not_a_stall() {
         // e.g. the upstream assembling a big multipart upload: quiet for up to 2 h, then 60 s more of nothing
         let p = Arc::new(Progress::default());
-        p.mark_s3("t".into());
+        p.mark_streaming("t".into());
         p.quiet_for(Duration::from_secs(7200));
         assert_eq!(lives(p.clone(), async {}).await, Duration::from_secs(7200));
         // and bytes arriving during it end the quiet period early
         let p = Arc::new(Progress::default());
-        p.mark_s3("t".into());
+        p.mark_streaming("t".into());
         p.quiet_for(Duration::from_secs(7200));
         let q = p.clone();
         let t = lives(p, async move {
@@ -348,7 +348,7 @@ mod tests {
         // as forward_s3 does after the key: up to s3_connect_timeout (30 s) + s3_idle of silence while the
         // connection comes up; 25 s later the first bytes move, then nothing: cut s3_idle after those bytes
         let p = Arc::new(Progress::default());
-        p.mark_s3("t".into());
+        p.mark_streaming("t".into());
         p.quiet_for(Duration::from_secs(30 + 60));
         let q = p.clone();
         let t = lives(p, async move {
@@ -362,7 +362,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_connection_that_ends_is_not_held() {
         let p = Progress::default();
-        p.mark_s3("t".into());
+        p.mark_streaming("t".into());
         let start = tokio::time::Instant::now();
         let cut = within_lifetime(
             tokio::time::sleep(Duration::from_secs(10)),
