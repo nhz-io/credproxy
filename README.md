@@ -239,7 +239,7 @@ The daemon reads the config at start; after changing it, `credproxy restart`.
 
 | Command | What |
 |---|---|
-| `credproxy status` | Running? Each service: locked, unlocking (waiting for Touch ID), or unlocked and for how long |
+| `credproxy status` | Running? Each service: locked (or paused for 30 s after a refused or failed unlock), unlocking (waiting for Touch ID; for B2 then authorizing), or unlocked and for how long |
 | `credproxy unlock <service>` | Unlock now (e.g. before a long job), instead of on the first request |
 | `credproxy lock [<service>]` | Forget the key(s) now |
 | `credproxy token <service>` | Print the current token (changes at every daemon start) |
