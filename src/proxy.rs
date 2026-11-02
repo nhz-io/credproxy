@@ -428,13 +428,27 @@ fn reply_with(
     b.body(full(body)).unwrap()
 }
 
+/// The buffered reply, plus the upstream's Retry-After (a throttled client needs it to back off), on every route.
 async fn buffered_reply(
     res: reqwest::Response,
     secrets: &[&[u8]],
     progress: Option<&Progress>,
 ) -> Response<Body> {
+    let retry_after = res.headers().get("retry-after").cloned();
     match read_reply(res, secrets, progress).await {
-        Ok((status, ctype, body)) => reply_with(status, ctype, body),
+        Ok((status, ctype, body)) => {
+            let mut r = reply_with(status, ctype, body);
+            let clean = retry_after.and_then(|v| {
+                let b = secrets
+                    .iter()
+                    .fold(v.as_bytes().to_vec(), |acc, s| scrub(&acc, s));
+                hyper::header::HeaderValue::from_bytes(&b).ok()
+            });
+            if let Some(v) = clean {
+                r.headers_mut().insert("retry-after", v);
+            }
+            r
+        }
         Err(r) => r,
     }
 }
@@ -727,7 +741,8 @@ async fn forward_s3(
     let res = tokio::select! {
         r = out.send() => match r {
             Ok(r) => r,
-            Err(_) if changes && *sent_rx.borrow() => {
+            // a connect error means nothing reached the upstream, whatever the clock says
+            Err(e) if changes && *sent_rx.borrow() && !e.is_connect() => {
                 return reply(
                     StatusCode::BAD_GATEWAY,
                     &format!("upstream failed after the request was sent: {OUTCOME_UNKNOWN}"),
@@ -748,8 +763,8 @@ async fn forward_s3(
     progress.touch();
     if !res.status().is_success() {
         // 304 and 412 need the validators, 416 the object size; a redirect's Location is not passed on
-        // a throttled client needs Retry-After to back off
-        let keep: Vec<_> = ["etag", "last-modified", "content-range", "retry-after"]
+        // (Retry-After is kept by buffered_reply)
+        let keep: Vec<_> = ["etag", "last-modified", "content-range"]
             .iter()
             .filter_map(|n| Some((*n, res.headers().get(*n)?.clone())))
             .collect();

@@ -69,8 +69,11 @@ async fn upstream(hits: Arc<AtomicUsize>) -> u16 {
                             "x": x, "ctype": ctype, "accept_encoding": enc, "body": String::from_utf8_lossy(&body),
                         });
                         let gzip = path.ends_with("/gzip");
+                        let limited = path.ends_with("/limited");
                         Ok::<_, std::convert::Infallible>(
                             hyper::Response::builder()
+                                .status(if limited { 429 } else { 200 })
+                                .header("retry-after", if limited { "10" } else { "0" })
                                 .header("content-encoding", if gzip { "gzip" } else { "identity" })
                                 .header("content-type", "application/json")
                                 .body(Full::new(Bytes::from(v.to_string())))
@@ -134,7 +137,7 @@ graphql_queries = ["gpuTypes"]
 [[services.fake.routes]]
 prefix = "/v1"
 upstream = "http://127.0.0.1:{port}/v1"
-allow = ["GET /pods", "GET /pods/{{id}}", "POST /pods", "GET /billing/pods", "GET /slash/", "GET /slash/{{id}}/"]
+allow = ["GET /pods", "GET /pods/{{id}}", "POST /pods", "GET /billing/pods", "GET /slash/", "GET /slash/{{id}}/", "GET /limited"]
 "#,
             d = d.display(),
             age_line = match fake_age {
@@ -713,4 +716,18 @@ async fn trailing_slash_rules_match_exactly() {
         let (code, body) = get(&format!("{}{path}", env.base), Some(&t)).await;
         assert_eq!(code, 403, "{path}: {body}");
     }
+}
+
+/// A rate-limited reply keeps its Retry-After on key-in-header routes too.
+#[tokio::test(flavor = "multi_thread")]
+async fn retry_after_reaches_the_client() {
+    let env = setup("12h").await;
+    let r = reqwest::Client::new()
+        .get(format!("{}/v1/limited", env.base))
+        .header("authorization", format!("Bearer {}", env.token()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 429);
+    assert_eq!(r.headers()["retry-after"], "10");
 }

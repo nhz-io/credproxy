@@ -235,6 +235,8 @@ async fn setup() -> Env {
     let s3 = s3_server(d.join("store"), secret.clone()).await;
     let listen = free_port();
     let raw = raw_server(d.to_path_buf()).await;
+    // nothing listens here: an upstream that is down
+    let down = free_port();
 
     let public = age_identity(d);
     seal(
@@ -281,6 +283,11 @@ s3 = {{ region = "dc-1", ops = ["GetObject", "ListObjectsV2"], key_prefixes = ["
 prefix = "/raw"
 upstream = "http://127.0.0.1:{raw}"
 s3 = {{ region = "dc-1", ops = ["GetObject", "HeadObject", "PutObject", "CreateMultipartUpload", "UploadPart", "CompleteMultipartUpload"], unsigned_payload = true }}
+
+[[services.store.routes]]
+prefix = "/down"
+upstream = "http://127.0.0.1:{down}"
+s3 = {{ region = "dc-1", ops = ["DeleteObject", "CompleteMultipartUpload", "PutObject"] }}
 
 [[services.store.routes]]
 prefix = "/unsigned"
@@ -2136,4 +2143,29 @@ async fn throttling_and_broken_bodies_are_reported_as_such() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     let log = env.log();
     assert!(log.contains("store POST /raw/vol1/brokenbody 400"), "{log}");
+}
+
+/// A state-changing request that can't even connect reached nothing: "cannot connect", not "outcome unknown".
+#[tokio::test(flavor = "multi_thread")]
+async fn failing_to_connect_is_not_an_unknown_outcome() {
+    let env = setup().await;
+    for (m, p, body, hash) in [
+        ("DELETE", "/store/down/vol1/k", vec![], false),
+        (
+            "POST",
+            "/store/down/vol1/k?uploadId=u1",
+            b"<CompleteMultipartUpload/>".to_vec(),
+            false,
+        ),
+        ("PUT", "/store/down/vol1/k", random_bytes(2 << 20), true),
+    ] {
+        let r = call(&env, m, p, body, hash, &[]).await;
+        assert_eq!(r.status, 502, "{m} {p}: {}", r.text());
+        assert!(r.text().contains("cannot connect"), "{m} {p}: {}", r.text());
+        assert!(
+            !r.text().contains("outcome is unknown"),
+            "{m} {p}: {}",
+            r.text()
+        );
+    }
 }
