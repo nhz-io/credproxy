@@ -126,7 +126,9 @@ paginated listing. The B2 tests run a fake B2 (authorize, calls, downloads): one
 going up and scrubbed coming back, `accountId` filled in, refused calls and paths never unlocking, expiry by time and
 by a 401 locking and the retry unlocking again (B2's `unauthorized` passing through), authorize retries, a download
 waiting through a slow unlock under a 1 s `s3_idle`, ranges and header filtering on downloads, bad authorize replies
-failing the unlock, and no key or token in the log. Signing is also checked against AWS's published examples. Also covered: refused calls never
+failing the unlock, `credproxy lock` stopping an authorize in flight, a codeless 401 locking only a token that has
+worked (a front end's 5xx doesn't count), a slow download error body under a 1 s `s3_idle`, `version = "v4"` going
+out as v4, and no key or token in the log. Signing is also checked against AWS's published examples. Also covered: refused calls never
 unlock, lock or stop during an upload (finishes intact / never completes), 304/416/404/307 replies, more parallel
 parts than the connection limit, the log never showing queries, and (simulated time) the idle cut-off and connection
 lifetimes. `CREDPROXY_TEST_PYTHON=<python with boto3> cargo test` adds a real boto3 run through the proxy. `cargo test --release --test s3 -- --ignored --nocapture` also runs the slow ones: 600 MB up and

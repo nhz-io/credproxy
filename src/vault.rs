@@ -109,6 +109,17 @@ fn new_token() -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
+/// The line of age's stderr that says what went wrong (no plaintext on failure): the last one, but not the
+/// "report unexpected or unhelpful errors" hint age ends some errors with.
+fn age_error(stderr: &str) -> &str {
+    stderr
+        .lines()
+        .map(str::trim)
+        .rev()
+        .find(|l| !l.is_empty() && !l.contains("filippo.io/age/report"))
+        .unwrap_or("")
+}
+
 fn kill_group(pgid: libc::pid_t) {
     unsafe { libc::kill(-pgid, libc::SIGKILL) };
 }
@@ -398,15 +409,12 @@ impl Vault {
             }
         };
         if !status.success() {
-            // age's own message (no plaintext on failure); keep the last line only
             let msg = String::from_utf8_lossy(&err);
-            let last = msg
-                .lines()
-                .rev()
-                .find(|l| !l.trim().is_empty())
-                .unwrap_or("")
-                .trim();
-            return Err(format!("could not decrypt {}: {last}", file.display()));
+            return Err(format!(
+                "could not decrypt {}: {}",
+                file.display(),
+                age_error(&msg)
+            ));
         }
         let svc = &self.cfg.services[service];
         let lines = if svc.sigv4.is_some() || svc.b2.is_some() {
@@ -518,6 +526,20 @@ mod tests {
         assert_eq!(a.len(), 64);
         assert_ne!(a, b);
         assert!(a.bytes().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn age_error_skips_the_report_hint() {
+        let err = "age: error: age-plugin-se: authentication canceled\nage: report unexpected or unhelpful errors at https://filippo.io/age/report\n";
+        assert_eq!(
+            age_error(err),
+            "age: error: age-plugin-se: authentication canceled"
+        );
+        assert_eq!(
+            age_error("age: error: no identity matched any of the recipients\n\n"),
+            "age: error: no identity matched any of the recipients"
+        );
+        assert_eq!(age_error(""), "");
     }
 
     #[test]

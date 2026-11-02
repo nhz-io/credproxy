@@ -270,11 +270,11 @@ fn main() {
         "install" => install(&cfg_path).unwrap_or_else(|e| die(&e)),
         "unlock" => {
             let s = need_service();
-            // Long timeout: waits for Touch ID.
+            // Long timeout: waits for Touch ID, and for B2 the authorize call after it.
             request(
                 &sock,
                 &json!({"op": "unlock", "service": s}),
-                Duration::from_secs(150),
+                b2::unlock_wait() + Duration::from_secs(20),
             )
             .unwrap_or_else(|e| die(&e));
             println!("unlocked: {s}");
