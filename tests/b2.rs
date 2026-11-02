@@ -27,6 +27,14 @@ struct B2State {
     token: String,
     /// answer every call with 401 expired_auth_token
     expire: bool,
+    /// answer every call with this 401 instead: Some(None) = plain text, Some(Some(code)) = B2 JSON with `code`
+    other_401: Option<Option<&'static str>>,
+    /// answer this many authorize calls with 503 first
+    authorize_fail: usize,
+    /// authorize calls received, failed ones included
+    authorize_tries: usize,
+    /// wait before answering an authorize call
+    authorize_delay: Duration,
     /// apiUrl to hand out instead of its own
     api_url: Option<String>,
     /// the last call: path, Authorization, body, Range
@@ -71,8 +79,20 @@ async fn fake_b2(state: Arc<Mutex<B2State>>) -> u16 {
                         let path = req.uri().path().to_string();
                         let body = req.into_body().collect().await.unwrap().to_bytes();
                         let body = String::from_utf8_lossy(&body).to_string();
+                        let delay = state.lock().unwrap().authorize_delay;
+                        if path == "/b2api/v3/b2_authorize_account" && !delay.is_zero() {
+                            tokio::time::sleep(delay).await;
+                        }
                         let mut s = state.lock().unwrap();
                         if path == "/b2api/v3/b2_authorize_account" {
+                            s.authorize_tries += 1;
+                            if s.authorize_fail > 0 {
+                                s.authorize_fail -= 1;
+                                return Ok::<_, std::convert::Infallible>(json_reply(
+                                    503,
+                                    json!({"status": 503, "code": "service_unavailable", "message": "busy"}),
+                                ));
+                            }
                             if auth.as_deref() != Some(s.basic.as_str()) {
                                 return Ok::<_, std::convert::Infallible>(json_reply(
                                     401,
@@ -97,6 +117,24 @@ async fn fake_b2(state: Arc<Mutex<B2State>>) -> u16 {
                                 401,
                                 json!({"status": 401, "code": "expired_auth_token", "message": "expired"}),
                             ));
+                        }
+                        match s.other_401 {
+                            Some(None) => {
+                                return Ok(hyper::Response::builder()
+                                    .status(401)
+                                    .header("content-type", "text/html")
+                                    .body(Full::new(Bytes::from("<html>401</html>")))
+                                    .unwrap());
+                            }
+                            Some(Some(code)) => {
+                                let mut r = json_reply(
+                                    401,
+                                    json!({"status": 401, "code": code, "message": "no"}),
+                                );
+                                r.headers_mut().insert("retry-after", "7".parse().unwrap());
+                                return Ok(r);
+                            }
+                            None => {}
                         }
                         if auth.as_deref() != Some(s.token.as_str()) {
                             return Ok(json_reply(
@@ -170,6 +208,11 @@ impl Drop for Env {
 }
 
 async fn setup(relock: &str) -> Env {
+    setup_with(relock, "", None).await
+}
+
+/// `top`: extra top-level config lines; `age_delay`: seconds `age` takes before decrypting (a slow Touch ID).
+async fn setup_with(relock: &str, top: &str, age_delay: Option<u32>) -> Env {
     let dir = tempfile::Builder::new().prefix("cp").tempdir().unwrap();
     let d = dir.path();
     let state = Arc::new(Mutex::new(B2State::default()));
@@ -187,11 +230,30 @@ async fn setup(relock: &str) -> Env {
         d.join("secrets/backblaze/master.age"),
         &format!("{id}\n{secret}\n"),
     );
+    let age_line = match age_delay {
+        Some(secs) => {
+            let p = d.join("slow-age");
+            let age = String::from_utf8(
+                sh(Command::new("/bin/sh").args(["-c", "command -v age"])).stdout,
+            )
+            .unwrap();
+            std::fs::write(
+                &p,
+                format!("#!/bin/sh\nsleep {secs}\nexec {} \"$@\"\n", age.trim()),
+            )
+            .unwrap();
+            std::fs::set_permissions(&p, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+                .unwrap();
+            format!("age = \"{}\"\n", p.display())
+        }
+        None => String::new(),
+    };
     let cfg = d.join("config.toml");
     std::fs::write(
         &cfg,
         format!(
-            r#"listen = "127.0.0.1:{listen}"
+            r#"{top}
+{age_line}listen = "127.0.0.1:{listen}"
 identity = "{d}/id.txt"
 secrets_dir = "{d}/secrets"
 runtime_dir = "{d}/run"
@@ -564,4 +626,62 @@ async fn bad_authorize_replies_fail_the_unlock() {
     );
     assert_eq!(env.st(|s| s.hits), 0);
     assert!(!env.log().contains(&env.secret));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn authorize_is_retried_while_the_key_is_held() {
+    let env = setup("23h").await;
+    env.st(|s| s.authorize_fail = 2);
+    let (code, body) = env.call("b2_list_buckets", "{}").await;
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(env.st(|s| (s.authorize_tries, s.authorizes)), (3, 1));
+
+    // three failures: the unlock fails with B2's own words, and stops there
+    let env = setup("23h").await;
+    env.st(|s| s.authorize_fail = 5);
+    let (code, body) = env.call("b2_list_buckets", "{}").await;
+    assert_eq!(code, 503);
+    assert!(body.contains("503 service_unavailable: busy"), "{body}");
+    assert_eq!(env.st(|s| (s.authorize_tries, s.hits)), (3, 0));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_401_ends_the_token_unless_b2_says_unauthorized() {
+    let env = setup("23h").await;
+    assert_eq!(env.call("b2_list_buckets", "{}").await.0, 200);
+    // the token is good but may not do this: B2's reply as it is, Retry-After included; still unlocked
+    env.st(|s| s.other_401 = Some(Some("unauthorized")));
+    let r = reqwest::Client::new()
+        .post(format!("{}/b2api/v3/b2_list_buckets", env.base))
+        .header("authorization", format!("Bearer {}", env.token()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 401);
+    assert_eq!(r.headers()["retry-after"], "7");
+    assert!(r.text().await.unwrap().contains("\"unauthorized\""));
+    assert!(env.status().contains("b2: unlocked"));
+    // a 401 without B2's code (a front end's page): the token is taken as ended
+    env.st(|s| s.other_401 = Some(None));
+    assert_eq!(env.call("b2_list_buckets", "{}").await.0, 503);
+    assert!(env.status().contains("b2: locked"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_download_waits_through_a_slow_unlock() {
+    // s3_idle 1s: a watchdog that didn't count the unlock as expected silence would cut this
+    let env = setup_with("23h", "s3_idle = \"1s\"", Some(2)).await;
+    env.st(|s| {
+        s.authorize_fail = 1;
+        s.authorize_delay = Duration::from_millis(700);
+    });
+    let r = reqwest::Client::new()
+        .get(format!("{}/file/my-bkt/x.bin", env.base))
+        .header("authorization", format!("Bearer {}", env.token()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    assert_eq!(r.text().await.unwrap(), "contents of /file/my-bkt/x.bin");
+    assert!(!env.log().contains("cut off"), "{}", env.log());
 }

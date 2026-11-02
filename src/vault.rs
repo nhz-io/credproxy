@@ -8,7 +8,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use subtle::ConstantTimeEq;
 use tokio::io::AsyncReadExt;
 use tokio::sync::watch;
@@ -30,13 +30,14 @@ pub enum Secret {
 struct Unlocked {
     secret: Secret,
     last_used: Instant,
-    /// B2: the token's end (`relock_after` after the unlock); the service locks then.
-    expires: Option<Instant>,
+    /// B2: the token's end (`relock_after` after the unlock); the service locks then. Wall-clock time: B2's token
+    /// lifetime counts while the Mac sleeps, which `Instant` (uptime on macOS) doesn't.
+    expires: Option<SystemTime>,
 }
 
 impl Unlocked {
     fn expired(&self) -> bool {
-        self.expires.is_some_and(|e| Instant::now() >= e)
+        self.expires.is_some_and(|e| SystemTime::now() >= e)
     }
 }
 
@@ -271,7 +272,7 @@ impl Vault {
                 Some(b) => crate::b2::authorize(&self.http, b, key).await.map(|s| {
                     (
                         Secret::B2(Arc::new(s)),
-                        Some(Instant::now() + b.relock_after),
+                        Some(SystemTime::now() + b.relock_after),
                     )
                 }),
                 None => Ok((Secret::Key(key), None)),
@@ -450,7 +451,9 @@ impl Vault {
                     Some(u) => {
                         let idle = self.cfg.idle_lock.saturating_sub(u.last_used.elapsed());
                         let left = match u.expires {
-                            Some(e) => idle.min(e.saturating_duration_since(Instant::now())),
+                            Some(e) => {
+                                idle.min(e.duration_since(SystemTime::now()).unwrap_or_default())
+                            }
                             None => idle,
                         };
                         (name.clone(), "unlocked", left.as_secs())
@@ -532,7 +535,7 @@ allow = ["GET /x"]
         )
         .unwrap();
         let v = Vault::new(cfg);
-        let past = Instant::now() - Duration::from_secs(1);
+        let past = SystemTime::now() - Duration::from_secs(1);
         let unlocked = |expires, last_used| Unlocked {
             secret: Secret::Key(Zeroizing::new("x".into())),
             last_used,

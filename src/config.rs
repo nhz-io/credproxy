@@ -641,10 +641,17 @@ pub fn parse(text: &str) -> Result<Config, String> {
                             r.prefix
                         ));
                     }
-                    Some(
-                        check_b2_route(x)
-                            .map_err(|e| format!("service {name}: route {:?}: {e}", r.prefix))?,
-                    )
+                    let route = check_b2_route(x)
+                        .map_err(|e| format!("service {name}: route {:?}: {e}", r.prefix))?;
+                    // the path clients call names the API version calls go out with
+                    let version = &b2.as_ref().expect("b2 service").version;
+                    if matches!(route, B2Route::Api(_)) && prefix != format!("/b2api/{version}") {
+                        return Err(format!(
+                            "service {name}: route {:?}: a B2 calls route's prefix is \"/b2api/{version}\" (auth.b2.version)",
+                            r.prefix
+                        ));
+                    }
+                    Some(route)
                 }
                 (None, false) => None,
                 (Some(_), false) => {
@@ -1090,10 +1097,13 @@ b2 = { download = true }
             s.route("/file/bkt/a/b").unwrap().0.b2,
             Some(B2Route::Download)
         );
-        let c = parse(&B2.replace(
-            "b2 = {}",
-            "b2 = { version = \"v4\", relock_after = \"2s\", authorize_url = \"http://127.0.0.1:9/auth\" }",
-        ))
+        let c = parse(
+            &B2.replace(
+                "b2 = {}",
+                "b2 = { version = \"v4\", relock_after = \"2s\", authorize_url = \"http://127.0.0.1:9/auth\" }",
+            )
+            .replace("/b2api/v3", "/b2api/v4"),
+        )
         .unwrap();
         let b = c.services["b2"].b2.as_ref().unwrap();
         assert_eq!(
@@ -1122,6 +1132,8 @@ b2 = { download = true }
                 "b2 = { authorize_url = \"http://evil.example/a\" }",
             ),
             B2.replace("b2 = {}", "b2 = {}, sigv4 = {}"),
+            B2.replace("b2 = {}", "b2 = { version = \"v4\" }"),
+            B2.replace("/b2api/v3", "/api"),
             B2.replace("b2 = {}", "header = \"Range\", format = \"{key}\", b2 = {}"),
             B2.replace("auth = { b2 = {} }", ""),
             B2.replace("\"b2_create_key\"", "\"B2_list\""),

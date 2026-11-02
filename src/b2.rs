@@ -7,8 +7,8 @@
 use crate::config::{B2Auth, B2Route, check_upstream};
 use crate::log;
 use crate::proxy::{
-    Body, Clients, IDLE, Progress, UPSTREAM_TIMEOUT, buffered_reply, read_reply, read_small, reply,
-    reply_with, stream_reply, upstream_failed,
+    Body, Clients, IDLE, Progress, UPSTREAM_TIMEOUT, read_buffered, read_small, reply,
+    stream_reply, upstream_failed,
 };
 use crate::s3;
 use crate::vault::Vault;
@@ -21,6 +21,9 @@ use zeroize::Zeroizing;
 
 /// The authorize call (one small request and reply), made right after the Touch ID wait.
 pub(crate) const AUTHORIZE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Tries of the authorize call: a connection failure or a 5xx is tried again (the key is still held then; once
+/// it's gone, only a new Touch ID can get a token).
+const AUTHORIZE_TRIES: u32 = 3;
 /// Largest authorize reply read (they are a few KiB).
 const MAX_AUTHORIZE_REPLY: usize = 64 << 10;
 /// Calls that name the account: credproxy fills in `accountId` (a client may not send one).
@@ -51,6 +54,11 @@ const DOWNLOAD_HEADERS: [&str; 16] = [
     "x-bz-file-retention-mode",
     "x-bz-file-legal-hold",
 ];
+
+/// How long a B2 unlock may take: the Touch ID wait, then the authorize call (all its tries).
+pub(crate) fn unlock_wait() -> Duration {
+    crate::vault::UNLOCK_TIMEOUT + AUTHORIZE_TIMEOUT + Duration::from_secs(10)
+}
 
 /// What an unlocked B2 service holds. No Debug: nothing may print the token.
 pub struct Session {
@@ -114,14 +122,33 @@ pub async fn authorize(
     base64_into(pair.as_bytes(), &mut basic);
     let mut value = reqwest::header::HeaderValue::from_str(&basic).map_err(|_| "bad key")?;
     value.set_sensitive(true);
-    let sent = http
-        .get(&cfg.authorize_url)
-        .timeout(AUTHORIZE_TIMEOUT)
-        .header("authorization", value)
-        .header("accept-encoding", "identity")
-        .send()
-        .await;
-    drop((basic, pair, key));
+    // every try, and the waits between them, within AUTHORIZE_TIMEOUT
+    let deadline = tokio::time::Instant::now() + AUTHORIZE_TIMEOUT;
+    let mut tries = 0;
+    let sent = loop {
+        tries += 1;
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let r = http
+            .get(&cfg.authorize_url)
+            .timeout(left)
+            .header("authorization", value.clone())
+            .header("accept-encoding", "identity")
+            .send()
+            .await;
+        let transient = match &r {
+            Ok(res) => res.status().is_server_error(),
+            Err(e) => !e.is_builder(),
+        };
+        let pause = Duration::from_secs(tries.into());
+        if !transient
+            || tries == AUTHORIZE_TRIES
+            || deadline.saturating_duration_since(tokio::time::Instant::now()) <= pause
+        {
+            break r;
+        }
+        tokio::time::sleep(pause).await;
+    };
+    drop((value, basic, pair, key));
     let mut res = sent.map_err(|e| {
         let what = if e.is_timeout() {
             "timed out"
@@ -217,41 +244,33 @@ fn token_value(session: &Session) -> Result<reqwest::header::HeaderValue, Respon
     Ok(v)
 }
 
-/// A reply other than a successful download: buffered and scrubbed of the token. A 401 saying the token is bad or
-/// expired locks the service and becomes a 503 (a retry unlocks again); the call is not replayed, it may change
-/// state.
+/// A reply other than a successful download: buffered and scrubbed of the token. A 401 means the token ended
+/// (expired, revoked, or a reply without B2's code, e.g. a HEAD's), except B2's `unauthorized` (the token is good
+/// but may not do this): the service locks and the client gets a 503 (a retry unlocks again). The call is not
+/// replayed, it may change state.
 async fn buffered(
     vault: &Vault,
     service: &str,
     session: &Arc<Session>,
     res: reqwest::Response,
-    head: bool,
 ) -> Response<Body> {
-    let secrets = [session.token.as_bytes()];
-    if res.status() != reqwest::StatusCode::UNAUTHORIZED {
-        return buffered_reply(res, &secrets, None).await;
-    }
-    let (status, ctype, body) = match read_reply(res, &secrets, None).await {
-        Ok(r) => r,
+    let b = match read_buffered(res, &[session.token.as_bytes()], None).await {
+        Ok(b) => b,
         Err(r) => return r,
     };
-    let code = serde_json::from_slice::<Value>(&body)
-        .ok()
-        .and_then(|v| v["code"].as_str().map(str::to_string));
-    // a HEAD's 401 has no body to say why; with the account's own token it can only be the token
-    if head
-        || matches!(
-            code.as_deref(),
-            Some("expired_auth_token" | "bad_auth_token")
-        )
-    {
-        vault.expire(service, session);
-        return reply(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "B2 token expired or revoked, so the service is locked: retry (the retry unlocks: Touch ID)",
-        );
+    if b.status == StatusCode::UNAUTHORIZED {
+        let code = serde_json::from_slice::<Value>(&b.body)
+            .ok()
+            .and_then(|v| v["code"].as_str().map(str::to_string));
+        if code.as_deref() != Some("unauthorized") {
+            vault.expire(service, session);
+            return reply(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "B2 token expired or revoked, so the service is locked: retry (the retry unlocks: Touch ID)",
+            );
+        }
     }
-    reply_with(status, ctype, body)
+    b.into_response()
 }
 
 /// Allowlist first, then the session (unlocking if needed): a refused call never raises a Touch ID prompt.
@@ -345,7 +364,7 @@ async fn api(
         .send()
         .await;
     match res {
-        Ok(r) => buffered(vault, service, &session, r, false).await,
+        Ok(r) => buffered(vault, service, &session, r).await,
         Err(e) => upstream_failed(&e),
     }
 }
@@ -396,7 +415,7 @@ async fn download(
     // expected silence
     let what = format!("{service} {method} /file{}", log::printable(sub));
     progress.mark_streaming(what.clone());
-    progress.quiet_for(crate::vault::UNLOCK_TIMEOUT + AUTHORIZE_TIMEOUT + Duration::from_secs(10));
+    progress.quiet_for(unlock_wait());
     let session = match vault.b2(service).await {
         Ok(s) => s,
         Err(e) => return reply(StatusCode::SERVICE_UNAVAILABLE, &e),
@@ -436,7 +455,7 @@ async fn download(
     if !res.status().is_success() {
         // 416 needs the size
         let range = res.headers().get("content-range").cloned();
-        let mut r = buffered(vault, service, &session, res, method == "HEAD").await;
+        let mut r = buffered(vault, service, &session, res).await;
         if let Some(v) = range {
             r.headers_mut().insert("content-range", v);
         }
@@ -476,6 +495,11 @@ mod tests {
             base64_into(i.as_bytes(), &mut s);
             assert_eq!(s, o, "{i:?}");
         }
+    }
+
+    #[test]
+    fn unlock_wait_covers_touch_id_and_authorize() {
+        assert!(unlock_wait() > crate::vault::UNLOCK_TIMEOUT + AUTHORIZE_TIMEOUT);
     }
 
     #[test]

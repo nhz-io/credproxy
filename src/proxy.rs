@@ -439,27 +439,55 @@ pub(crate) fn reply_with(
     b.body(full(body)).unwrap()
 }
 
-/// The buffered reply, plus the upstream's Retry-After (a throttled client needs it to back off), on every route.
+/// A whole upstream reply, read and scrubbed: what `buffered_reply` sends, for callers that look at it first.
+pub(crate) struct Buffered {
+    pub status: StatusCode,
+    pub ctype: Option<hyper::header::HeaderValue>,
+    pub body: Vec<u8>,
+    /// The upstream's Retry-After, scrubbed (a throttled client needs it to back off)
+    pub retry_after: Option<hyper::header::HeaderValue>,
+}
+
+impl Buffered {
+    pub fn into_response(self) -> Response<Body> {
+        let mut r = reply_with(self.status, self.ctype, self.body);
+        if let Some(v) = self.retry_after {
+            r.headers_mut().insert("retry-after", v);
+        }
+        r
+    }
+}
+
+#[allow(clippy::result_large_err)]
+pub(crate) async fn read_buffered(
+    res: reqwest::Response,
+    secrets: &[&[u8]],
+    progress: Option<&Progress>,
+) -> Result<Buffered, Response<Body>> {
+    let retry_after = res.headers().get("retry-after").cloned();
+    let (status, ctype, body) = read_reply(res, secrets, progress).await?;
+    let retry_after = retry_after.and_then(|v| {
+        let b = secrets
+            .iter()
+            .fold(v.as_bytes().to_vec(), |acc, s| scrub(&acc, s));
+        hyper::header::HeaderValue::from_bytes(&b).ok()
+    });
+    Ok(Buffered {
+        status,
+        ctype,
+        body,
+        retry_after,
+    })
+}
+
+/// The buffered reply, plus the upstream's Retry-After, on every route.
 pub(crate) async fn buffered_reply(
     res: reqwest::Response,
     secrets: &[&[u8]],
     progress: Option<&Progress>,
 ) -> Response<Body> {
-    let retry_after = res.headers().get("retry-after").cloned();
-    match read_reply(res, secrets, progress).await {
-        Ok((status, ctype, body)) => {
-            let mut r = reply_with(status, ctype, body);
-            let clean = retry_after.and_then(|v| {
-                let b = secrets
-                    .iter()
-                    .fold(v.as_bytes().to_vec(), |acc, s| scrub(&acc, s));
-                hyper::header::HeaderValue::from_bytes(&b).ok()
-            });
-            if let Some(v) = clean {
-                r.headers_mut().insert("retry-after", v);
-            }
-            r
-        }
+    match read_buffered(res, secrets, progress).await {
+        Ok(b) => b.into_response(),
         Err(r) => r,
     }
 }
