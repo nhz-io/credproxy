@@ -395,7 +395,16 @@ fn check_listen(s: &str) -> Result<SocketAddr, String> {
 fn bounded(s: &str, what: &str, max: Duration) -> Result<Duration, String> {
     let d = parse_duration(s).map_err(|e| format!("{what}: {e}"))?;
     if d > max {
-        return Err(format!("{what}: at most {}h", max.as_secs() / 3600));
+        // in the largest unit that states it exactly, as the config would write it
+        let secs = max.as_secs();
+        let limit = if secs % 3600 == 0 {
+            format!("{}h", secs / 3600)
+        } else if secs % 60 == 0 {
+            format!("{}m", secs / 60)
+        } else {
+            format!("{secs}s")
+        };
+        return Err(format!("{what}: at most {limit}"));
     }
     Ok(d)
 }
@@ -663,7 +672,16 @@ allow = ["GET /pods", "DELETE /pods/{id}", "GET /catalog/gpus"]
         assert!(parse(&format!("s3_reply_wait = \"99999999999999h\"\n{RUNPOD}")).is_err());
         assert!(parse(&format!("s3_reply_wait = \"168h\"\n{RUNPOD}")).is_ok());
         assert_eq!(c.s3_connect_timeout, Duration::from_secs(30));
-        assert!(parse(&format!("s3_connect_timeout = \"6m\"\n{RUNPOD}")).is_err());
+        let err = |extra: &str| parse(&format!("{extra}\n{RUNPOD}")).unwrap_err();
+        assert_eq!(
+            err("s3_connect_timeout = \"6m\""),
+            "s3_connect_timeout: at most 5m"
+        );
+        assert_eq!(err("s3_idle = \"25h\""), "s3_idle: at most 24h");
+        assert_eq!(
+            err("s3_reply_wait = \"169h\""),
+            "s3_reply_wait: at most 168h"
+        );
         let s = &c.services["runpod"];
         assert_eq!(s.secret, PathBuf::from("runpod/api-key.age"));
         assert_eq!(s.auth_format, "Bearer {key}");
