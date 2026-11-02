@@ -1,7 +1,9 @@
 //! The HTTP side: http://127.0.0.1:<port>/<service>/<route>/... with the token in the service's auth header → Host and token
 //! check → allowlist → upstream with the key in place of the token → scrubbed reply. S3 routes instead sign the
-//! request with SigV4 (the secret never goes upstream) and stream bodies both ways.
+//! request with SigV4 (the secret never goes upstream) and stream bodies both ways. B2 routes (b2.rs) use the token
+//! the key was traded for at unlock.
 
+use crate::b2;
 use crate::config::Route;
 use crate::graphql;
 use crate::log;
@@ -25,14 +27,14 @@ pub const USER_AGENT: &str = concat!("credproxy/", env!("CARGO_PKG_VERSION"));
 /// Upstream TCP connect (DNS included) for key-in-header routes; S3 uses the config's s3_connect_timeout.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// How S3 refusals and failures after a state-changing request may have reached the upstream say so.
-const OUTCOME_UNKNOWN: &str = "the outcome is unknown (it may still complete); check the object (HEAD, ListParts) before retrying";
+pub(crate) const OUTCOME_UNKNOWN: &str = "the outcome is unknown (it may still complete); check the object (HEAD, ListParts) before retrying";
 /// Whole upstream call for key-in-header routes.
-const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(60);
+pub(crate) const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(60);
 /// A client that takes this long to send a small (key-in-header) body is refused. S3 calls use the config's
 /// `s3_idle` and `s3_reply_wait` instead (defaults 60 s and 2 h: RunPod's docs say a CompleteMultipartUpload of a
 /// 10 GB+ file can take long and suggest a 2 h read timeout), enforced by the connection watchdog (serve.rs);
 /// they have no overall time limit.
-const IDLE: Duration = Duration::from_secs(60);
+pub(crate) const IDLE: Duration = Duration::from_secs(60);
 
 /// What a connection's watchdog (serve.rs) needs to know: whether it carries an allowed S3 call, when bytes last
 /// moved, and until when silence is expected (Touch ID, the upstream preparing its reply).
@@ -104,8 +106,8 @@ pub type Body = BoxBody<Bytes, BoxError>;
 /// tests exercise (an S3 endpoint behind a CDN would otherwise negotiate HTTP/2).
 #[derive(Clone)]
 pub struct Clients {
-    api: reqwest::Client,
-    s3: reqwest::Client,
+    pub(crate) api: reqwest::Client,
+    pub(crate) s3: reqwest::Client,
 }
 
 fn api_builder() -> reqwest::ClientBuilder {
@@ -114,6 +116,11 @@ fn api_builder() -> reqwest::ClientBuilder {
         .connect_timeout(CONNECT_TIMEOUT)
         .user_agent(USER_AGENT)
         .no_proxy()
+}
+
+/// The client for small calls credproxy makes itself (B2's authorize).
+pub fn api_client() -> reqwest::Client {
+    api_builder().build().expect("http client")
 }
 
 fn s3_builder(connect: Duration) -> reqwest::ClientBuilder {
@@ -127,11 +134,11 @@ pub fn clients(s3_connect: Duration) -> Clients {
     }
 }
 
-fn full(b: impl Into<Bytes>) -> Body {
+pub(crate) fn full(b: impl Into<Bytes>) -> Body {
     Full::new(b.into()).map_err(|n| match n {}).boxed()
 }
 
-fn reply(status: StatusCode, msg: &str) -> Response<Body> {
+pub(crate) fn reply(status: StatusCode, msg: &str) -> Response<Body> {
     Response::builder()
         .status(status)
         .header("content-type", "text/plain; charset=utf-8")
@@ -265,6 +272,9 @@ async fn forward(
     let Some((route, sub)) = svc.route(rest) else {
         return reply(StatusCode::FORBIDDEN, "path not allowed");
     };
+    if let Some(b) = &route.b2 {
+        return b2::forward(vault, http, service, method, b, &sub, req, progress).await;
+    }
     if route.s3.is_some() {
         return forward_s3(vault, &http.s3, service, method, route, &sub, req, progress).await;
     }
@@ -340,7 +350,7 @@ async fn forward(
 
 /// A small client body (≤ MAX_REQUEST), read within `limit`.
 #[allow(clippy::result_large_err)]
-async fn read_small(body: Incoming, limit: Duration) -> Result<Bytes, Response<Body>> {
+pub(crate) async fn read_small(body: Incoming, limit: Duration) -> Result<Bytes, Response<Body>> {
     match tokio::time::timeout(limit, Limited::new(body, MAX_REQUEST).collect()).await {
         Ok(Ok(b)) => Ok(b.to_bytes()),
         Ok(Err(e))
@@ -358,7 +368,7 @@ async fn read_small(body: Incoming, limit: Duration) -> Result<Bytes, Response<B
     }
 }
 
-fn upstream_failed(e: &reqwest::Error) -> Response<Body> {
+pub(crate) fn upstream_failed(e: &reqwest::Error) -> Response<Body> {
     let what = if e.is_timeout() {
         "timed out"
     } else if e.is_connect() {
@@ -372,7 +382,7 @@ fn upstream_failed(e: &reqwest::Error) -> Response<Body> {
 /// The whole upstream reply (≤ MAX_RESPONSE, uncompressed) as status, content type and body, with every copy of
 /// each of `secrets` replaced; or the reply to send instead.
 #[allow(clippy::result_large_err)]
-async fn read_reply(
+pub(crate) async fn read_reply(
     mut res: reqwest::Response,
     secrets: &[&[u8]],
     progress: Option<&Progress>,
@@ -416,7 +426,7 @@ async fn read_reply(
     Ok((status, ctype, clean(&buf)))
 }
 
-fn reply_with(
+pub(crate) fn reply_with(
     status: StatusCode,
     ctype: Option<hyper::header::HeaderValue>,
     body: Vec<u8>,
@@ -429,7 +439,7 @@ fn reply_with(
 }
 
 /// The buffered reply, plus the upstream's Retry-After (a throttled client needs it to back off), on every route.
-async fn buffered_reply(
+pub(crate) async fn buffered_reply(
     res: reqwest::Response,
     secrets: &[&[u8]],
     progress: Option<&Progress>,
@@ -824,8 +834,28 @@ async fn forward_s3(
         }
         return reply_with(status, ctype, body);
     }
-    // A body that ends when the connection closes can't be told from one cut short: only replies that say how
-    // long they are (or are chunked, with an end marker) stream through.
+    let keep: Vec<_> = S3_REPLY_HEADERS
+        .iter()
+        .filter_map(|n| {
+            let v = res.headers().get(*n)?.clone();
+            Some((hyper::header::HeaderName::from_static(n), v))
+        })
+        .collect();
+    stream_reply(res, method, changes, keep, &vault.cfg.log, what, progress)
+}
+
+/// A successful reply streamed back with `headers`. A body that ends when the connection closes can't be told from
+/// one cut short: only replies that say how long they are (or are chunked, with an end marker) stream through.
+/// `changes`: the request may have changed state, so a refused reply's outcome is unknown.
+pub(crate) fn stream_reply(
+    res: reqwest::Response,
+    method: &str,
+    changes: bool,
+    headers: Vec<(hyper::header::HeaderName, hyper::header::HeaderValue)>,
+    log_file: &std::path::Path,
+    what: String,
+    progress: &Arc<Progress>,
+) -> Response<Body> {
     let chunked = res.headers().get_all("transfer-encoding").iter().any(|v| {
         v.as_bytes()
             .to_ascii_lowercase()
@@ -844,14 +874,12 @@ async fn forward_s3(
         return reply(StatusCode::BAD_GATEWAY, &msg);
     }
     let mut b = Response::builder().status(res.status().as_u16());
-    for n in S3_REPLY_HEADERS {
-        if let Some(v) = res.headers().get(n) {
-            b = b.header(n, v.clone());
-        }
+    for (n, v) in headers {
+        b = b.header(n, v);
     }
     // The request is logged when the reply starts; a reply the upstream breaks off later gets its own line (a
     // stalled one is cut and logged by the watchdog).
-    let log_file = vault.cfg.log.clone();
+    let log_file = log_file.to_path_buf();
     let moved = progress.clone();
     let stream = res
         .bytes_stream()

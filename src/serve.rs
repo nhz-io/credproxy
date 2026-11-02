@@ -235,7 +235,7 @@ async fn control(conn: UnixStream, vault: Arc<Vault>, stop: Arc<Notify>) {
     let req: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
     let service = req.get("service").and_then(|s| s.as_str());
     let res = match (req.get("op").and_then(|o| o.as_str()), service) {
-        (Some("unlock"), Some(s)) => match vault.key(s, true).await {
+        (Some("unlock"), Some(s)) => match vault.secret(s, true).await {
             Ok(_) => json!({"ok": true}),
             Err(e) => json!({"ok": false, "error": e}),
         },

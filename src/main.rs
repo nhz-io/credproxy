@@ -1,6 +1,7 @@
 //! credproxy: a local proxy that holds API keys (age-sealed, unlocked with one Touch ID) and adds them to allowed
 //! requests, so the programs using them never see the keys.
 
+mod b2;
 mod config;
 mod graphql;
 mod log;

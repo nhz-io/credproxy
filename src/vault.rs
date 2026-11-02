@@ -20,9 +20,24 @@ pub const UNLOCK_BACKOFF: Duration = Duration::from_secs(30);
 /// How long an unlock waits for the Touch ID / password prompt.
 pub const UNLOCK_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// What an unlocked service holds: its key, or for B2 only the session the key was traded for.
+#[derive(Clone)]
+pub enum Secret {
+    Key(Zeroizing<String>),
+    B2(Arc<crate::b2::Session>),
+}
+
 struct Unlocked {
-    key: Zeroizing<String>,
+    secret: Secret,
     last_used: Instant,
+    /// B2: the token's end (`relock_after` after the unlock); the service locks then.
+    expires: Option<Instant>,
+}
+
+impl Unlocked {
+    fn expired(&self) -> bool {
+        self.expires.is_some_and(|e| Instant::now() >= e)
+    }
 }
 
 /// Outcome of one unlock job, shared by every request waiting for it.
@@ -48,6 +63,8 @@ pub struct Vault {
     pub cfg: Config,
     slots: Mutex<HashMap<String, Slot>>,
     next_job: AtomicU64,
+    /// For B2's authorize call.
+    http: reqwest::Client,
 }
 
 /// The runtime dir must be ours and private.
@@ -93,7 +110,7 @@ fn to_key(raw: &[u8], lines: usize) -> Result<Zeroizing<String>, String> {
     let what = if lines == 1 {
         "a single line of printable ASCII"
     } else {
-        "two lines of printable ASCII (access key id, secret)"
+        "two lines of printable ASCII (key id, secret)"
     };
     if parts.len() != lines
         || parts
@@ -131,6 +148,7 @@ impl Vault {
             cfg,
             slots: Mutex::new(slots),
             next_job: AtomicU64::new(1),
+            http: crate::proxy::api_client(),
         }
     }
 
@@ -150,13 +168,43 @@ impl Vault {
             .map(|s| s.token.clone())
     }
 
-    /// The service's key, unlocking first if needed. Requests share one unlock job per service and only wait
-    /// for it. `force` (explicit `credproxy unlock`) ignores the back-off after a failed unlock.
+    /// The service's key, unlocking first if needed.
     pub async fn key(
         self: &Arc<Self>,
         service: &str,
         force: bool,
     ) -> Result<Zeroizing<String>, String> {
+        match self.secret(service, force).await? {
+            Secret::Key(k) => Ok(k),
+            Secret::B2(_) => Err("a B2 service has no key in memory".into()),
+        }
+    }
+
+    /// The B2 service's session, unlocking (and authorizing) first if needed.
+    pub async fn b2(self: &Arc<Self>, service: &str) -> Result<Arc<crate::b2::Session>, String> {
+        match self.secret(service, false).await? {
+            Secret::B2(s) => Ok(s),
+            Secret::Key(_) => Err("not a B2 service".into()),
+        }
+    }
+
+    /// B2 said the session's token is no longer good: lock the service, unless it already holds a newer session.
+    pub fn expire(&self, service: &str, session: &Arc<crate::b2::Session>) {
+        let mut slots = self.slots.lock().unwrap();
+        if let Some(s) = slots.get_mut(service)
+            && matches!(&s.unlocked, Some(Unlocked { secret: Secret::B2(x), .. }) if Arc::ptr_eq(x, session))
+        {
+            s.unlocked = None;
+            log::line(
+                &self.cfg.log,
+                &format!("{service} locked (B2 token no longer valid)"),
+            );
+        }
+    }
+
+    /// The service's secret, unlocking first if needed. Requests share one unlock job per service and only wait
+    /// for it. `force` (explicit `credproxy unlock`) ignores the back-off after a failed unlock.
+    pub async fn secret(self: &Arc<Self>, service: &str, force: bool) -> Result<Secret, String> {
         if !self.cfg.services.contains_key(service) {
             return Err(format!("unknown service {service:?}"));
         }
@@ -164,9 +212,16 @@ impl Vault {
             let mut done = {
                 let mut slots = self.slots.lock().unwrap();
                 let slot = slots.entry(service.to_string()).or_default();
+                if slot.unlocked.as_ref().is_some_and(Unlocked::expired) {
+                    slot.unlocked = None;
+                    log::line(
+                        &self.cfg.log,
+                        &format!("{service} locked (B2 token expired)"),
+                    );
+                }
                 if let Some(u) = slot.unlocked.as_mut() {
                     u.last_used = Instant::now();
-                    return Ok(u.key.clone());
+                    return Ok(u.secret.clone());
                 }
                 match &slot.pending {
                     Some(p) => p.done.subscribe(),
@@ -210,7 +265,19 @@ impl Vault {
         id: u64,
         done: Arc<watch::Sender<Outcome>>,
     ) {
-        let res = self.decrypt(&service, id).await;
+        let res = match self.decrypt(&service, id).await {
+            Ok(key) => match &self.cfg.services[&service].b2 {
+                // the key is dropped (zeroed) as soon as the authorize call is done, whatever its outcome
+                Some(b) => crate::b2::authorize(&self.http, b, key).await.map(|s| {
+                    (
+                        Secret::B2(Arc::new(s)),
+                        Some(Instant::now() + b.relock_after),
+                    )
+                }),
+                None => Ok((Secret::Key(key), None)),
+            },
+            Err(e) => Err(e),
+        };
         let mut slots = self.slots.lock().unwrap();
         let slot = slots.entry(service.clone()).or_default();
         // A `lock` while we waited removed our job (and already told the waiters): drop the result.
@@ -219,11 +286,12 @@ impl Vault {
         }
         slot.pending = None;
         let outcome = match res {
-            Ok(key) => {
+            Ok((secret, expires)) => {
                 slot.failed_at = None;
                 slot.unlocked = Some(Unlocked {
-                    key,
+                    secret,
                     last_used: Instant::now(),
+                    expires,
                 });
                 log::line(&self.cfg.log, &format!("{service} unlocked"));
                 Ok(())
@@ -311,7 +379,8 @@ impl Vault {
                 .trim();
             return Err(format!("could not decrypt {}: {last}", file.display()));
         }
-        let lines = if self.cfg.services[service].sigv4.is_some() {
+        let svc = &self.cfg.services[service];
+        let lines = if svc.sigv4.is_some() || svc.b2.is_some() {
             2
         } else {
             1
@@ -346,7 +415,7 @@ impl Vault {
         locked
     }
 
-    /// Lock every service unused for `idle_lock`; returns their names.
+    /// Lock every service unused for `idle_lock`, and B2 services whose token expires; returns their names.
     pub fn sweep(&self) -> Vec<String> {
         let idle = self.cfg.idle_lock;
         let mut slots = self.slots.lock().unwrap();
@@ -354,7 +423,7 @@ impl Vault {
         for (name, s) in slots.iter_mut() {
             if s.unlocked
                 .as_ref()
-                .is_some_and(|u| u.last_used.elapsed() >= idle)
+                .is_some_and(|u| u.last_used.elapsed() >= idle || u.expired())
             {
                 s.unlocked = None;
                 locked.push(name.clone());
@@ -371,15 +440,20 @@ impl Vault {
             .services
             .keys()
             .map(
-                |name| match slots.get(name).and_then(|s| s.unlocked.as_ref()) {
-                    Some(u) => (
-                        name.clone(),
-                        "unlocked",
-                        self.cfg
-                            .idle_lock
-                            .saturating_sub(u.last_used.elapsed())
-                            .as_secs(),
-                    ),
+                // an expired session is locked, even before the sweep forgets it
+                |name| match slots
+                    .get(name)
+                    .and_then(|s| s.unlocked.as_ref())
+                    .filter(|u| !u.expired())
+                {
+                    Some(u) => {
+                        let idle = self.cfg.idle_lock.saturating_sub(u.last_used.elapsed());
+                        let left = match u.expires {
+                            Some(e) => idle.min(e.saturating_duration_since(Instant::now())),
+                            None => idle,
+                        };
+                        (name.clone(), "unlocked", left.as_secs())
+                    }
                     None if slots.get(name).is_some_and(|s| s.pending.is_some()) => {
                         (name.clone(), "unlocking", 0)
                     }

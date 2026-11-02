@@ -96,12 +96,12 @@ pub struct Target {
     pub query: String,
 }
 
-fn encode(s: &str) -> String {
+pub(crate) fn encode(s: &str) -> String {
     utf8_percent_encode(s, ENCODE).to_string()
 }
 
 /// Percent-decode strictly: every `%` must start a two-digit hex escape, and the result must be UTF-8.
-fn decode(raw: &str) -> Option<String> {
+pub(crate) fn decode(raw: &str) -> Option<String> {
     let b = raw.as_bytes();
     let mut i = 0;
     while i < b.len() {
@@ -122,7 +122,7 @@ fn decode(raw: &str) -> Option<String> {
 
 /// An object key: no control characters, no `.`/`..` or empty segments (RunPod keys are file paths), at most
 /// one trailing `/` (a "directory").
-fn valid_key(k: &str) -> bool {
+pub(crate) fn valid_key(k: &str) -> bool {
     if k.is_empty() || k.len() > 1024 || k.chars().any(char::is_control) {
         return false;
     }

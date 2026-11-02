@@ -52,6 +52,28 @@ struct RawAuth {
     format: String,
     /// Sign requests with AWS SigV4 instead of putting the key in `header`.
     sigv4: Option<RawSigv4>,
+    /// Backblaze B2 native API: the key is traded for a B2 token at unlock, then forgotten.
+    b2: Option<RawB2>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawB2 {
+    #[serde(default = "default_b2_version")]
+    version: String,
+    #[serde(default = "default_b2_relock")]
+    relock_after: String,
+    /// For tests and fakes; default https://api.backblazeb2.com/b2api/<version>/b2_authorize_account.
+    authorize_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawB2Route {
+    #[serde(default)]
+    calls: Vec<String>,
+    #[serde(default)]
+    download: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -67,6 +89,7 @@ impl Default for RawAuth {
             header: default_header(),
             format: default_format(),
             sigv4: None,
+            b2: None,
         }
     }
 }
@@ -75,11 +98,13 @@ impl Default for RawAuth {
 #[serde(deny_unknown_fields)]
 struct RawRoute {
     prefix: String,
-    upstream: String,
+    /// Not for B2 routes: their upstream comes from the authorize reply.
+    upstream: Option<String>,
     #[serde(default)]
     allow: Vec<String>,
     graphql_queries: Option<Vec<String>>,
     s3: Option<RawS3>,
+    b2: Option<RawB2Route>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -132,6 +157,12 @@ fn default_format() -> String {
 fn default_sigv4_service() -> String {
     "s3".into()
 }
+fn default_b2_version() -> String {
+    "v3".into()
+}
+fn default_b2_relock() -> String {
+    "23h".into()
+}
 
 #[derive(Debug)]
 pub struct Config {
@@ -163,8 +194,42 @@ pub struct Service {
     /// Some(signing service name, e.g. "s3"): requests are signed with SigV4; the sealed file holds two lines,
     /// the access key id and the secret.
     pub sigv4: Option<String>,
+    /// Some: Backblaze B2 native API (the sealed file holds two lines, the key id and the application key).
+    pub b2: Option<B2Auth>,
     pub routes: Vec<Route>,
 }
+
+#[derive(Debug)]
+pub struct B2Auth {
+    /// API version in call paths, "v3" or "v4".
+    pub version: String,
+    /// A B2 token lives at most 24 h; the service locks this long after its unlock.
+    pub relock_after: Duration,
+    pub authorize_url: String,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum B2Route {
+    /// POST /<call>, for the listed calls, to the account's apiUrl.
+    Api(Vec<String>),
+    /// GET/HEAD /<bucket>/<file name>, to the account's downloadUrl.
+    Download,
+}
+
+/// Calls a B2 route can't allow: credproxy makes the authorize call itself, the others hand out credentials that
+/// work against B2 directly, or don't go to the apiUrl.
+const B2_REFUSED: [(&str, &str); 7] = [
+    ("b2_authorize_account", "credproxy authorizes itself"),
+    ("b2_get_upload_url", "its reply is a credential"),
+    ("b2_get_upload_part_url", "its reply is a credential"),
+    ("b2_get_download_authorization", "its reply is a credential"),
+    ("b2_upload_file", "not an apiUrl call"),
+    ("b2_upload_part", "not an apiUrl call"),
+    (
+        "b2_download_file_by_id",
+        "not an apiUrl call (use a download route)",
+    ),
+];
 
 #[derive(Debug)]
 pub struct Route {
@@ -177,6 +242,8 @@ pub struct Route {
     pub graphql_queries: Option<Vec<String>>,
     /// Some = S3 endpoint (SigV4 services only): only the listed operations, path-style.
     pub s3: Option<S3Route>,
+    /// Some = B2 endpoint (B2 services only); `upstream` is then empty.
+    pub b2: Option<B2Route>,
 }
 
 #[derive(Debug)]
@@ -277,7 +344,7 @@ pub fn valid_param(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
 }
 
-fn check_upstream(u: &str) -> Result<String, String> {
+pub(crate) fn check_upstream(u: &str) -> Result<String, String> {
     let u = u.trim_end_matches('/');
     let rest = if let Some(r) = u.strip_prefix("https://") {
         r
@@ -403,6 +470,50 @@ fn check_s3(r: RawS3) -> Result<S3Route, String> {
     })
 }
 
+fn check_b2(r: RawB2) -> Result<B2Auth, String> {
+    if r.version != "v3" && r.version != "v4" {
+        return Err(format!("auth.b2.version {:?}: \"v3\" or \"v4\"", r.version));
+    }
+    let relock_after = bounded(
+        &r.relock_after,
+        "auth.b2.relock_after",
+        Duration::from_secs(24 * 3600),
+    )?;
+    let authorize_url = match r.authorize_url {
+        Some(u) => check_upstream(&u)?,
+        None => format!(
+            "https://api.backblazeb2.com/b2api/{}/b2_authorize_account",
+            r.version
+        ),
+    };
+    Ok(B2Auth {
+        version: r.version,
+        relock_after,
+        authorize_url,
+    })
+}
+
+fn check_b2_route(r: RawB2Route) -> Result<B2Route, String> {
+    match (r.calls.is_empty(), r.download) {
+        (false, true) => return Err("b2: calls or download, not both".into()),
+        (true, false) => return Err("b2: no calls".into()),
+        (true, true) => return Ok(B2Route::Download),
+        (false, false) => {}
+    }
+    for c in &r.calls {
+        if let Some((_, why)) = B2_REFUSED.iter().find(|(n, _)| n == c) {
+            return Err(format!("b2 call {c:?} can't be allowed: {why}"));
+        }
+        let ok = c.strip_prefix("b2_").is_some_and(|n| {
+            !n.is_empty() && n.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
+        });
+        if !ok {
+            return Err(format!("bad b2 call {c:?}"));
+        }
+    }
+    Ok(B2Route::Api(r.calls))
+}
+
 fn check_listen(s: &str) -> Result<SocketAddr, String> {
     let a: SocketAddr = s
         .parse()
@@ -483,6 +594,13 @@ pub fn parse(text: &str) -> Result<Config, String> {
                 s.auth.header
             ));
         }
+        if s.auth.sigv4.is_some() && s.auth.b2.is_some() {
+            return Err(format!("service {name}: auth.sigv4 or auth.b2, not both"));
+        }
+        let b2 = match s.auth.b2 {
+            Some(b) => Some(check_b2(b).map_err(|e| format!("service {name}: {e}"))?),
+            None => None,
+        };
         if let Some(v) = &s.auth.sigv4
             && (v.service.is_empty()
                 || !v
@@ -504,8 +622,44 @@ pub fn parse(text: &str) -> Result<Config, String> {
             if routes.iter().any(|x: &Route| x.prefix == prefix) {
                 return Err(format!("service {name}: duplicate prefix {:?}", r.prefix));
             }
-            let upstream =
-                check_upstream(&r.upstream).map_err(|e| format!("service {name}: {e}"))?;
+            let b2_route = match (r.b2, b2.is_some()) {
+                (Some(x), true) => {
+                    if r.upstream.is_some()
+                        || !r.allow.is_empty()
+                        || r.graphql_queries.is_some()
+                        || r.s3.is_some()
+                    {
+                        return Err(format!(
+                            "service {name}: route {:?}: use b2 alone (the upstream comes from B2)",
+                            r.prefix
+                        ));
+                    }
+                    Some(
+                        check_b2_route(x)
+                            .map_err(|e| format!("service {name}: route {:?}: {e}", r.prefix))?,
+                    )
+                }
+                (None, false) => None,
+                (Some(_), false) => {
+                    return Err(format!(
+                        "service {name}: route {:?}: b2 routes need auth.b2",
+                        r.prefix
+                    ));
+                }
+                (None, true) => {
+                    return Err(format!(
+                        "service {name}: route {:?}: a b2 service has b2 routes only",
+                        r.prefix
+                    ));
+                }
+            };
+            let upstream = match (&r.upstream, &b2_route) {
+                (_, Some(_)) => String::new(),
+                (Some(u), None) => check_upstream(u).map_err(|e| format!("service {name}: {e}"))?,
+                (None, None) => {
+                    return Err(format!("service {name}: route {:?}: no upstream", r.prefix));
+                }
+            };
             let allow = r
                 .allow
                 .iter()
@@ -537,7 +691,8 @@ pub fn parse(text: &str) -> Result<Config, String> {
                     r.prefix
                 ));
             }
-            if allow.is_empty() && r.graphql_queries.is_none() && s3.is_none() {
+            if allow.is_empty() && r.graphql_queries.is_none() && s3.is_none() && b2_route.is_none()
+            {
                 return Err(format!(
                     "service {name}: route {:?} allows nothing",
                     r.prefix
@@ -555,6 +710,7 @@ pub fn parse(text: &str) -> Result<Config, String> {
                 allow,
                 graphql_queries: r.graphql_queries,
                 s3,
+                b2: b2_route,
             });
         }
         services.insert(
@@ -564,6 +720,7 @@ pub fn parse(text: &str) -> Result<Config, String> {
                 auth_header: s.auth.header,
                 auth_format: s.auth.format,
                 sigv4: s.auth.sigv4.map(|v| v.service),
+                b2,
                 routes,
             },
         );
@@ -885,5 +1042,107 @@ s3 = { region = "EU-RO-1", ops = ["GetObject", "PutObject"] }
             assert!(parse(&b).is_err(), "accepted:\n{b}");
         }
         assert!(parse(&RUNPOD.replace("https://api.runpod.io", "http://127.0.0.1:9")).is_ok());
+    }
+
+    const B2: &str = r#"
+[services.b2]
+secret = "backblaze/master"
+auth = { b2 = {} }
+[[services.b2.routes]]
+prefix = "/b2api/v3"
+b2 = { calls = ["b2_list_buckets", "b2_create_key"] }
+[[services.b2.routes]]
+prefix = "/file"
+b2 = { download = true }
+"#;
+
+    #[test]
+    fn b2_service() {
+        let c = parse(B2).unwrap();
+        let s = &c.services["b2"];
+        let b = s.b2.as_ref().unwrap();
+        assert_eq!(
+            (b.version.as_str(), b.relock_after, b.authorize_url.as_str()),
+            (
+                "v3",
+                Duration::from_secs(23 * 3600),
+                "https://api.backblazeb2.com/b2api/v3/b2_authorize_account"
+            )
+        );
+        assert_eq!(s.secret, PathBuf::from("backblaze/master.age"));
+        let (r, rest) = s.route("/b2api/v3/b2_list_buckets").unwrap();
+        assert_eq!(rest, "/b2_list_buckets");
+        assert_eq!(
+            r.b2,
+            Some(B2Route::Api(vec![
+                "b2_list_buckets".into(),
+                "b2_create_key".into()
+            ]))
+        );
+        assert_eq!(
+            s.route("/file/bkt/a/b").unwrap().0.b2,
+            Some(B2Route::Download)
+        );
+        let c = parse(&B2.replace(
+            "b2 = {}",
+            "b2 = { version = \"v4\", relock_after = \"2s\", authorize_url = \"http://127.0.0.1:9/auth\" }",
+        ))
+        .unwrap();
+        let b = c.services["b2"].b2.as_ref().unwrap();
+        assert_eq!(
+            (b.version.as_str(), b.relock_after, b.authorize_url.as_str()),
+            ("v4", Duration::from_secs(2), "http://127.0.0.1:9/auth")
+        );
+        let err = |from: &str, to: &str| parse(&B2.replace(from, to)).unwrap_err();
+        for refused in [
+            "b2_authorize_account",
+            "b2_get_upload_url",
+            "b2_get_upload_part_url",
+            "b2_get_download_authorization",
+            "b2_upload_file",
+            "b2_download_file_by_id",
+        ] {
+            assert!(
+                err("\"b2_create_key\"", &format!("\"{refused}\"")).contains("can't be allowed"),
+                "{refused}"
+            );
+        }
+        let bad = [
+            B2.replace("b2 = {}", "b2 = { relock_after = \"25h\" }"),
+            B2.replace("b2 = {}", "b2 = { version = \"v2\" }"),
+            B2.replace(
+                "b2 = {}",
+                "b2 = { authorize_url = \"http://evil.example/a\" }",
+            ),
+            B2.replace("b2 = {}", "b2 = {}, sigv4 = {}"),
+            B2.replace("auth = { b2 = {} }", ""),
+            B2.replace("\"b2_create_key\"", "\"B2_list\""),
+            B2.replace("\"b2_create_key\"", "\"b2_\""),
+            B2.replace("\"b2_create_key\"", "\"list_keys\""),
+            B2.replace(
+                "download = true",
+                "download = true, calls = [\"b2_list_keys\"]",
+            ),
+            B2.replace("download = true", "download = false"),
+            B2.replace(
+                "download = true }",
+                "download = true }\nupstream = \"https://x\"",
+            ),
+            B2.replace(
+                "download = true }",
+                "download = true }\nallow = [\"GET /x\"]",
+            ),
+            B2.replace(
+                "b2 = { download = true }",
+                "upstream = \"https://x\"\nallow = [\"GET /x\"]",
+            ),
+            format!(
+                "{RUNPOD}[[services.runpod.routes]]\nprefix = \"/f\"\nb2 = {{ download = true }}\n"
+            ),
+            RUNPOD.replace("upstream = \"https://api.runpod.io/v2\"\n", ""),
+        ];
+        for b in bad {
+            assert!(parse(&b).is_err(), "accepted:\n{b}");
+        }
     }
 }
