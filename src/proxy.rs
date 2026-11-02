@@ -432,6 +432,8 @@ async fn forward_s3(
         .get("content-length")
         .map(|v| v.to_str().ok().and_then(|s| s.parse::<u64>().ok()))
     {
+        // neither Content-Length nor chunked: HTTP/1.1 says the body is empty
+        None if !parts.headers.contains_key("transfer-encoding") => Some(0),
         None => None,
         Some(Some(n)) => Some(n),
         Some(None) => return reply(StatusCode::BAD_REQUEST, "bad content-length"),

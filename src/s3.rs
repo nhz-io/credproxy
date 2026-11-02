@@ -273,6 +273,31 @@ pub fn sign_headers(
     access_key: &str,
     secret: &str,
 ) -> Result<Vec<(String, String)>, String> {
+    sign_at(
+        SystemTime::now(),
+        method,
+        url,
+        headers,
+        payload,
+        region,
+        service,
+        access_key,
+        secret,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sign_at(
+    time: SystemTime,
+    method: &str,
+    url: &str,
+    headers: &[(&str, &str)],
+    payload: &str,
+    region: &str,
+    service: &str,
+    access_key: &str,
+    secret: &str,
+) -> Result<Vec<(String, String)>, String> {
     let identity: Identity = Credentials::new(access_key, secret, None, None, "credproxy").into();
     let mut settings = SigningSettings::default();
     // The path is already canonical (see classify); S3 signs it as sent, without normalising.
@@ -283,7 +308,7 @@ pub fn sign_headers(
         .identity(&identity)
         .region(region)
         .name(service)
-        .time(SystemTime::now())
+        .time(time)
         .settings(settings)
         .build()
         .map_err(|e| e.to_string())?
@@ -446,49 +471,130 @@ mod tests {
         assert!(client_hash(&"g".repeat(64)).is_none());
     }
 
-    /// AWS's published example (S3 SigV4 docs, "GET Object" with a Range header).
-    #[test]
-    fn signs_like_aws() {
-        let identity: Identity = Credentials::new(
+    /// The signature `sign_at` (our settings) makes for one of AWS's published S3 examples
+    /// (docs.aws.amazon.com/AmazonS3/latest/API/sig-v4-header-based-auth.html: 2013-05-24, us-east-1).
+    fn aws_example(method: &str, url: &str, headers: &[(&str, &str)], body: &[u8]) -> String {
+        let h = sign_at(
+            SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1369353600),
+            method,
+            url,
+            headers,
+            &sha256_hex(body),
+            "us-east-1",
+            "s3",
             "AKIAIOSFODNN7EXAMPLE",
             "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
-            None,
-            None,
-            "test",
-        )
-        .into();
-        let mut settings = SigningSettings::default();
-        settings.percent_encoding_mode = PercentEncodingMode::Single;
-        settings.uri_path_normalization_mode = UriPathNormalizationMode::Disabled;
-        settings.payload_checksum_kind = PayloadChecksumKind::XAmzSha256;
-        let params = v4::SigningParams::builder()
-            .identity(&identity)
-            .region("us-east-1")
-            .name("s3")
-            .time(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1369353600))
-            .settings(settings)
-            .build()
-            .unwrap()
-            .into();
-        let req = SignableRequest::new(
-            "GET",
-            "https://examplebucket.s3.amazonaws.com/test.txt",
-            [("range", "bytes=0-9")].into_iter(),
-            SignableBody::Precomputed(sha256_hex(b"")),
         )
         .unwrap();
-        let (ins, _) = sign(req, &params).unwrap().into_parts();
-        let auth = ins
-            .headers()
+        let auth = &h
+            .iter()
             .find(|(n, _)| n.eq_ignore_ascii_case("authorization"))
             .unwrap()
-            .1
-            .to_string();
-        assert!(
-            auth.ends_with(
-                "Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41"
+            .1;
+        auth.rsplit_once("Signature=").unwrap().1.to_string()
+    }
+
+    #[test]
+    fn signs_like_aws_get_object() {
+        assert_eq!(
+            aws_example(
+                "GET",
+                "https://examplebucket.s3.amazonaws.com/test.txt",
+                &[("range", "bytes=0-9")],
+                b""
             ),
-            "{auth}"
+            "f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41"
         );
+    }
+
+    #[test]
+    fn signs_like_aws_put_object() {
+        // encoded key ($) and a body hash
+        assert_eq!(
+            aws_example(
+                "PUT",
+                "https://examplebucket.s3.amazonaws.com/test%24file.text",
+                &[
+                    ("date", "Fri, 24 May 2013 00:00:00 GMT"),
+                    ("x-amz-storage-class", "REDUCED_REDUNDANCY")
+                ],
+                b"Welcome to Amazon S3."
+            ),
+            "98ad721746da40c64f1a55b78f14c238d841ea1380cd77a1b5971af0ece108bd"
+        );
+    }
+
+    #[test]
+    fn signs_like_aws_queries() {
+        // a valueless sub-resource, and parameters that must be sorted
+        assert_eq!(
+            aws_example(
+                "GET",
+                "https://examplebucket.s3.amazonaws.com/?lifecycle",
+                &[],
+                b""
+            ),
+            "fea454ca298b7da1c68078a5d1bdbfbbe0d65c699e0f91ac7a200a0136783543"
+        );
+        assert_eq!(
+            aws_example(
+                "GET",
+                "https://examplebucket.s3.amazonaws.com/?max-keys=2&prefix=J",
+                &[],
+                b""
+            ),
+            "34b48302e7b5fa45bde8084f4b7868a86f0a534bc59db6670ed5711ef69dc6f7"
+        );
+    }
+
+    /// A random key, percent-encoded the way a client might (every non-unreserved byte), then classified, must come
+    /// out as a canonical path that decodes to the same key; classifying that path again changes nothing.
+    #[test]
+    fn keys_round_trip() {
+        const CHARS: &[char] = &[
+            'a', 'Z', '0', '9', '-', '.', '_', '~', ' ', '!', '$', '&', '\'', '(', ')', '*', '+',
+            ',', ';', '=', ':', '@', '%', '#', '?', '[', ']', '"', '<', '>', '\\', '^', '`', '{',
+            '|', '}', 'é', 'ß', 'ж', '中', '😀', '/',
+        ];
+        let mut rnd = [0u8; 4096];
+        getrandom::fill(&mut rnd).unwrap();
+        let mut r = rnd.iter().copied().cycle();
+        let mut checked = 0;
+        for _ in 0..500 {
+            let len = 1 + (r.next().unwrap() as usize % 40);
+            let key: String = (0..len)
+                .map(|_| CHARS[r.next().unwrap() as usize % CHARS.len()])
+                .collect();
+            if !valid_key(&key) {
+                continue;
+            }
+            let client: String = key
+                .split('/')
+                .map(|s| {
+                    s.bytes()
+                        .map(|b| {
+                            if b.is_ascii_alphanumeric() {
+                                (b as char).to_string()
+                            } else {
+                                format!("%{b:02x}")
+                            }
+                        })
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("/");
+            let t = classify("PUT", &format!("/vol/{client}"), None, &[])
+                .unwrap_or_else(|e| panic!("{key:?}: {e}"));
+            let back = decode(t.path.strip_prefix("/vol/").unwrap()).unwrap();
+            assert_eq!(back, key);
+            assert!(
+                t.path
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-._~/%".contains(&b))
+            );
+            assert_eq!(classify("PUT", &t.path, None, &[]).unwrap().path, t.path);
+            checked += 1;
+        }
+        assert!(checked > 300, "only {checked} valid keys generated");
     }
 }

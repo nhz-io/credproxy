@@ -99,20 +99,98 @@ async fn s3_server(root: PathBuf, secret: String) -> u16 {
     port
 }
 
-/// Records the head of each request it gets in `file`, answers 200 with an empty body.
-async fn raw_server(file: PathBuf) -> u16 {
+fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+/// A scripted upstream (no signature check). Every request is recorded in `<dir>/raw-<last path segment>.txt`:
+/// its head, then how many body bytes arrived out of Content-Length and their SHA-256. The last path segment picks
+/// the reply: `truncate-cl` (says 1000 bytes, sends 500, closes), `truncate-chunked` (one chunk, then closes
+/// without the final one), `chunked-ok`, `stall` (10 of 1000 bytes, then nothing for 90 s), `error-echo` (403
+/// quoting the access key id), anything else 200 with no body.
+async fn raw_server(dir: PathBuf) -> u16 {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = l.local_addr().unwrap().port();
     tokio::spawn(async move {
         loop {
             let (mut c, _) = l.accept().await.unwrap();
-            let mut buf = vec![0u8; 16384];
-            let n = c.read(&mut buf).await.unwrap_or(0);
-            std::fs::write(&file, &buf[..n]).unwrap();
-            let _ = c
-                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
-                .await;
+            let dir = dir.clone();
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut tmp = vec![0u8; 1 << 16];
+                let end = loop {
+                    let n = c.read(&mut tmp).await.unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                    if let Some(i) = find(&buf, b"\r\n\r\n") {
+                        break i + 4;
+                    }
+                };
+                let head = String::from_utf8_lossy(&buf[..end]).into_owned();
+                let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
+                let name = path
+                    .split('?')
+                    .next()
+                    .unwrap()
+                    .rsplit('/')
+                    .next()
+                    .unwrap()
+                    .to_string();
+                let cl: usize = head
+                    .lines()
+                    .find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.eq_ignore_ascii_case("content-length")
+                            .then(|| v.trim().parse().ok())?
+                    })
+                    .unwrap_or(0);
+                let mut body = buf[end..].to_vec();
+                while body.len() < cl {
+                    let n = c.read(&mut tmp).await.unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    body.extend_from_slice(&tmp[..n]);
+                }
+                std::fs::write(
+                    dir.join(format!("raw-{name}.txt")),
+                    format!(
+                        "{head}--- body {} of {cl} sha256 {}\n",
+                        body.len(),
+                        hex_sha256(&body)
+                    ),
+                )
+                .unwrap();
+                let mut out: Vec<u8> = match name.as_str() {
+                    "truncate-cl" => {
+                        let mut v = b"HTTP/1.1 200 OK\r\ncontent-length: 1000\r\n\r\n".to_vec();
+                        v.extend_from_slice(&[7u8; 500]);
+                        v
+                    }
+                    "truncate-chunked" => {
+                        let mut v = b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n1f4\r\n".to_vec();
+                        v.extend_from_slice(&[7u8; 500]);
+                        v.extend_from_slice(b"\r\n");
+                        v
+                    }
+                    "chunked-ok" => b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n".to_vec(),
+                    "stall" => {
+                        let _ = c.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 1000\r\n\r\n0123456789").await;
+                        tokio::time::sleep(Duration::from_secs(90)).await;
+                        return;
+                    }
+                    "error-echo" => format!(
+                        "HTTP/1.1 403 Forbidden\r\ncontent-type: application/xml\r\nconnection: close\r\n\r\n<Error><Code>SignatureDoesNotMatch</Code><AWSAccessKeyId>{ACCESS_KEY}</AWSAccessKeyId></Error>"
+                    )
+                    .into_bytes(),
+                    _ => b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_vec(),
+                };
+                let _ = c.write_all(&out).await;
+                out.clear();
+            });
         }
     });
     port
@@ -130,7 +208,7 @@ async fn setup() -> Env {
     std::fs::create_dir_all(d.join("store/vol1")).unwrap();
     let s3 = s3_server(d.join("store"), secret.clone()).await;
     let listen = free_port();
-    let raw = raw_server(d.join("raw-request.txt")).await;
+    let raw = raw_server(d.to_path_buf()).await;
 
     sh(Command::new("age-keygen").arg("-o").arg(d.join("id.txt")));
     let public =
@@ -175,7 +253,7 @@ s3 = {{ region = "dc-1", ops = ["GetObject", "ListObjectsV2"], key_prefixes = ["
 [[services.store.routes]]
 prefix = "/raw"
 upstream = "http://127.0.0.1:{raw}"
-s3 = {{ region = "dc-1", ops = ["CreateMultipartUpload"] }}
+s3 = {{ region = "dc-1", ops = ["GetObject", "HeadObject", "PutObject", "CreateMultipartUpload", "UploadPart"] }}
 
 [services.wrong]
 secret = "s3/wrong"
@@ -493,7 +571,7 @@ async fn bodiless_post_says_content_length_zero() {
     )
     .await;
     assert_eq!(r.status, 200, "{}", r.text());
-    let head = std::fs::read_to_string(env.dir.path().join("raw-request.txt")).unwrap();
+    let head = std::fs::read_to_string(env.dir.path().join("raw-k.txt")).unwrap();
     let head = head.to_ascii_lowercase();
     assert!(head.starts_with("post /vol1/k?uploads= http/1.1"), "{head}");
     assert!(head.contains("\r\ncontent-length: 0\r\n"), "{head}");
@@ -676,4 +754,501 @@ async fn big_transfer_memory() {
         up.as_secs_f64(),
         down.as_secs_f64()
     );
+}
+
+// ---- Data integrity: what goes in comes out byte for byte, and failures are errors, never short files. ----
+
+fn random_bytes(n: usize) -> Vec<u8> {
+    let mut v = vec![0u8; n];
+    getrandom::fill(&mut v).unwrap();
+    v
+}
+
+fn on_disk(env: &Env, rel: &str) -> Vec<u8> {
+    std::fs::read(env.dir.path().join("store").join(rel)).unwrap()
+}
+
+/// The raw upstream's record of its last request named `name`, waiting up to 5 s for it.
+async fn raw_record(env: &Env, name: &str) -> String {
+    let f = env.dir.path().join(format!("raw-{name}.txt"));
+    for _ in 0..100 {
+        if let Ok(s) = std::fs::read_to_string(&f) {
+            return s;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("upstream never saw {name}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn every_size_and_byte_value_survives() {
+    let env = setup().await;
+    let mib = 1usize << 20;
+    for (i, n) in [0, 1, 255, mib - 1, mib, mib + 1, 3 * mib + 7]
+        .into_iter()
+        .enumerate()
+    {
+        let body = random_bytes(n);
+        let sum = hex_sha256(&body);
+        // with the client's hash (streamed), and without (hashed here) where that's allowed
+        for hashed in [true, false] {
+            if !hashed && n > mib {
+                continue;
+            }
+            let key = format!("sizes/{i}-{hashed}.bin");
+            let r = call(
+                &env,
+                "PUT",
+                &format!("/store/dc-1/vol1/{key}"),
+                body.clone(),
+                hashed,
+                &[],
+            )
+            .await;
+            assert_eq!(r.status, 200, "PUT {n} hashed={hashed}: {}", r.text());
+            assert_eq!(
+                hex_sha256(&on_disk(&env, &format!("vol1/{key}"))),
+                sum,
+                "stored {n}"
+            );
+            let r = call(
+                &env,
+                "GET",
+                &format!("/store/dc-1/vol1/{key}"),
+                vec![],
+                false,
+                &[],
+            )
+            .await;
+            assert_eq!((r.status, r.body.len()), (200, n));
+            assert_eq!(hex_sha256(&r.body), sum, "GET {n} hashed={hashed}");
+            let r = call(
+                &env,
+                "HEAD",
+                &format!("/store/dc-1/vol1/{key}"),
+                vec![],
+                false,
+                &[],
+            )
+            .await;
+            assert_eq!(r.headers["content-length"], n.to_string().as_str());
+        }
+    }
+    // an overwrite replaces the whole object, no old tail left behind
+    let p = "/store/dc-1/vol1/over.bin";
+    call(&env, "PUT", p, random_bytes(3 * mib), true, &[]).await;
+    let r = call(&env, "PUT", p, b"short".to_vec(), true, &[]).await;
+    assert_eq!(r.status, 200);
+    assert_eq!(
+        call(&env, "GET", p, vec![], false, &[]).await.body,
+        b"short"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn parallel_multipart_is_byte_exact() {
+    let env = std::sync::Arc::new(setup().await);
+    let p = "/store/dc-1/vol1/ckpt/step-1000/model.safetensors";
+    let r = call(&env, "POST", &format!("{p}?uploads"), vec![], false, &[]).await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    let id = url_encode(between(&r.text(), "<UploadId>", "</UploadId>"));
+    let parts: Vec<Vec<u8>> = (0..6)
+        .map(|i| random_bytes((5 << 20) + i * 1234 + 1))
+        .collect();
+
+    // a part sent with the wrong hash is refused by the server; its retry succeeds
+    let r = reqwest::Client::new()
+        .put(format!("{}{p}?partNumber=3&uploadId={id}", env.base))
+        .header("authorization", format!("Bearer {}", env.token("store")))
+        .header("x-amz-content-sha256", hex_sha256(b"not this"))
+        .body(parts[2].clone())
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_client_error(), "{}", r.status());
+
+    let mut set = tokio::task::JoinSet::new();
+    for (i, part) in parts.iter().enumerate() {
+        let (env, part, id) = (env.clone(), part.clone(), id.clone());
+        set.spawn(async move {
+            let n = i + 1;
+            let r = call(
+                &env,
+                "PUT",
+                &format!("{p}?partNumber={n}&uploadId={id}"),
+                part,
+                true,
+                &[],
+            )
+            .await;
+            assert_eq!(r.status, 200, "part {n}: {}", r.text());
+            (n, r.headers["etag"].to_str().unwrap().to_string())
+        });
+    }
+    let mut etags = set.join_all().await;
+    etags.sort();
+    let xml: String = etags
+        .iter()
+        .map(|(n, e)| format!("<Part><PartNumber>{n}</PartNumber><ETag>{e}</ETag></Part>"))
+        .collect();
+    let r = call(
+        &env,
+        "POST",
+        &format!("{p}?uploadId={id}"),
+        format!("<CompleteMultipartUpload>{xml}</CompleteMultipartUpload>").into_bytes(),
+        false,
+        &[],
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", r.text());
+
+    let whole = parts.concat();
+    let r = call(&env, "GET", p, vec![], false, &[]).await;
+    assert_eq!(r.body.len(), whole.len());
+    assert_eq!(
+        hex_sha256(&r.body),
+        hex_sha256(&whole),
+        "assembled object differs"
+    );
+    // ranges across every part boundary
+    let mut at = 0;
+    for part in &parts[..parts.len() - 1] {
+        at += part.len();
+        let (a, b) = (at - 3, at + 2);
+        let r = call(
+            &env,
+            "GET",
+            p,
+            vec![],
+            false,
+            &[("range", &format!("bytes={a}-{b}"))],
+        )
+        .await;
+        assert_eq!((r.status, r.body.as_slice()), (206, &whole[a..=b]));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn upstream_gets_exactly_the_client_bytes() {
+    let env = setup().await;
+    let body = random_bytes((2 << 20) + 3);
+    let sum = hex_sha256(&body);
+    let r = call(&env, "PUT", "/store/raw/vol1/rec1", body.clone(), true, &[]).await;
+    assert_eq!(r.status, 200);
+    let rec = raw_record(&env, "rec1").await;
+    let lower = rec.to_ascii_lowercase();
+    assert!(
+        rec.contains(&format!(
+            "--- body {} of {} sha256 {sum}",
+            body.len(),
+            body.len()
+        )),
+        "{rec}"
+    );
+    assert!(
+        lower.contains(&format!("x-amz-content-sha256: {sum}")),
+        "{rec}"
+    );
+    assert!(!lower.contains("bearer") && !rec.contains(&env.secret));
+    // small body, no client hash: the proxy's hash is the body's
+    let r = call(
+        &env,
+        "PUT",
+        "/store/raw/vol1/rec2",
+        b"small body".to_vec(),
+        false,
+        &[],
+    )
+    .await;
+    assert_eq!(r.status, 200);
+    let rec = raw_record(&env, "rec2").await.to_ascii_lowercase();
+    let sum = hex_sha256(b"small body");
+    assert!(
+        rec.contains(&format!("x-amz-content-sha256: {sum}")),
+        "{rec}"
+    );
+    assert!(
+        rec.contains(&format!("--- body 10 of 10 sha256 {sum}")),
+        "{rec}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn truncated_downloads_fail_loudly() {
+    let env = setup().await;
+    for name in ["truncate-cl", "truncate-chunked"] {
+        let res = reqwest::Client::new()
+            .get(format!("{}/store/raw/vol1/{name}", env.base))
+            .header("authorization", format!("Bearer {}", env.token("store")))
+            .send()
+            .await;
+        // either the reply fails outright or its body does; never a short body that looks complete
+        if let Ok(r) = res {
+            assert!(
+                r.bytes().await.is_err(),
+                "{name}: a short body arrived as if complete"
+            );
+        }
+    }
+    let r = call(
+        &env,
+        "GET",
+        "/store/raw/vol1/chunked-ok",
+        vec![],
+        false,
+        &[],
+    )
+    .await;
+    assert_eq!((r.status, r.body.as_slice()), (200, &b"hello world"[..]));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let log = env.log();
+    assert!(
+        log.contains("/raw/vol1/truncate-cl reply broke off"),
+        "{log}"
+    );
+    assert!(
+        log.contains("/raw/vol1/truncate-chunked reply broke off"),
+        "{log}"
+    );
+
+    let r = call(
+        &env,
+        "GET",
+        "/store/raw/vol1/error-echo",
+        vec![],
+        false,
+        &[],
+    )
+    .await;
+    assert_eq!(r.status, 403);
+    assert!(
+        r.text().contains("[REDACTED]") && !r.text().contains(ACCESS_KEY),
+        "{}",
+        r.text()
+    );
+}
+
+/// Sends `head` then `body` straight to the proxy; `close_after` bytes of body, then hangs up if given.
+async fn raw_client(env: &Env, head: String, body: &[u8], close_after: Option<usize>) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let addr = env.base.strip_prefix("http://").unwrap();
+    let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
+    c.write_all(head.as_bytes()).await.unwrap();
+    let n = close_after.unwrap_or(body.len());
+    let _ = c.write_all(&body[..n]).await;
+    if close_after.is_some() {
+        return String::new();
+    }
+    let mut out = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(10), c.read_to_end(&mut out)).await;
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn put_head(env: &Env, path: &str, len: usize, sum: &str, extra: &str) -> String {
+    format!(
+        "PUT {path} HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nContent-Length: {len}\r\nx-amz-content-sha256: {sum}\r\n{extra}\r\n",
+        env.base.strip_prefix("http://").unwrap(),
+        env.token("store")
+    )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn client_that_hangs_up_mid_upload_never_completes_one() {
+    let env = setup().await;
+    let body = random_bytes(4 << 20);
+    let sum = hex_sha256(&body);
+    // upstream sees a short body and a closed connection, not a complete request
+    raw_client(
+        &env,
+        put_head(&env, "/store/raw/vol1/abort1", body.len(), &sum, ""),
+        &body,
+        Some(1 << 20),
+    )
+    .await;
+    let rec = raw_record(&env, "abort1").await;
+    let got: usize = between(&rec, "--- body ", " of").parse().unwrap();
+    assert!(got < body.len(), "upstream got the whole body: {rec}");
+
+    // against a real S3 server: an existing object is left as it was
+    let p = "/store/dc-1/vol1/abort.bin";
+    call(&env, "PUT", p, b"keep".to_vec(), true, &[]).await;
+    raw_client(
+        &env,
+        put_head(&env, p, body.len(), &sum, ""),
+        &body,
+        Some(1 << 20),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let r = call(&env, "GET", p, vec![], false, &[]).await;
+    assert_eq!((r.status, r.body.as_slice()), (200, &b"keep"[..]));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn expect_100_continue_uploads() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    // what the AWS CLI and boto3 send for uploads
+    let env = setup().await;
+    let body = random_bytes((1 << 20) + 5);
+    let sum = hex_sha256(&body);
+    let head = put_head(
+        &env,
+        "/store/dc-1/vol1/expect.bin",
+        body.len(),
+        &sum,
+        "Expect: 100-continue\r\n",
+    );
+    let mut c = tokio::net::TcpStream::connect(env.base.strip_prefix("http://").unwrap())
+        .await
+        .unwrap();
+    c.write_all(head.as_bytes()).await.unwrap();
+    let mut buf = vec![0u8; 256];
+    let n = tokio::time::timeout(Duration::from_secs(10), c.read(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 100 Continue"));
+    c.write_all(&body).await.unwrap();
+    let mut out = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), c.read_to_end(&mut out))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&out).starts_with("HTTP/1.1 200"),
+        "{}",
+        String::from_utf8_lossy(&out)
+    );
+    assert_eq!(hex_sha256(&on_disk(&env, "vol1/expect.bin")), sum);
+}
+
+fn xml_unescape(s: &str) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&#39;", "'")
+        .replace("&amp;", "&")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn odd_keys_round_trip_and_list_completely() {
+    let env = setup().await;
+    const CHARS: &[char] = &[
+        'a', 'Z', '0', '-', '.', '_', '~', ' ', '!', '$', '&', '\'', '(', ')', '*', '+', ',', ';',
+        '=', ':', '@', '%', '#', '?', '[', ']', '"', '^', '`', '{', '}', '|', 'é', 'ж', '中', '😀',
+    ];
+    let mut rnd = random_bytes(8192).into_iter().cycle();
+    let mut keys = std::collections::BTreeSet::new();
+    while keys.len() < 60 {
+        let dir = if rnd.next().unwrap().is_multiple_of(2) {
+            "odd/"
+        } else {
+            "odd/sub dir/"
+        };
+        let len = 1 + rnd.next().unwrap() as usize % 20;
+        let name: String = (0..len)
+            .map(|_| CHARS[rnd.next().unwrap() as usize % CHARS.len()])
+            .collect();
+        if name == "." || name == ".." {
+            continue;
+        }
+        keys.insert(format!("{dir}{name}"));
+    }
+    for k in &keys {
+        let enc = k.split('/').map(url_encode).collect::<Vec<_>>().join("/");
+        let r = call(
+            &env,
+            "PUT",
+            &format!("/store/dc-1/vol1/{enc}"),
+            k.as_bytes().to_vec(),
+            true,
+            &[],
+        )
+        .await;
+        assert_eq!(r.status, 200, "PUT {k:?}: {}", r.text());
+        let r = call(
+            &env,
+            "GET",
+            &format!("/store/dc-1/vol1/{enc}"),
+            vec![],
+            false,
+            &[],
+        )
+        .await;
+        assert_eq!(
+            (r.status, r.body.as_slice()),
+            (200, k.as_bytes()),
+            "GET {k:?}"
+        );
+    }
+    // paginated listing finds every key exactly once
+    let mut seen = Vec::new();
+    let mut token: Option<String> = None;
+    for _ in 0..100 {
+        let mut q = "list-type=2&prefix=odd%2F&max-keys=7".to_string();
+        if let Some(t) = &token {
+            q.push_str(&format!("&continuation-token={}", url_encode(t)));
+        }
+        let r = call(
+            &env,
+            "GET",
+            &format!("/store/dc-1/vol1?{q}"),
+            vec![],
+            false,
+            &[],
+        )
+        .await;
+        assert_eq!(r.status, 200, "{}", r.text());
+        let t = r.text();
+        for chunk in t.split("<Key>").skip(1) {
+            seen.push(xml_unescape(chunk.split("</Key>").next().unwrap()));
+        }
+        if t.contains("<IsTruncated>true</IsTruncated>") {
+            token = Some(xml_unescape(between(
+                &t,
+                "<NextContinuationToken>",
+                "</NextContinuationToken>",
+            )));
+        } else {
+            break;
+        }
+    }
+    let unique: std::collections::BTreeSet<String> = seen.iter().cloned().collect();
+    assert_eq!(unique.len(), seen.len(), "a key was listed twice");
+    assert_eq!(unique, keys);
+}
+
+/// 60 s+: an upstream that stops sending mid-body is cut off and the client sees an error.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn stalled_download_is_cut_off() {
+    let env = setup().await;
+    let t = std::time::Instant::now();
+    let r = reqwest::Client::new()
+        .get(format!("{}/store/raw/vol1/stall", env.base))
+        .header("authorization", format!("Bearer {}", env.token("store")))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        r.bytes().await.is_err(),
+        "a stalled body arrived as if complete"
+    );
+    let waited = t.elapsed().as_secs();
+    assert!((59..80).contains(&waited), "cut off after {waited}s");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn chunked_upload_without_length_is_refused() {
+    let env = setup().await;
+    let sum = hex_sha256(b"hello");
+    let head = format!(
+        "PUT /store/dc-1/vol1/chunked.bin HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nTransfer-Encoding: chunked\r\nx-amz-content-sha256: {sum}\r\n\r\n",
+        env.base.strip_prefix("http://").unwrap(),
+        env.token("store")
+    );
+    let out = raw_client(&env, head, b"5\r\nhello\r\n0\r\n\r\n", None).await;
+    assert!(out.starts_with("HTTP/1.1 411"), "{out}");
+    assert!(!env.dir.path().join("store/vol1/chunked.bin").exists());
 }

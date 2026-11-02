@@ -93,8 +93,13 @@ cargo install --locked --path .
 
 The tests need `age` and `age-keygen`; they use a throwaway identity, a fake key and a free port, and never touch
 launchd. The S3 tests run an S3 server in process ([s3s-fs](https://crates.io/crates/s3s-fs)) that checks every
-signature and body hash. `cargo test --release --test s3 -- --ignored --nocapture` moves 600 MB up and down and
-prints the daemon's memory (7 MiB idle, 12 MiB peak on an M-series Mac).
+signature and body hash, plus a scripted upstream for faults. They check that bytes arrive exactly (every size
+around the 1 MiB and part boundaries, random data, parallel multipart parts, ranges across part boundaries, what the
+upstream itself receives), that failures are errors and never short files (truncated or stalled downloads, a client
+hanging up mid-upload), Expect: 100-continue, and 60 random keys with awkward characters through PUT, GET and a
+paginated listing. Signing is also checked against AWS's published examples. `cargo test --release --test s3 -- --ignored --nocapture` also runs the slow ones: 600 MB up and
+down with the daemon's memory printed (7 MiB idle, 11–12 MiB peak on an M-series Mac), and a stalled download
+cut off after 60 s.
 
 ## Config
 
