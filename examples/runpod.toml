@@ -3,7 +3,8 @@
 idle_lock = "12h"
 listen = "127.0.0.1:7777"
 
-# RunPod, for a rented-GPU launcher: create, inspect and delete pods, GPU prices, billing. Nothing else.
+# RunPod, for a rented-GPU launcher: create, inspect and delete pods and network volumes, GPU prices, billing.
+# Nothing else. (CPU pods use the same POST /pods, with computeType "CPU".)
 # Clients call http://127.0.0.1:7777/runpod/v1/... and http://127.0.0.1:7777/runpod/graphql
 # with "Authorization: Bearer $(credproxy token runpod)".
 [services.runpod]
@@ -12,9 +13,31 @@ secret = "runpod/api-key"
 [[services.runpod.routes]]
 prefix = "/v1"
 upstream = "https://rest.runpod.io/v1"
-allow = ["GET /pods", "POST /pods", "GET /pods/{id}", "DELETE /pods/{id}", "GET /billing/pods"]
+allow = [
+  "GET /pods", "POST /pods", "GET /pods/{id}", "DELETE /pods/{id}", "GET /billing/pods",
+  "GET /networkvolumes", "POST /networkvolumes", "GET /networkvolumes/{id}", "DELETE /networkvolumes/{id}",
+]
 
 [[services.runpod.routes]]
 prefix = "/graphql"
 upstream = "https://api.runpod.io/graphql"
 graphql_queries = ["gpuTypes"]
+
+# RunPod network volumes over their S3 API: move files in and out without a pod. The secret stays in credproxy,
+# which signs each call (SigV4). Seal two lines, access key id (user_...) then secret (rps_...), as
+# ~/.secrets/runpod/s3-key.age. Bucket = volume id. Clients call
+# http://127.0.0.1:7777/runpod-s3/<datacenter, lower case>/<volume id>/<key> with the runpod-s3 token.
+# One route per datacenter with the S3 API (docs.runpod.io/storage/s3-api); list only the ones you use.
+[services.runpod-s3]
+secret = "runpod/s3-key"
+auth = { sigv4 = { service = "s3" } }
+
+[[services.runpod-s3.routes]]
+prefix = "/eu-ro-1"
+upstream = "https://s3api-eu-ro-1.runpod.io"
+s3 = { region = "EU-RO-1", ops = ["GetObject", "HeadObject", "PutObject", "DeleteObject", "ListObjectsV2", "CreateMultipartUpload", "UploadPart", "CompleteMultipartUpload", "AbortMultipartUpload"] }
+
+[[services.runpod-s3.routes]]
+prefix = "/us-ks-2"
+upstream = "https://s3api-us-ks-2.runpod.io"
+s3 = { region = "US-KS-2", ops = ["GetObject", "HeadObject", "PutObject", "DeleteObject", "ListObjectsV2", "CreateMultipartUpload", "UploadPart", "CompleteMultipartUpload", "AbortMultipartUpload"] }

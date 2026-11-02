@@ -75,8 +75,9 @@ fn kill_group(pgid: libc::pid_t) {
     unsafe { libc::kill(-pgid, libc::SIGKILL) };
 }
 
-/// age output → key: one line of visible ASCII (anything else could split a header).
-fn to_key(raw: &[u8]) -> Result<Zeroizing<String>, String> {
+/// age output → key: `lines` lines (1, or 2 for SigV4: access key id, secret) of visible ASCII each (anything
+/// else could split a header). Stored joined by `\n`.
+fn to_key(raw: &[u8], lines: usize) -> Result<Zeroizing<String>, String> {
     let mut end = raw.len();
     while end > 0 && matches!(raw[end - 1], b'\n' | b'\r') {
         end -= 1;
@@ -85,12 +86,30 @@ fn to_key(raw: &[u8]) -> Result<Zeroizing<String>, String> {
     if k.is_empty() {
         return Err("decrypted secret is empty".into());
     }
-    if !k.iter().all(|b| (0x21..=0x7e).contains(b)) {
-        return Err("decrypted secret is not a single line of printable ASCII".into());
+    let parts: Vec<&[u8]> = k
+        .split(|b| *b == b'\n')
+        .map(|l| l.strip_suffix(b"\r").unwrap_or(l))
+        .collect();
+    let what = if lines == 1 {
+        "a single line of printable ASCII"
+    } else {
+        "two lines of printable ASCII (access key id, secret)"
+    };
+    if parts.len() != lines
+        || parts
+            .iter()
+            .any(|l| l.is_empty() || !l.iter().all(|b| (0x21..=0x7e).contains(b)))
+    {
+        return Err(format!("decrypted secret is not {what}"));
     }
-    Ok(Zeroizing::new(
-        String::from_utf8(k.to_vec()).expect("ascii"),
-    ))
+    let mut out = Zeroizing::new(String::with_capacity(k.len()));
+    for (i, l) in parts.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        out.push_str(std::str::from_utf8(l).expect("ascii"));
+    }
+    Ok(out)
 }
 
 impl Vault {
@@ -292,7 +311,12 @@ impl Vault {
                 .trim();
             return Err(format!("could not decrypt {}: {last}", file.display()));
         }
-        to_key(&out)
+        let lines = if self.cfg.services[service].sigv4.is_some() {
+            2
+        } else {
+            1
+        };
+        to_key(&out, lines)
     }
 
     /// Lock one service, or all of them: forget the key (zeroed on drop) and abort a pending unlock (kills age
@@ -391,11 +415,24 @@ mod tests {
 
     #[test]
     fn key_parsing() {
-        assert_eq!(to_key(b"rpa_ABC123\n").unwrap().as_str(), "rpa_ABC123");
-        assert_eq!(to_key(b"abc\r\n").unwrap().as_str(), "abc");
-        assert!(to_key(b"\n").is_err());
-        assert!(to_key(b"a b").is_err());
-        assert!(to_key(b"abc\nX-Evil: 1").is_err());
-        assert!(to_key("ключ".as_bytes()).is_err());
+        assert_eq!(to_key(b"rpa_ABC123\n", 1).unwrap().as_str(), "rpa_ABC123");
+        assert_eq!(to_key(b"abc\r\n", 1).unwrap().as_str(), "abc");
+        assert!(to_key(b"\n", 1).is_err());
+        assert!(to_key(b"a b", 1).is_err());
+        assert!(to_key(b"abc\nX-Evil: 1", 1).is_err());
+        assert!(to_key(b"abc\ndef", 1).is_err());
+        assert!(to_key("ключ".as_bytes(), 1).is_err());
+        assert_eq!(
+            to_key(b"user_1\nrps_2\n", 2).unwrap().as_str(),
+            "user_1\nrps_2"
+        );
+        assert_eq!(
+            to_key(b"user_1\r\nrps_2\r\n", 2).unwrap().as_str(),
+            "user_1\nrps_2"
+        );
+        assert!(to_key(b"rps_2\n", 2).is_err());
+        assert!(to_key(b"user_1\n\nrps_2", 2).is_err());
+        assert!(to_key(b"a\nb\nc", 2).is_err());
+        assert!(to_key(b"user 1\nrps_2", 2).is_err());
     }
 }

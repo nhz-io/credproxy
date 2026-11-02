@@ -5,6 +5,7 @@ mod config;
 mod graphql;
 mod log;
 mod proxy;
+mod s3;
 mod serve;
 mod vault;
 

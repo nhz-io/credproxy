@@ -1,5 +1,6 @@
 //! Config file: services, their upstreams and what each may call.
 
+use crate::s3::Op;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -43,6 +44,15 @@ struct RawAuth {
     header: String,
     #[serde(default = "default_format")]
     format: String,
+    /// Sign requests with AWS SigV4 instead of putting the key in `header`.
+    sigv4: Option<RawSigv4>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSigv4 {
+    #[serde(default = "default_sigv4_service")]
+    service: String,
 }
 
 impl Default for RawAuth {
@@ -50,6 +60,7 @@ impl Default for RawAuth {
         RawAuth {
             header: default_header(),
             format: default_format(),
+            sigv4: None,
         }
     }
 }
@@ -62,6 +73,18 @@ struct RawRoute {
     #[serde(default)]
     allow: Vec<String>,
     graphql_queries: Option<Vec<String>>,
+    s3: Option<RawS3>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawS3 {
+    region: String,
+    ops: Vec<String>,
+    #[serde(default)]
+    key_prefixes: Vec<String>,
+    #[serde(default)]
+    unsigned_payload: bool,
 }
 
 fn default_idle() -> String {
@@ -91,6 +114,9 @@ fn default_header() -> String {
 fn default_format() -> String {
     "Bearer {key}".into()
 }
+fn default_sigv4_service() -> String {
+    "s3".into()
+}
 
 #[derive(Debug)]
 pub struct Config {
@@ -108,8 +134,12 @@ pub struct Config {
 #[derive(Debug)]
 pub struct Service {
     pub secret: PathBuf,
+    /// How clients send the token (and, without `sigv4`, how the key goes upstream).
     pub auth_header: String,
     pub auth_format: String,
+    /// Some(signing service name, e.g. "s3"): requests are signed with SigV4; the sealed file holds two lines,
+    /// the access key id and the secret.
+    pub sigv4: Option<String>,
     pub routes: Vec<Route>,
 }
 
@@ -122,6 +152,19 @@ pub struct Route {
     pub allow: Vec<Rule>,
     /// Some(fields) = GraphQL endpoint: POST only, one `query` operation whose top-level fields are all listed.
     pub graphql_queries: Option<Vec<String>>,
+    /// Some = S3 endpoint (SigV4 services only): only the listed operations, path-style.
+    pub s3: Option<S3Route>,
+}
+
+#[derive(Debug)]
+pub struct S3Route {
+    /// Signing region (RunPod: the datacenter id, e.g. "EU-RO-1"; R2: "auto").
+    pub region: String,
+    pub ops: Vec<Op>,
+    /// If not empty, object keys (and list prefixes) must start with one of these.
+    pub key_prefixes: Vec<String>,
+    /// Pass a client's `x-amz-content-sha256: UNSIGNED-PAYLOAD` through (body not covered by the signature).
+    pub unsigned_payload: bool,
 }
 
 #[derive(Debug)]
@@ -268,6 +311,37 @@ impl Service {
     }
 }
 
+fn check_s3(r: RawS3) -> Result<S3Route, String> {
+    if r.region.is_empty()
+        || !r
+            .region
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err(format!("bad s3.region {:?}", r.region));
+    }
+    if r.ops.is_empty() {
+        return Err("s3.ops is empty".into());
+    }
+    let ops = r
+        .ops
+        .iter()
+        .map(|o| Op::from_name(o).ok_or(format!("unknown s3 operation {o:?}")))
+        .collect::<Result<Vec<_>, _>>()?;
+    if r.key_prefixes
+        .iter()
+        .any(|p| p.is_empty() || p.starts_with('/') || p.chars().any(char::is_control))
+    {
+        return Err("s3.key_prefixes: non-empty, without a leading /".into());
+    }
+    Ok(S3Route {
+        region: r.region,
+        ops,
+        key_prefixes: r.key_prefixes,
+        unsigned_payload: r.unsigned_payload,
+    })
+}
+
 fn check_listen(s: &str) -> Result<SocketAddr, String> {
     let a: SocketAddr = s
         .parse()
@@ -320,6 +394,15 @@ pub fn parse(text: &str) -> Result<Config, String> {
         if s.routes.is_empty() {
             return Err(format!("service {name}: no routes"));
         }
+        if let Some(v) = &s.auth.sigv4
+            && (v.service.is_empty()
+                || !v
+                    .service
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'))
+        {
+            return Err(format!("service {name}: bad auth.sigv4.service"));
+        }
         let mut routes = Vec::new();
         for r in s.routes {
             let prefix = r.prefix.trim_end_matches('/').to_string();
@@ -340,7 +423,32 @@ pub fn parse(text: &str) -> Result<Config, String> {
                 .map(|a| parse_rule(a))
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| format!("service {name}: {e}"))?;
-            if allow.is_empty() && r.graphql_queries.is_none() {
+            let s3 = match (r.s3, s.auth.sigv4.is_some()) {
+                (Some(x), true) => Some(
+                    check_s3(x)
+                        .map_err(|e| format!("service {name}: route {:?}: {e}", r.prefix))?,
+                ),
+                (None, false) => None,
+                (Some(_), false) => {
+                    return Err(format!(
+                        "service {name}: route {:?}: s3 routes need auth.sigv4",
+                        r.prefix
+                    ));
+                }
+                (None, true) => {
+                    return Err(format!(
+                        "service {name}: route {:?}: a sigv4 service has s3 routes only",
+                        r.prefix
+                    ));
+                }
+            };
+            if s3.is_some() && (!allow.is_empty() || r.graphql_queries.is_some()) {
+                return Err(format!(
+                    "service {name}: route {:?}: use s3 alone",
+                    r.prefix
+                ));
+            }
+            if allow.is_empty() && r.graphql_queries.is_none() && s3.is_none() {
                 return Err(format!(
                     "service {name}: route {:?} allows nothing",
                     r.prefix
@@ -357,6 +465,7 @@ pub fn parse(text: &str) -> Result<Config, String> {
                 upstream,
                 allow,
                 graphql_queries: r.graphql_queries,
+                s3,
             });
         }
         services.insert(
@@ -365,6 +474,7 @@ pub fn parse(text: &str) -> Result<Config, String> {
                 secret: PathBuf::from(format!("{}.age", s.secret)),
                 auth_header: s.auth.header,
                 auth_format: s.auth.format,
+                sigv4: s.auth.sigv4.map(|v| v.service),
                 routes,
             },
         );
@@ -487,6 +597,50 @@ allow = ["GET /pods", "DELETE /pods/{id}", "GET /catalog/gpus"]
             ("POST", "/user/apikey"),
         ] {
             assert!(!allowed(&c, m, p), "{m} {p}");
+        }
+    }
+
+    const S3: &str = r#"
+[services.runpod-s3]
+secret = "runpod/s3-key"
+auth = { sigv4 = { service = "s3" } }
+[[services.runpod-s3.routes]]
+prefix = "/eu-ro-1"
+upstream = "https://s3api-eu-ro-1.runpod.io"
+s3 = { region = "EU-RO-1", ops = ["GetObject", "PutObject"] }
+"#;
+
+    #[test]
+    fn sigv4_service() {
+        let c = parse(S3).unwrap();
+        let s = &c.services["runpod-s3"];
+        assert_eq!(s.sigv4.as_deref(), Some("s3"));
+        assert_eq!(
+            s.auth_format, "Bearer {key}",
+            "clients still send the token as a Bearer"
+        );
+        let (r, rest) = s.route("/eu-ro-1/vol/a").unwrap();
+        let s3 = r.s3.as_ref().unwrap();
+        assert_eq!((s3.region.as_str(), rest.as_str()), ("EU-RO-1", "/vol/a"));
+        assert_eq!(s3.ops, [Op::GetObject, Op::PutObject]);
+        assert!(!s3.unsigned_payload && s3.key_prefixes.is_empty());
+        let bad = [
+            S3.replace("auth = { sigv4 = { service = \"s3\" } }", ""),
+            S3.replace("\"PutObject\"", "\"CreateBucket\""),
+            S3.replace("ops = [\"GetObject\", \"PutObject\"]", "ops = []"),
+            S3.replace("EU-RO-1", "eu/ro"),
+            S3.replace("service = \"s3\"", "service = \"S3\""),
+            S3.replace("s3 = {", "allow = [\"GET /x\"]\ns3 = {"),
+            S3.replace("ops = [", "key_prefixes = [\"/x\"], ops = ["),
+            format!(
+                "{S3}[[services.runpod-s3.routes]]\nprefix = \"/v1\"\nupstream = \"https://x\"\nallow = [\"GET /x\"]\n"
+            ),
+            format!(
+                "{RUNPOD}[[services.runpod.routes]]\nprefix = \"/s3\"\nupstream = \"https://x\"\ns3 = {{ region = \"a\", ops = [\"GetObject\"] }}\n"
+            ),
+        ];
+        for b in bad {
+            assert!(parse(&b).is_err(), "accepted:\n{b}");
         }
     }
 

@@ -54,8 +54,9 @@ pub fn run(cfg_path: &Path) -> Result<(), String> {
 
 /// At most this many client connections at once; more are closed right away.
 const MAX_CONNECTIONS: usize = 64;
-/// One request per connection, and no connection lives longer than this (unlock wait + upstream + slack).
-const CONNECTION_LIFETIME: Duration = Duration::from_secs(300);
+/// One request per connection, and no connection lives longer than this (the longest upstream call, an S3
+/// transfer, plus unlock wait and slack).
+const CONNECTION_LIFETIME: Duration = proxy::S3_TIMEOUT.saturating_add(Duration::from_secs(300));
 /// How long to keep trying the port when it's busy (e.g. the previous daemon still releasing it).
 const BIND_RETRY: Duration = Duration::from_secs(30);
 

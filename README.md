@@ -15,6 +15,13 @@ curl -H "Authorization: Bearer $(credproxy token runpod)" http://127.0.0.1:7777/
 credproxy checks that the request comes from this machine and carries the token, checks it against the service's
 allowlist, swaps the token for the real key, forwards over HTTPS and returns the reply with the key scrubbed out.
 
+S3-compatible storage (RunPod network volumes, Cloudflare R2, AWS S3) works the same way for the client, but the
+secret never leaves credproxy at all: it signs each allowed request with AWS SigV4 instead.
+
+```bash
+curl -H "Authorization: Bearer $(credproxy token runpod-s3)" http://127.0.0.1:7777/runpod-s3/eu-ro-1/<volume>/<key>
+```
+
 ## Why
 
 - An agent that runs a tool which needs an API key would otherwise get the key in its env, argv or a file, and
@@ -38,9 +45,12 @@ allowlist, swaps the token for the real key, forwards over HTTPS and returns the
 | Allowlist | Per route: `METHOD /path/{param}` rules (`{param}` = one segment of `[A-Za-z0-9._-]`, never `.`/`..`), or a GraphQL endpoint where only one `query` operation whose top-level fields are all listed passes (no mutations, subscriptions or fragments). Anything else → 403, never sent upstream. For GraphQL only the checked request is sent: `{query, variables, operationName}` re-serialised as JSON, `Content-Type: application/json`, no query string — so the upstream can't read anything that wasn't checked. |
 | Upstream | HTTPS only (plain HTTP only to 127.0.0.1, for tests), no redirects followed, own `User-Agent: credproxy/<version>`, `Accept-Encoding: identity` (a compressed reply is refused: the key couldn't be scrubbed from it), 60 s timeout. Only `Content-Type` and `Accept` are forwarded from the client; its auth header, cookies and other headers are dropped. Request body ≤ 1 MiB, response ≤ 16 MiB. |
 | Reply | Status, `Content-Type` and body, with every verbatim copy of the key replaced by `[REDACTED]`. |
+| S3 (SigV4) | For services with `auth.sigv4`. The sealed file holds two lines: access key id, secret. Path-style only (`/<bucket>/<key>`). The operation is worked out from method + path + query and must be in the route's `ops`: `GetObject`, `HeadObject`, `PutObject`, `DeleteObject`, `HeadBucket`, `ListObjectsV2`, `CreateMultipartUpload`, `UploadPart`, `CompleteMultipartUpload`, `AbortMultipartUpload`, `ListParts`. Nothing else passes (no ListBuckets, bucket admin, ACLs, tagging, versions, DeleteObjects). Keys are percent-decoded and refused if they hold `.`/`..` or empty segments or control characters; optional `key_prefixes` limit keys and list prefixes. Path and query are re-encoded canonically, then signed with [`aws-sigv4`](https://crates.io/crates/aws-sigv4). Only `Content-Type`, `Content-MD5`, `Range`, `If-Match`, `If-None-Match` go upstream (so no `x-amz-copy-source`: no CopyObject). |
+| S3 payload | PutObject / UploadPart bodies stream through (≤ 512 MiB each) when the client sends their SHA-256 in `x-amz-content-sha256`; the signature covers it and the server checks the body against it. Other bodies (≤ 1 MiB, e.g. the CompleteMultipartUpload XML) are hashed by credproxy. `UNSIGNED-PAYLOAD` only where the route sets `unsigned_payload = true`; aws-chunked (`STREAMING-…`) is refused. 60 s without bytes moving aborts a transfer; one call may take up to 1 h. |
+| S3 reply | Successful replies stream back as they are, with `Content-Type`, `Content-Length`, `Content-Range`, `Accept-Ranges`, `ETag`, `Last-Modified`: the secret was never sent, so it can't come back in them. Error replies are buffered and scrubbed of the access key id and the secret. |
 | Control | Unix socket `ctl.sock` (0600) in a 0700 runtime dir, peer uid checked: token, status, unlock, lock, stop. |
 | Log | `~/Library/Logs/credproxy.log` (0600): time, service, method, path, status, ms; unlocks and locks. No token, no query string, no key. Rotates at 1 MiB into one `.1` file; reopened if deleted. |
-| Limits | At most 64 client connections at once (logged when reached), one request per connection, headers within 10 s, 5 minutes per connection. Unknown services get the same 401, with the same text, as a wrong token. |
+| Limits | At most 64 client connections at once (logged when reached), one request per connection, headers within 10 s, a small request body within 60 s, 65 minutes per connection. Unknown services get the same 401, with the same text, as a wrong token. |
 | Hardening | Core dumps off; on macOS the daemon requests `PT_DENY_ATTACH` (not tested by the test suite). |
 
 ## Limits (read these)
@@ -54,7 +64,9 @@ allowlist, swaps the token for the real key, forwards over HTTPS and returns the
   HTTP client's buffers while a request is built; those are not zeroed.
 - **Scrubbing catches the key verbatim only**, not encoded forms (base64, URL-encoded).
 - **The allowlist covers method and path.** Query strings and REST request bodies are passed through unchecked, so
-  an allowed `POST /pods` can create any pod the API allows.
+  an allowed `POST /pods` can create any pod the API allows. (S3 routes do check the query.)
+- **An S3 route reaches every bucket the key can**, unless `key_prefixes` narrows it: an allowed `DeleteObject`
+  can delete any object there.
 
 ## Install
 
@@ -80,7 +92,9 @@ cargo install --locked --path .
 ```
 
 The tests need `age` and `age-keygen`; they use a throwaway identity, a fake key and a free port, and never touch
-launchd.
+launchd. The S3 tests run an S3 server in process ([s3s-fs](https://crates.io/crates/s3s-fs)) that checks every
+signature and body hash. `cargo test --release --test s3 -- --ignored --nocapture` moves 600 MB up and down and
+prints the daemon's memory (7 MiB idle, 12 MiB peak on an M-series Mac).
 
 ## Config
 
@@ -102,7 +116,32 @@ secret = "runpod/api-key"                          # ~/.secrets/runpod/api-key.a
 [[services.runpod.routes]]
 prefix = "/v1"                                     # longest prefix wins
 upstream = "https://rest.runpod.io/v1"
-allow = ["GET /pods", "POST /pods", "GET /pods/{id}", "DELETE /pods/{id}", "GET /billing/pods"]
+allow = ["GET /pods", "POST /pods", "GET /pods/{id}", "DELETE /pods/{id}", "GET /billing/pods",
+         "GET /networkvolumes", "POST /networkvolumes", "GET /networkvolumes/{id}", "DELETE /networkvolumes/{id}"]
+```
+
+An S3-compatible service (here RunPod network volumes; one route per datacenter):
+
+```toml
+[services.runpod-s3]
+secret = "runpod/s3-key"                           # two lines: access key id (user_…), secret (rps_…)
+auth = { sigv4 = { service = "s3" } }              # clients still send "Authorization: Bearer <token>"
+
+[[services.runpod-s3.routes]]
+prefix = "/eu-ro-1"
+upstream = "https://s3api-eu-ro-1.runpod.io"
+s3 = { region = "EU-RO-1", ops = ["GetObject", "HeadObject", "PutObject", "DeleteObject", "ListObjectsV2",
+       "CreateMultipartUpload", "UploadPart", "CompleteMultipartUpload", "AbortMultipartUpload"] }
+# key_prefixes = ["runs/"]                         # optional
+# unsigned_payload = true                          # optional: let clients skip the body hash
+```
+
+Cloudflare R2: `upstream = "https://<account id>.r2.cloudflarestorage.com"`, `region = "auto"`.
+
+Seal two lines without the clipboard (zsh; the secret isn't echoed):
+
+```bash
+{ read -r "id?Access key id: "; read -rs "sec?Secret: "; echo >&2; printf '%s\n%s\n' "$id" "$sec"; } | age -R <recipients> -o ~/.secrets/runpod/s3-key.age
 ```
 
 The daemon reads the config at start; after changing it, `credproxy restart`.
