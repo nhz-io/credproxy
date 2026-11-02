@@ -343,10 +343,17 @@ async fn forward(
 async fn read_small(body: Incoming, limit: Duration) -> Result<Bytes, Response<Body>> {
     match tokio::time::timeout(limit, Limited::new(body, MAX_REQUEST).collect()).await {
         Ok(Ok(b)) => Ok(b.to_bytes()),
-        Ok(Err(_)) => Err(reply(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "request body too large",
-        )),
+        Ok(Err(e))
+            if e.downcast_ref::<http_body_util::LengthLimitError>()
+                .is_some() =>
+        {
+            Err(reply(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "request body too large",
+            ))
+        }
+        // e.g. the client hung up mid-body
+        Ok(Err(_)) => Err(reply(StatusCode::BAD_REQUEST, "request body broken")),
         Err(_) => Err(reply(StatusCode::REQUEST_TIMEOUT, "request body too slow")),
     }
 }
@@ -663,20 +670,16 @@ async fn forward_s3(
     // streamed one is only counted sent once its last byte went through the open connection.
     let small = !matches!(payload, Payload::Stream(..));
     let reply_clock = reply_limit + if small { connect_limit } else { Duration::ZERO };
-    let (sent_tx, sent_rx) = tokio::sync::oneshot::channel::<()>();
-    // once a state-changing request has gone out, a failure can't tell whether the upstream acted on it
+    // Whether the whole request has been handed on: it starts the reply clock, and once a state-changing request
+    // has gone out a failure can't tell whether the upstream acted on it.
+    let (sent_tx, sent_rx) = tokio::sync::watch::channel(false);
     let changes = method != "GET" && method != "HEAD";
-    let sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
     // called once the last request byte has been handed on: from then on silence is the upstream working
-    let mut on_sent = {
+    let on_sent = {
         let progress = progress.clone();
-        let sent = sent.clone();
-        let mut sent_tx = Some(sent_tx);
         move || {
-            if let Some(t) = sent_tx.take() {
-                sent.store(true, std::sync::atomic::Ordering::Relaxed);
+            if !sent_tx.send_replace(true) {
                 progress.quiet_for(reply_clock + idle_limit);
-                let _ = t.send(());
             }
         }
     };
@@ -712,9 +715,10 @@ async fn forward_s3(
                 .body(reqwest::Body::wrap_stream(chunks))
         }
     };
-    let no_reply = async {
+    let mut sent_seen = sent_rx.clone();
+    let no_reply = async move {
         // a dropped sender (the request failed before its end) never starts the clock; send() reports that
-        if sent_rx.await.is_ok() {
+        if sent_seen.wait_for(|s| *s).await.is_ok() {
             tokio::time::sleep(reply_clock).await;
         } else {
             std::future::pending::<()>().await;
@@ -723,7 +727,7 @@ async fn forward_s3(
     let res = tokio::select! {
         r = out.send() => match r {
             Ok(r) => r,
-            Err(_) if changes && sent.load(std::sync::atomic::Ordering::Relaxed) => {
+            Err(_) if changes && *sent_rx.borrow() => {
                 return reply(
                     StatusCode::BAD_GATEWAY,
                     &format!("upstream failed after the request was sent: {OUTCOME_UNKNOWN}"),
@@ -744,7 +748,8 @@ async fn forward_s3(
     progress.touch();
     if !res.status().is_success() {
         // 304 and 412 need the validators, 416 the object size; a redirect's Location is not passed on
-        let keep: Vec<_> = ["etag", "last-modified", "content-range"]
+        // a throttled client needs Retry-After to back off
+        let keep: Vec<_> = ["etag", "last-modified", "content-range", "retry-after"]
             .iter()
             .filter_map(|n| Some((*n, res.headers().get(*n)?.clone())))
             .collect();

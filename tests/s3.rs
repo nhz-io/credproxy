@@ -86,7 +86,7 @@ fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
 /// its head, then how many body bytes arrived out of Content-Length and their SHA-256. The last path segment picks
 /// the reply: `truncate-cl` (says 1000 bytes, sends 500, closes), `truncate-chunked` (one chunk, then closes
 /// without the final one), `chunked-ok`, `stall` (10 of 1000 bytes, then nothing for 90 s), `error-echo` (403
-/// quoting the access key id), `complete-error` (200 with an <Error> body), `complete-ok`, `not-modified` (304), `redirect` (307), `no-read` (never reads the body or replies), `slow-reply` (replies after 10 s), `pause-reply` (after 2.5 s), `complete-trickle` (keep-alive spaces, then the result), `complete-late` (headers late, then spaces: 5 s in all), `close-delimited` (200, no length), `complete-empty`, `complete-cut` (says 1000 bytes, sends 3), `reset-after-body` (closes without replying), anything else 200
+/// quoting the access key id), `complete-error` (200 with an <Error> body), `complete-ok`, `not-modified` (304), `redirect` (307), `no-read` (never reads the body or replies), `slow-reply` (replies after 10 s), `pause-reply` (after 2.5 s), `complete-trickle` (keep-alive spaces, then the result), `complete-late` (headers late, then spaces: 5 s in all), `close-delimited` (200, no length), `complete-empty`, `complete-cut` (says 1000 bytes, sends 3), `reset-after-body` (closes without replying), `throttle` (503 with Retry-After), anything else 200
 /// with no body.
 async fn raw_server(dir: PathBuf) -> u16 {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -166,6 +166,7 @@ async fn raw_server(dir: PathBuf) -> u16 {
                         tokio::time::sleep(Duration::from_millis(2500)).await;
                         b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_vec()
                     }
+                    "throttle" => b"HTTP/1.1 503 Slow Down\r\nretry-after: 5\r\ncontent-type: application/xml\r\nconnection: close\r\n\r\n<Error><Code>SlowDown</Code></Error>".to_vec(),
                     "close-delimited" => b"HTTP/1.1 200 OK\r\ncontent-type: application/octet-stream\r\nconnection: close\r\n\r\nhello".to_vec(),
                     "complete-empty" => b"HTTP/1.1 200 OK\r\ncontent-type: application/xml\r\nconnection: close\r\n\r\n".to_vec(),
                     "complete-cut" => b"HTTP/1.1 200 OK\r\ncontent-type: application/xml\r\ncontent-length: 1000\r\n\r\n<Co".to_vec(),
@@ -2103,4 +2104,36 @@ async fn replies_that_cannot_prove_completeness_are_refused() {
     .await;
     assert_eq!(r.status, 502, "{}", r.text());
     assert!(!r.text().contains("outcome is unknown"), "{}", r.text());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn throttling_and_broken_bodies_are_reported_as_such() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let env = setup().await;
+    // a throttled client gets told how long to back off
+    let r = call(
+        &env,
+        "PUT",
+        "/store/raw/vol1/throttle",
+        b"x".to_vec(),
+        true,
+        &[],
+    )
+    .await;
+    assert_eq!(r.status, 503);
+    assert_eq!(r.headers["retry-after"], "5");
+    // a client that stops mid-body (half-closes after 10 of 100 bytes) is a broken body, not a too-large one
+    let addr = env.base.strip_prefix("http://").unwrap();
+    let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let head = format!(
+        "POST /store/raw/vol1/brokenbody?uploadId=u1 HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {}\r\nContent-Length: 100\r\n\r\n<Complete",
+        env.token("store")
+    );
+    c.write_all(head.as_bytes()).await.unwrap();
+    c.shutdown().await.unwrap();
+    let mut out = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(5), c.read_to_end(&mut out)).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let log = env.log();
+    assert!(log.contains("store POST /raw/vol1/brokenbody 400"), "{log}");
 }
