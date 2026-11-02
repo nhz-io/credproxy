@@ -107,7 +107,7 @@ fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
 /// its head, then how many body bytes arrived out of Content-Length and their SHA-256. The last path segment picks
 /// the reply: `truncate-cl` (says 1000 bytes, sends 500, closes), `truncate-chunked` (one chunk, then closes
 /// without the final one), `chunked-ok`, `stall` (10 of 1000 bytes, then nothing for 90 s), `error-echo` (403
-/// quoting the access key id), `complete-error` (200 with an <Error> body), `complete-ok`, anything else 200
+/// quoting the access key id), `complete-error` (200 with an <Error> body), `complete-ok`, `not-modified` (304), `redirect` (307), anything else 200
 /// with no body.
 async fn raw_server(dir: PathBuf) -> u16 {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -183,6 +183,8 @@ async fn raw_server(dir: PathBuf) -> u16 {
                         tokio::time::sleep(Duration::from_secs(90)).await;
                         return;
                     }
+                    "not-modified" => b"HTTP/1.1 304 Not Modified\r\netag: \"e1\"\r\nlast-modified: Wed, 21 Oct 2015 07:28:00 GMT\r\nconnection: close\r\n\r\n".to_vec(),
+                    "redirect" => b"HTTP/1.1 307 Temporary Redirect\r\nlocation: http://127.0.0.1:1/vol1/redirected-target\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_vec(),
                     "complete-error" => b"HTTP/1.1 200 OK\r\ncontent-type: application/xml\r\nconnection: close\r\n\r\n<?xml version=\"1.0\"?>\n<Error><Code>InternalError</Code><Message>We encountered an internal error.</Message></Error>".to_vec(),
                     "complete-ok" => b"HTTP/1.1 200 OK\r\ncontent-type: application/xml\r\nconnection: close\r\n\r\n<CompleteMultipartUploadResult><ETag>\"x-2\"</ETag></CompleteMultipartUploadResult>".to_vec(),
                     "error-echo" => format!(
@@ -759,11 +761,42 @@ async fn big_transfer_memory() {
         "600 MB came back different"
     );
     let down = t.elapsed();
+    let fast_peak = peak.load(std::sync::atomic::Ordering::Relaxed);
+    // a slow reader: the proxy must hold back, not buffer the object
+    peak.store(0, std::sync::atomic::Ordering::Relaxed);
+    let mut res = reqwest::Client::new()
+        .get(format!("{}{p}", env.base))
+        .header("authorization", format!("Bearer {}", env.token("store")))
+        .header("range", "bytes=0-199999999")
+        .send()
+        .await
+        .unwrap();
+    let mut slow = sha2::Sha256::new();
+    let mut n = 0usize;
+    while let Some(c) = res.chunk().await.unwrap() {
+        n += c.len();
+        slow.update(&c);
+        tokio::time::sleep(Duration::from_micros(300)).await;
+    }
+    let slow_peak = peak.load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(n, 200_000_000);
+    let want: String = sha2::Sha256::digest(&parts.concat()[..200_000_000])
+        .iter()
+        .map(|x| format!("{x:02x}"))
+        .collect();
+    let got: String = slow.finalize().iter().map(|x| format!("{x:02x}")).collect();
+    assert_eq!(got, want);
+    assert!(
+        slow_peak < 64 * 1024,
+        "daemon grew to {} MiB under a slow reader",
+        slow_peak / 1024
+    );
     watcher.abort();
     println!(
-        "daemon RSS: {} MiB before, peak {} MiB; up {:.1}s, down {:.1}s",
+        "daemon RSS: {} MiB before, peak {} MiB (slow reader: {} MiB); up {:.1}s, down {:.1}s",
         before / 1024,
-        peak.load(std::sync::atomic::Ordering::Relaxed) / 1024,
+        fast_peak / 1024,
+        slow_peak / 1024,
         up.as_secs_f64(),
         down.as_secs_f64()
     );
@@ -1402,5 +1435,367 @@ async fn conditional_and_object_headers_reach_upstream() {
     assert_eq!(
         call(&env, "GET", p, vec![], false, &[]).await.body,
         b"version 2"
+    );
+}
+
+// ---- Claims, edge replies, interruptions, load ----
+
+fn status_of(env: &Env, service: &str) -> String {
+    let out = String::from_utf8_lossy(&env.cli(&["status"]).stdout).into_owned();
+    out.lines()
+        .find(|l| l.trim_start().starts_with(&format!("{service}:")))
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn refused_calls_never_unlock() {
+    let env = setup().await;
+    assert!(status_of(&env, "store").starts_with("store: locked"));
+    let bad_hash = "0".repeat(63);
+    type Case<'a> = (&'a str, &'a str, Vec<u8>, Vec<(&'a str, &'a str)>);
+    let cases: Vec<Case> = vec![
+        ("GET", "/store/dc-1/", vec![], vec![]), // ListBuckets
+        ("GET", "/store/dc-1/vol1?acl", vec![], vec![]), // not an operation we allow
+        ("PUT", "/store/ro/vol1/pub/x", b"x".to_vec(), vec![]), // not on this route
+        ("GET", "/store/ro/vol1/other", vec![], vec![]), // outside key_prefixes
+        ("GET", "/store/dc-1/vol1/a%2F..%2Fb", vec![], vec![]), // bad key
+        ("GET", "/store/dc-9/vol1/a", vec![], vec![]), // no such route
+        (
+            "PUT",
+            "/store/dc-1/vol1/a",
+            b"x".to_vec(),
+            vec![("x-amz-copy-source", "/vol1/b")],
+        ),
+        (
+            "PUT",
+            "/store/dc-1/vol1/a",
+            b"x".to_vec(),
+            vec![("x-amz-content-sha256", &bad_hash)],
+        ),
+        (
+            "PUT",
+            "/store/dc-1/vol1/a",
+            b"x".to_vec(),
+            vec![("x-amz-content-sha256", "UNSIGNED-PAYLOAD")],
+        ),
+        (
+            "PUT",
+            "/store/dc-1/vol1/a",
+            b"x".to_vec(),
+            vec![("content-encoding", "aws-chunked")],
+        ),
+        (
+            "GET",
+            "/store/dc-1/vol1/a",
+            vec![],
+            vec![("range", "bytes=0-1"), ("range", "bytes=2-3")],
+        ),
+    ];
+    for (m, p, body, h) in &cases {
+        let r = call(&env, m, p, body.clone(), false, h).await;
+        assert!(
+            r.status == 400 || r.status == 403,
+            "{m} {p}: {} {}",
+            r.status,
+            r.text()
+        );
+    }
+    // a wrong or missing token never gets that far either
+    let r = reqwest::get(format!("{}/store/dc-1/vol1/a", env.base))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 401);
+    assert!(
+        status_of(&env, "store").starts_with("store: locked"),
+        "{}",
+        status_of(&env, "store")
+    );
+    assert!(!env.log().contains("store unlocked"));
+    // the first allowed call does unlock
+    let r = call(&env, "PUT", "/store/dc-1/vol1/a", b"x".to_vec(), false, &[]).await;
+    assert_eq!(r.status, 200);
+    assert!(status_of(&env, "store").starts_with("store: unlocked"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn edge_replies_pass_through_correctly() {
+    let env = setup().await;
+    // 304 keeps its validators
+    let r = call(
+        &env,
+        "GET",
+        "/store/raw/vol1/not-modified",
+        vec![],
+        false,
+        &[("if-none-match", "\"e1\"")],
+    )
+    .await;
+    assert_eq!(r.status, 304);
+    assert_eq!(r.headers["etag"], "\"e1\"");
+    assert!(r.headers.get("last-modified").is_some());
+    // a redirect is passed back, not followed, and without its Location
+    let r = call(&env, "GET", "/store/raw/vol1/redirect", vec![], false, &[]).await;
+    assert_eq!(r.status, 307);
+    assert!(r.headers.get("location").is_none());
+    // against the real server: a range past the end, a missing object by HEAD
+    call(
+        &env,
+        "PUT",
+        "/store/dc-1/vol1/ten",
+        b"0123456789".to_vec(),
+        true,
+        &[],
+    )
+    .await;
+    let r = call(
+        &env,
+        "GET",
+        "/store/dc-1/vol1/ten",
+        vec![],
+        false,
+        &[("range", "bytes=100-200")],
+    )
+    .await;
+    assert_eq!(r.status, 416, "{}", r.text());
+    let r = call(
+        &env,
+        "GET",
+        "/store/dc-1/vol1/ten",
+        vec![],
+        false,
+        &[("range", "bytes=-3")],
+    )
+    .await;
+    assert_eq!((r.status, r.body.as_slice()), (206, &b"789"[..]));
+    let r = call(&env, "HEAD", "/store/dc-1/vol1/missing", vec![], false, &[]).await;
+    assert_eq!((r.status, r.body.len()), (404, 0));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn log_shows_paths_but_never_queries_or_secrets() {
+    let env = setup().await;
+    let p = "/store/dc-1/vol1/logged.bin";
+    let r = call(&env, "POST", &format!("{p}?uploads"), vec![], false, &[]).await;
+    let id = url_encode(between(&r.text(), "<UploadId>", "</UploadId>"));
+    let r = call(
+        &env,
+        "PUT",
+        &format!("{p}?partNumber=1&uploadId={id}"),
+        b"part".to_vec(),
+        true,
+        &[],
+    )
+    .await;
+    assert_eq!(r.status, 200);
+    call(
+        &env,
+        "GET",
+        "/store/dc-1/vol1?list-type=2&prefix=secret-prefix/",
+        vec![],
+        false,
+        &[],
+    )
+    .await;
+    let log = env.log();
+    assert!(log.contains("store PUT /dc-1/vol1/logged.bin 200"), "{log}");
+    for bad in [
+        "uploadId",
+        "partNumber",
+        "secret-prefix",
+        "?",
+        ACCESS_KEY,
+        &env.secret,
+        &env.token("store"),
+    ] {
+        assert!(!log.contains(bad), "log contains {bad:?}:\n{log}");
+    }
+}
+
+/// Writes the head and the first half of `body`, runs `between_halves`, then the rest; returns the reply.
+async fn upload_in_two_halves(
+    env: &Env,
+    path: &str,
+    body: &[u8],
+    between_halves: impl FnOnce(),
+) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let head = put_head(env, path, body.len(), &hex_sha256(body), "");
+    let mut c = tokio::net::TcpStream::connect(env.base.strip_prefix("http://").unwrap())
+        .await
+        .unwrap();
+    c.write_all(head.as_bytes()).await.unwrap();
+    c.write_all(&body[..body.len() / 2]).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    between_halves();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let _ = c.write_all(&body[body.len() / 2..]).await;
+    let mut out = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(10), c.read_to_end(&mut out)).await;
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lock_during_an_upload_lets_it_finish_intact() {
+    let env = setup().await;
+    let body = random_bytes(4 << 20);
+    let out = upload_in_two_halves(&env, "/store/dc-1/vol1/locked.bin", &body, || {
+        assert!(env.cli(&["lock"]).status.success());
+    })
+    .await;
+    assert!(out.starts_with("HTTP/1.1 200"), "{out}");
+    assert_eq!(
+        hex_sha256(&on_disk(&env, "vol1/locked.bin")),
+        hex_sha256(&body)
+    );
+    assert!(status_of(&env, "store").starts_with("store: locked"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn daemon_stop_during_an_upload_never_completes_it() {
+    let mut env = setup().await;
+    let body = random_bytes(4 << 20);
+    let out = upload_in_two_halves(&env, "/store/raw/vol1/stopped", &body, || {
+        assert!(env.cli(&["stop"]).status.success());
+    })
+    .await;
+    assert!(!out.starts_with("HTTP/1.1 200"), "{out}");
+    let rec = raw_record(&env, "stopped").await;
+    let got: usize = between(&rec, "--- body ", " of").parse().unwrap();
+    assert!(got < body.len(), "upstream got the whole body: {rec}");
+    if let Some(mut d) = env.daemon.take() {
+        let _ = d.wait();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn more_parallel_parts_than_connections_still_assemble_exactly() {
+    let env = std::sync::Arc::new(setup().await);
+    let p = "/store/dc-1/vol1/many.bin";
+    let r = call(&env, "POST", &format!("{p}?uploads"), vec![], false, &[]).await;
+    let id = url_encode(between(&r.text(), "<UploadId>", "</UploadId>"));
+    // 66 parts > the 64-connection limit; the server wants parts of at least 5 MiB
+    let parts: Vec<Vec<u8>> = (0..66).map(|i| random_bytes((5 << 20) + i)).collect();
+    let token = env.token("store");
+    let mut set = tokio::task::JoinSet::new();
+    for (i, part) in parts.iter().enumerate() {
+        let (base, part, id, token) = (env.base.clone(), part.clone(), id.clone(), token.clone());
+        set.spawn(async move {
+            let n = i + 1;
+            // the proxy closes connections over its limit: retry like a client would
+            for attempt in 0..50 {
+                let r = reqwest::Client::new()
+                    .put(format!("{base}{p}?partNumber={n}&uploadId={id}"))
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("x-amz-content-sha256", hex_sha256(&part))
+                    .body(part.clone())
+                    .send()
+                    .await;
+                if let Ok(r) = r
+                    && r.status() == 200
+                {
+                    return (
+                        n,
+                        r.headers()["etag"].to_str().unwrap().to_string(),
+                        attempt,
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            panic!("part {n} never went through");
+        });
+    }
+    let mut etags = set.join_all().await;
+    etags.sort();
+    let retried = etags.iter().filter(|(_, _, a)| *a > 0).count();
+    let xml: String = etags
+        .iter()
+        .map(|(n, e, _)| format!("<Part><PartNumber>{n}</PartNumber><ETag>{e}</ETag></Part>"))
+        .collect();
+    let r = call(
+        &env,
+        "POST",
+        &format!("{p}?uploadId={id}"),
+        format!("<CompleteMultipartUpload>{xml}</CompleteMultipartUpload>").into_bytes(),
+        false,
+        &[],
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    let r = call(&env, "GET", p, vec![], false, &[]).await;
+    assert_eq!(hex_sha256(&r.body), hex_sha256(&parts.concat()));
+    println!("{retried} of 66 parts needed a retry");
+}
+
+/// 60 s+: a client that stops sending mid-upload is cut off; upstream never gets a complete request.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn stalled_upload_is_cut_off() {
+    use tokio::io::AsyncWriteExt;
+    let env = setup().await;
+    let body = random_bytes(2 << 20);
+    let head = put_head(
+        &env,
+        "/store/raw/vol1/stalled-up",
+        body.len(),
+        &hex_sha256(&body),
+        "",
+    );
+    let mut c = tokio::net::TcpStream::connect(env.base.strip_prefix("http://").unwrap())
+        .await
+        .unwrap();
+    c.write_all(head.as_bytes()).await.unwrap();
+    c.write_all(&body[..1 << 20]).await.unwrap();
+    let t = std::time::Instant::now();
+    let rec = loop {
+        if let Ok(s) = std::fs::read_to_string(env.dir.path().join("raw-stalled-up.txt")) {
+            break s;
+        }
+        assert!(
+            t.elapsed() < Duration::from_secs(90),
+            "upstream request never ended"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    let waited = t.elapsed().as_secs();
+    let got: usize = between(&rec, "--- body ", " of").parse().unwrap();
+    assert!(got < body.len(), "{rec}");
+    assert!((59..80).contains(&waited), "cut off after {waited}s");
+    drop(c);
+}
+
+/// boto3 configured as the README says, through the proxy (put, get, head, multipart upload_file and
+/// download_file, ranged get, list, delete; copy refused). Runs when CREDPROXY_TEST_PYTHON is a python with boto3.
+#[tokio::test(flavor = "multi_thread")]
+async fn boto3_through_the_proxy() {
+    let Ok(python) = std::env::var("CREDPROXY_TEST_PYTHON") else {
+        eprintln!("skipped: set CREDPROXY_TEST_PYTHON to a python with boto3");
+        return;
+    };
+    let env = setup().await;
+    // the proxy unlocks on boto3's first call; the client only has the token
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/boto3_client.py");
+    let scratch = env.dir.path().join("boto");
+    std::fs::create_dir_all(&scratch).unwrap();
+    let out = tokio::process::Command::new(python)
+        .arg("-I")
+        .arg(script)
+        .arg(format!("{}/store/dc-1", env.base))
+        .arg("dc-1")
+        .arg("vol1")
+        .arg(env.token("store"))
+        .arg(&scratch)
+        .output()
+        .await
+        .unwrap();
+    let (so, se) = (
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(
+        out.status.success() && so.trim() == "ok",
+        "stdout:\n{so}\nstderr:\n{se}\nlog:\n{}",
+        env.log()
     );
 }

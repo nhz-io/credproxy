@@ -530,6 +530,27 @@ allow = ["GET /pods", "DELETE /pods/{id}", "GET /catalog/gpus"]
         );
         assert!(s.route("/graphql").unwrap().0.graphql_queries.is_some());
         assert!(s.route("/v2/pods").is_none() && s.route("/pods").is_none());
+        assert!(
+            s.route("/v1/networkvolumes/abc")
+                .unwrap()
+                .0
+                .allow
+                .iter()
+                .any(|r| r.matches("DELETE", "/networkvolumes/abc"))
+        );
+        let s3 = &c.services["runpod-s3"];
+        assert_eq!(s3.sigv4.as_deref(), Some("s3"));
+        assert_eq!(s3.secret, PathBuf::from("runpod/s3-key.age"));
+        for (dc, region) in [("eu-ro-1", "EU-RO-1"), ("us-ks-2", "US-KS-2")] {
+            let (r, rest) = s3.route(&format!("/{dc}/vol/k")).unwrap();
+            assert_eq!(r.upstream, format!("https://s3api-{dc}.runpod.io"));
+            assert_eq!(rest, "/vol/k");
+            let cfg = r.s3.as_ref().unwrap();
+            assert_eq!(cfg.region, region);
+            assert!(cfg.ops.contains(&Op::UploadPart) && !cfg.ops.contains(&Op::ListParts));
+            assert!(!cfg.unsigned_payload);
+        }
+        assert!(s3.route("/eu-ro-2/vol/k").is_none());
     }
 
     #[test]

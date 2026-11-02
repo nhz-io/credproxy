@@ -61,6 +61,19 @@ const S3_CONNECTION_LIFETIME: Duration = proxy::S3_TIMEOUT.saturating_add(CONNEC
 /// How long to keep trying the port when it's busy (e.g. the previous daemon still releasing it).
 const BIND_RETRY: Duration = Duration::from_secs(30);
 
+/// Run a connection until it ends or its lifetime is up: CONNECTION_LIFETIME, or S3_CONNECTION_LIFETIME once
+/// `long` says it carries an S3 call. Dropping the future closes the connection.
+async fn within_lifetime<F: std::future::Future>(conn: F, long: &std::sync::atomic::AtomicBool) {
+    tokio::pin!(conn);
+    if tokio::time::timeout(CONNECTION_LIFETIME, &mut conn)
+        .await
+        .is_err()
+        && long.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        let _ = tokio::time::timeout(S3_CONNECTION_LIFETIME - CONNECTION_LIFETIME, conn).await;
+    }
+}
+
 /// Bind the port, retrying while something else holds it. If it's our own daemon, give up at once.
 async fn bind(cfg: &Config, sock: &Path) -> Result<TcpListener, String> {
     let start = std::time::Instant::now();
@@ -100,7 +113,7 @@ async fn serve(cfg: Config) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
 
     let vault = Arc::new(Vault::new(cfg));
-    let http = proxy::client();
+    let http = proxy::clients();
     let stop = Arc::new(Notify::new());
     let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     let mut full_logged: Option<std::time::Instant> = None;
@@ -158,12 +171,7 @@ async fn serve(cfg: Config) -> Result<(), String> {
                         .header_read_timeout(Duration::from_secs(10))
                         .keep_alive(false)
                         .serve_connection(TokioIo::new(conn), svc);
-                    tokio::pin!(conn);
-                    if tokio::time::timeout(CONNECTION_LIFETIME, &mut conn).await.is_err()
-                        && is_long.load(std::sync::atomic::Ordering::Relaxed)
-                    {
-                        let _ = tokio::time::timeout(S3_CONNECTION_LIFETIME - CONNECTION_LIFETIME, conn).await;
-                    }
+                    within_lifetime(conn, &is_long).await;
                 });
             }
             a = ctl.accept() => {
@@ -230,4 +238,43 @@ async fn control(conn: UnixStream, vault: Arc<Vault>, stop: Arc<Notify>) {
         _ => json!({"ok": false, "error": "bad request"}),
     };
     let _ = w.write_all(format!("{res}\n").as_bytes()).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    async fn lifetime(long: bool, set_after: Option<Duration>) -> Duration {
+        let flag = Arc::new(AtomicBool::new(false));
+        if let Some(d) = set_after {
+            let f = flag.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(d).await;
+                f.store(long, Ordering::Relaxed);
+            });
+        }
+        let start = tokio::time::Instant::now();
+        within_lifetime(std::future::pending::<()>(), &flag).await;
+        start.elapsed()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connections_live_5_minutes_s3_ones_65() {
+        assert_eq!(lifetime(false, None).await, Duration::from_secs(300));
+        // an S3 call is known within the first 5 minutes (it is marked once its route is found)
+        assert_eq!(
+            lifetime(true, Some(Duration::from_secs(1))).await,
+            Duration::from_secs(3900)
+        );
+        assert_eq!(
+            lifetime(false, Some(Duration::from_secs(1))).await,
+            Duration::from_secs(300)
+        );
+        // a connection that ends sooner is not held
+        let flag = AtomicBool::new(true);
+        let start = tokio::time::Instant::now();
+        within_lifetime(tokio::time::sleep(Duration::from_secs(10)), &flag).await;
+        assert_eq!(start.elapsed(), Duration::from_secs(10));
+    }
 }

@@ -33,14 +33,26 @@ const IDLE: Duration = Duration::from_secs(60);
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 pub type Body = BoxBody<Bytes, BoxError>;
 
-pub fn client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(Duration::from_secs(30))
-        .user_agent(USER_AGENT)
-        .no_proxy()
-        .build()
-        .expect("http client")
+/// Upstream HTTP clients: one for key-in-header APIs, one for S3. S3 goes over HTTP/1.1 only, the protocol the
+/// tests exercise (an S3 endpoint behind a CDN would otherwise negotiate HTTP/2).
+#[derive(Clone)]
+pub struct Clients {
+    api: reqwest::Client,
+    s3: reqwest::Client,
+}
+
+pub fn clients() -> Clients {
+    let base = || {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(30))
+            .user_agent(USER_AGENT)
+            .no_proxy()
+    };
+    Clients {
+        api: base().build().expect("http client"),
+        s3: base().http1_only().build().expect("http client"),
+    }
 }
 
 fn full(b: impl Into<Bytes>) -> Body {
@@ -130,7 +142,7 @@ fn host_ok(headers: &hyper::HeaderMap, listen: std::net::SocketAddr) -> bool {
 /// `long` is set once the request turns out to be an S3 call: only those connections may outlive the short limit.
 pub async fn handle(
     vault: Arc<Vault>,
-    http: reqwest::Client,
+    http: Clients,
     req: Request<Incoming>,
     long: Arc<std::sync::atomic::AtomicBool>,
 ) -> Response<Body> {
@@ -196,7 +208,7 @@ pub async fn handle(
 /// Allowlist first, then the key (unlocking if needed): a refused call never raises a Touch ID prompt.
 async fn forward(
     vault: &Arc<Vault>,
-    http: &reqwest::Client,
+    http: &Clients,
     service: &str,
     method: &str,
     rest: &str,
@@ -209,7 +221,7 @@ async fn forward(
     };
     if route.s3.is_some() {
         long.store(true, std::sync::atomic::Ordering::Relaxed);
-        return forward_s3(vault, http, service, method, route, &sub, req).await;
+        return forward_s3(vault, &http.s3, service, method, route, &sub, req).await;
     }
     let (parts, body) = req.into_parts();
     let body = match read_small(body).await {
@@ -258,6 +270,7 @@ async fn forward(
     // Only these client headers go upstream; cookies, auth and anything else are dropped. Replies must come back
     // uncompressed, or the key couldn't be scrubbed from them.
     let mut out = http
+        .api
         .request(m, &url)
         .timeout(UPSTREAM_TIMEOUT)
         .header(svc.auth_header.as_str(), auth_value)
@@ -418,6 +431,13 @@ async fn forward_s3(
             &format!("header {} not allowed", h.as_str()),
         );
     }
+    // every check is made before the key: a refused call must never raise a Touch ID prompt
+    if let Some(n) = S3_REQUEST_HEADERS
+        .iter()
+        .find(|n| parts.headers.get_all(**n).iter().count() > 1)
+    {
+        return reply(StatusCode::BAD_REQUEST, &format!("header {n} given twice"));
+    }
     if parts.headers.get_all("content-encoding").iter().any(|v| {
         v.as_bytes()
             .to_ascii_lowercase()
@@ -523,12 +543,6 @@ async fn forward_s3(
         .filter(|n| **n != "x-amz-content-sha256")
         .filter_map(|n| Some((*n, parts.headers.get(*n)?.to_str().ok()?)))
         .collect();
-    if let Some(n) = S3_REQUEST_HEADERS
-        .iter()
-        .find(|n| parts.headers.get_all(**n).iter().count() > 1)
-    {
-        return reply(StatusCode::BAD_REQUEST, &format!("header {n} given twice"));
-    }
     let hash = match &payload {
         Payload::Small(_, h) | Payload::Stream(_, _, h) => h.as_str(),
     };
@@ -578,7 +592,16 @@ async fn forward_s3(
         Err(e) => return upstream_failed(&e),
     };
     if !res.status().is_success() {
-        return buffered_reply(res, &[access_key.as_bytes(), secret.as_bytes()]).await;
+        // 304 and 412 need the validators, 416 the object size; a redirect's Location is not passed on
+        let keep: Vec<_> = ["etag", "last-modified", "content-range"]
+            .iter()
+            .filter_map(|n| Some((*n, res.headers().get(*n)?.clone())))
+            .collect();
+        let mut r = buffered_reply(res, &[access_key.as_bytes(), secret.as_bytes()]).await;
+        for (n, v) in keep {
+            r.headers_mut().insert(n, v);
+        }
+        return r;
     }
     // S3 may answer CompleteMultipartUpload with 200 and an <Error> body (the failure shows up after the headers
     // went out). A client checking only the status would think the object exists: make it a 502.
@@ -621,6 +644,50 @@ async fn forward_s3(
 #[cfg(test)]
 mod tests {
     use super::scrub;
+    use futures_util::StreamExt;
+    use std::time::Duration;
+
+    /// Items at the given gaps (seconds), then silence.
+    fn gaps(
+        gaps: &'static [u64],
+    ) -> impl futures_util::Stream<Item = Result<u32, std::io::Error>> + Send {
+        futures_util::stream::unfold(0usize, move |i| async move {
+            if i < gaps.len() {
+                tokio::time::sleep(Duration::from_secs(gaps[i])).await;
+                Some((Ok(i as u32), i + 1))
+            } else {
+                std::future::pending::<()>().await;
+                None
+            }
+        })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_passes_slow_but_moving_streams() {
+        let s = super::idle(gaps(&[59, 59, 59, 59])).take(4);
+        let got: Vec<_> = s.map(|r| r.unwrap()).collect().await;
+        assert_eq!(got, [0, 1, 2, 3]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_cuts_off_a_stalled_stream() {
+        let start = tokio::time::Instant::now();
+        let mut s = Box::pin(super::idle(gaps(&[1, 5])));
+        assert_eq!(s.next().await.unwrap().unwrap(), 0);
+        assert_eq!(s.next().await.unwrap().unwrap(), 1);
+        let e = s.next().await.unwrap().unwrap_err();
+        assert_eq!(e.to_string(), "idle timeout");
+        assert_eq!(start.elapsed(), Duration::from_secs(66));
+        assert!(s.next().await.is_none(), "nothing after the error");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_ends_after_an_upstream_error() {
+        let s = futures_util::stream::iter([Ok(1u32), Err(std::io::Error::other("broken")), Ok(2)]);
+        let got: Vec<_> = super::idle(s).collect().await;
+        assert_eq!(got.len(), 2);
+        assert!(got[1].is_err());
+    }
 
     #[test]
     fn host_must_be_the_proxy() {

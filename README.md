@@ -97,9 +97,12 @@ signature and body hash, plus a scripted upstream for faults. They check that by
 around the 1 MiB and part boundaries, random data, parallel multipart parts, ranges across part boundaries, what the
 upstream itself receives), that failures are errors and never short files (truncated or stalled downloads, a client
 hanging up mid-upload), Expect: 100-continue, and 60 random keys with awkward characters through PUT, GET and a
-paginated listing. Signing is also checked against AWS's published examples. `cargo test --release --test s3 -- --ignored --nocapture` also runs the slow ones: 600 MB up and
-down with the daemon's memory printed (7 MiB idle, 11–12 MiB peak on an M-series Mac), and a stalled download
-cut off after 60 s.
+paginated listing. Signing is also checked against AWS's published examples. Also covered: refused calls never
+unlock, lock or stop during an upload (finishes intact / never completes), 304/416/404/307 replies, more parallel
+parts than the connection limit, the log never showing queries, and (simulated time) the idle cut-off and connection
+lifetimes. `CREDPROXY_TEST_PYTHON=<python with boto3> cargo test` adds a real boto3 run through the proxy. `cargo test --release --test s3 -- --ignored --nocapture` also runs the slow ones: 600 MB up and
+down with the daemon's memory printed (7 MiB idle, 11–12 MiB peak on an M-series Mac), a slow reader (memory stays flat), and a stalled
+download and upload each cut off after 60 s.
 
 ## Config
 
@@ -143,12 +146,29 @@ s3 = { region = "EU-RO-1", ops = ["GetObject", "HeadObject", "PutObject", "Delet
 
 Cloudflare R2: `upstream = "https://<account id>.r2.cloudflarestorage.com"`, `region = "auto"`.
 
-Clients send `Authorization: Bearer <token>` instead of signing, so stock SDK defaults need adjusting. boto3:
-`Config(signature_version=botocore.UNSIGNED, request_checksum_calculation="when_required",
-response_checksum_validation="when_required", s3={"addressing_style": "path"})`, plus an event hook that adds the
-Bearer header and the body's `x-amz-content-sha256`. Without those, boto3 and the AWS CLI send checksum headers or
-aws-chunked bodies, which credproxy refuses (403/400). SDKs that add `?x-id=…` to the query (AWS JS v3, Rust) are
-refused too. Plain HTTP clients (curl, requests) work as is.
+Clients send `Authorization: Bearer <token>` instead of signing, so stock SDK defaults need adjusting. boto3
+(tested: [tests/boto3_client.py](tests/boto3_client.py), incl. multipart `upload_file`/`download_file`):
+
+```python
+def credproxy_auth(request, **_):                  # the token instead of a signature, plus the body's SHA-256
+    body = request.body or b""
+    if hasattr(body, "read"):
+        pos = body.tell(); data = body.read(); body.seek(pos)
+    else:
+        data = body.encode() if isinstance(body, str) else bytes(body)
+    request.headers["x-amz-content-sha256"] = hashlib.sha256(data).hexdigest()
+    request.headers["Authorization"] = f"Bearer {token}"
+
+s3 = boto3.client("s3", endpoint_url="http://127.0.0.1:7777/runpod-s3/eu-ro-1", region_name="EU-RO-1",
+                  config=Config(signature_version=botocore.UNSIGNED, s3={"addressing_style": "path"},
+                                request_checksum_calculation="when_required",
+                                response_checksum_validation="when_required"))
+s3.meta.events.register("request-created.s3", credproxy_auth)
+```
+
+Without those settings boto3 and the AWS CLI send checksum headers or aws-chunked bodies, which credproxy refuses
+(403/400). SDKs that add `?x-id=…` to the query (AWS JS v3, Rust) are refused too. Plain HTTP clients (curl,
+requests) work as is.
 
 Seal two lines without the clipboard (zsh; the secret isn't echoed):
 
