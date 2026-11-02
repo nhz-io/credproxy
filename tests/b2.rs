@@ -767,10 +767,18 @@ async fn lock_stops_an_authorize_in_flight() {
     });
     // the first try is answered (503) at ~0.5 s; the second would go out at ~1.5 s
     tokio::time::sleep(Duration::from_millis(1000)).await;
+    let status = env.status();
+    assert!(
+        status.contains("b2: unlocking (Touch ID done; authorizing with B2)"),
+        "{status}"
+    );
     assert!(env.cli(&["lock", "b2"]).status.success());
     let (code, body) = call.await.unwrap();
     assert_eq!(code, 503);
-    assert!(body.contains("locked while unlocking"), "{body}");
+    assert!(
+        body.contains("locked while unlocking (authorizing with B2)"),
+        "{body}"
+    );
     let tries = env.st(|s| s.authorize_tries);
     tokio::time::sleep(Duration::from_millis(3000)).await;
     assert_eq!(

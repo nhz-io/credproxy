@@ -322,6 +322,9 @@ fn main() {
                         "unlocking" => {
                             println!("  {name}: unlocking (waiting for Touch ID / password)")
                         }
+                        "authorizing" => {
+                            println!("  {name}: unlocking (Touch ID done; authorizing with B2)")
+                        }
                         "paused" => println!(
                             "  {name}: locked (no new prompt for {}s after a refused or failed unlock, see the log; `credproxy unlock {name}` to retry now)",
                             s["locks_in_secs"].as_u64().unwrap_or(0)

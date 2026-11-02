@@ -70,6 +70,8 @@ struct Pending {
     pgid: Option<libc::pid_t>,
     done: Arc<watch::Sender<Outcome>>,
     task: Option<tokio::task::AbortHandle>,
+    /// B2: the key is decrypted (Touch ID is done) and the authorize call is running
+    authorizing: bool,
 }
 
 #[derive(Default)]
@@ -283,6 +285,7 @@ impl Vault {
                             pgid: None,
                             done,
                             task: Some(task.abort_handle()),
+                            authorizing: false,
                         });
                         rx
                     }
@@ -308,12 +311,24 @@ impl Vault {
         let res = match self.decrypt(&service, id).await {
             Ok(key) => match &self.cfg.services[&service].b2 {
                 // the key is dropped (zeroed) as soon as the authorize call is done, whatever its outcome
-                Some(b) => crate::b2::authorize(&self.http, b, key).await.map(|s| {
-                    (
-                        Secret::B2(Arc::new(s)),
-                        Some(SystemTime::now() + b.relock_after),
-                    )
-                }),
+                Some(b) => {
+                    if let Some(p) = self
+                        .slots
+                        .lock()
+                        .unwrap()
+                        .get_mut(&service)
+                        .and_then(|s| s.pending.as_mut())
+                        .filter(|p| p.id == id)
+                    {
+                        p.authorizing = true;
+                    }
+                    crate::b2::authorize(&self.http, b, key).await.map(|s| {
+                        (
+                            Secret::B2(Arc::new(s)),
+                            Some(SystemTime::now() + b.relock_after),
+                        )
+                    })
+                }
                 None => Ok((Secret::Key(key), None)),
             },
             Err(e) => Err(e),
@@ -446,7 +461,9 @@ impl Vault {
                 // same as pressing Cancel: requests don't raise a new prompt for UNLOCK_BACKOFF
                 s.failed_at = Some(Instant::now());
                 // age runs only while the prompt may be up; after it, a B2 unlock is authorizing
-                let msg = if p.pgid.is_some() {
+                let msg = if p.authorizing {
+                    "locked while unlocking (authorizing with B2)"
+                } else if p.pgid.is_some() {
                     "locked while waiting for Touch ID"
                 } else {
                     "locked while unlocking"
@@ -476,7 +493,8 @@ impl Vault {
         locked
     }
 
-    /// (service, state, seconds): "unlocked" (seconds until idle lock), "unlocking", "paused" (locked after a
+    /// (service, state, seconds): "unlocked" (seconds until idle lock), "unlocking", "authorizing" (B2: Touch ID done,
+    /// the authorize call running), "paused" (locked after a
     /// refused or failed unlock: seconds until requests may prompt again), or "locked".
     pub fn status(&self) -> Vec<(String, &'static str, u64)> {
         let slots = self.slots.lock().unwrap();
@@ -500,8 +518,13 @@ impl Vault {
                         };
                         (name.clone(), "unlocked", left.as_secs())
                     }
-                    None if slots.get(name).is_some_and(|s| s.pending.is_some()) => {
-                        (name.clone(), "unlocking", 0)
+                    None if let Some(p) = slots.get(name).and_then(|s| s.pending.as_ref()) => {
+                        let state = if p.authorizing {
+                            "authorizing"
+                        } else {
+                            "unlocking"
+                        };
+                        (name.clone(), state, 0)
                     }
                     None => match slots
                         .get(name)
