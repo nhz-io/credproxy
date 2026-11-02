@@ -78,7 +78,7 @@ fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
 /// its head, then how many body bytes arrived out of Content-Length and their SHA-256. The last path segment picks
 /// the reply: `truncate-cl` (says 1000 bytes, sends 500, closes), `truncate-chunked` (one chunk, then closes
 /// without the final one), `chunked-ok`, `stall` (10 of 1000 bytes, then nothing for 90 s), `error-echo` (403
-/// quoting the access key id), `complete-error` (200 with an <Error> body), `complete-ok`, `not-modified` (304), `redirect` (307), `no-read` (never reads the body or replies), `slow-reply` (replies after 10 s), `pause-reply` (after 2.5 s), anything else 200
+/// quoting the access key id), `complete-error` (200 with an <Error> body), `complete-ok`, `not-modified` (304), `redirect` (307), `no-read` (never reads the body or replies), `slow-reply` (replies after 10 s), `pause-reply` (after 2.5 s), `complete-trickle` (keep-alive spaces, then the result), anything else 200
 /// with no body.
 async fn raw_server(dir: PathBuf) -> u16 {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -157,6 +157,17 @@ async fn raw_server(dir: PathBuf) -> u16 {
                     "pause-reply" => {
                         tokio::time::sleep(Duration::from_millis(2500)).await;
                         b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_vec()
+                    }
+                    "complete-trickle" => {
+                        // headers at once, then a keep-alive space every 0.5 s for 2.5 s (past s3_idle), then the result
+                        let _ = c
+                            .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: application/xml\r\nconnection: close\r\n\r\n")
+                            .await;
+                        for _ in 0..5 {
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                            let _ = c.write_all(b" ").await;
+                        }
+                        b"<CompleteMultipartUploadResult><ETag>\"t-2\"</ETag></CompleteMultipartUploadResult>".to_vec()
                     }
                     "slow-reply" => {
                         tokio::time::sleep(Duration::from_secs(10)).await;
@@ -1877,9 +1888,58 @@ async fn upstream_that_stops_reading_is_cut_off() {
     );
 }
 
-/// An upstream silent for longer than s3_reply_wait after the request (3 s here) gets a 504, not a hang.
+/// An upstream silent for too long after the request gets a 504 saying the outcome is unknown, not a hang: after
+/// s3_idle (2 s here) for a read, after s3_reply_wait (3 s) for an upload or a completion.
 #[tokio::test(flavor = "multi_thread")]
 async fn upstream_too_slow_to_reply_is_a_504() {
+    let env = setup().await;
+    for (method, path, body, min, max) in [
+        ("GET", "/store/raw/vol1/slow-reply", vec![], 2, 3),
+        (
+            "POST",
+            "/store/raw/vol1/slow-reply?uploadId=u1",
+            b"<CompleteMultipartUpload/>".to_vec(),
+            3,
+            6,
+        ),
+    ] {
+        let t = std::time::Instant::now();
+        let r = call(&env, method, path, body, false, &[]).await;
+        let waited = t.elapsed().as_secs();
+        assert_eq!(r.status, 504, "{method} {path}: {}", r.text());
+        assert!(r.text().contains("outcome is unknown"), "{}", r.text());
+        assert!(
+            (min..max).contains(&waited),
+            "{method} {path}: 504 after {waited}s"
+        );
+    }
+}
+
+/// A CompleteMultipartUpload reply that trickles in (headers, keep-alive spaces past s3_idle, then the result) is
+/// the upstream working, not a stall.
+#[tokio::test(flavor = "multi_thread")]
+async fn trickling_complete_reply_is_not_cut() {
+    let env = setup().await;
+    let r = call(
+        &env,
+        "POST",
+        "/store/raw/vol1/complete-trickle?uploadId=u1",
+        b"<CompleteMultipartUpload/>".to_vec(),
+        false,
+        &[],
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    assert!(
+        r.text().contains("<CompleteMultipartUploadResult>"),
+        "{}",
+        r.text()
+    );
+}
+
+/// A streamed upload whose upstream stays silent past s3_reply_wait gets a 504 (the outcome is unknown).
+#[tokio::test(flavor = "multi_thread")]
+async fn upload_with_no_reply_is_a_504() {
     let env = setup().await;
     let t = std::time::Instant::now();
     let r = call(

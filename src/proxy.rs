@@ -37,8 +37,7 @@ pub struct Progress {
 }
 
 struct ProgressState {
-    s3: bool,
-    /// "service METHOD path" of the S3 call, for the log line if the watchdog cuts it
+    /// Some("service METHOD path") once the connection carries an allowed S3 call (named in the log if cut)
     label: Option<String>,
     last: tokio::time::Instant,
     quiet_until: Option<tokio::time::Instant>,
@@ -48,7 +47,6 @@ impl Default for Progress {
     fn default() -> Self {
         Progress {
             state: std::sync::Mutex::new(ProgressState {
-                s3: false,
                 label: None,
                 last: tokio::time::Instant::now(),
                 quiet_until: None,
@@ -59,12 +57,11 @@ impl Default for Progress {
 
 impl Progress {
     pub fn is_s3(&self) -> bool {
-        self.state.lock().unwrap().s3
+        self.state.lock().unwrap().label.is_some()
     }
 
     pub(crate) fn mark_s3(&self, label: String) {
         let mut s = self.state.lock().unwrap();
-        s.s3 = true;
         s.label = Some(label);
         s.last = tokio::time::Instant::now();
     }
@@ -334,7 +331,7 @@ async fn forward(
         Ok(r) => r,
         Err(e) => return upstream_failed(&e),
     };
-    buffered_reply(res, &[key.as_bytes()]).await
+    buffered_reply(res, &[key.as_bytes()], None).await
 }
 
 /// A small client body (≤ MAX_REQUEST), read within `limit`.
@@ -367,6 +364,7 @@ fn upstream_failed(e: &reqwest::Error) -> Response<Body> {
 async fn read_reply(
     mut res: reqwest::Response,
     secrets: &[&[u8]],
+    progress: Option<&Progress>,
 ) -> Result<(StatusCode, Option<hyper::header::HeaderValue>, Vec<u8>), Response<Body>> {
     let status = StatusCode::from_u16(res.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     if res
@@ -384,6 +382,9 @@ async fn read_reply(
     loop {
         match res.chunk().await {
             Ok(Some(c)) => {
+                if let Some(p) = progress {
+                    p.touch();
+                }
                 if buf.len() + c.len() > MAX_RESPONSE {
                     return Err(reply(
                         StatusCode::BAD_GATEWAY,
@@ -416,8 +417,12 @@ fn reply_with(
     b.body(full(body)).unwrap()
 }
 
-async fn buffered_reply(res: reqwest::Response, secrets: &[&[u8]]) -> Response<Body> {
-    match read_reply(res, secrets).await {
+async fn buffered_reply(
+    res: reqwest::Response,
+    secrets: &[&[u8]],
+    progress: Option<&Progress>,
+) -> Response<Body> {
+    match read_reply(res, secrets, progress).await {
         Ok((status, ctype, body)) => reply_with(status, ctype, body),
         Err(r) => r,
     }
@@ -641,8 +646,14 @@ async fn forward_s3(
         v.set_sensitive(n.eq_ignore_ascii_case("authorization"));
         out = out.header(n.as_str(), v);
     }
-    // Once the whole request is out, the upstream may be silent for up to s3_reply_wait before replying.
-    let (idle_limit, reply_limit) = (vault.cfg.s3_idle, vault.cfg.s3_reply_wait);
+    // Once the whole request is out, the upstream may be silent before replying: up to s3_reply_wait where it
+    // has real work to do (storing an upload, assembling a multipart upload), s3_idle otherwise.
+    let idle_limit = vault.cfg.s3_idle;
+    let reply_limit = if target.op.streams_body() || target.op == s3::Op::CompleteMultipartUpload {
+        vault.cfg.s3_reply_wait
+    } else {
+        idle_limit
+    };
     let (sent_tx, sent_rx) = tokio::sync::oneshot::channel::<()>();
     // called once the last request byte has been handed on: from then on silence is the upstream working
     let mut on_sent = {
@@ -700,8 +711,8 @@ async fn forward_s3(
         _ = no_reply => {
             return reply(
                 StatusCode::GATEWAY_TIMEOUT,
-                "upstream sent no reply within s3_reply_wait of the request: the outcome is unknown (it may still \
-                 complete); check the object (HEAD, ListParts) before retrying",
+                "upstream sent no reply in time (s3_idle, or s3_reply_wait for uploads and completions): the \
+                 outcome is unknown (it may still complete); check the object (HEAD, ListParts) before retrying",
             );
         }
     };
@@ -712,7 +723,12 @@ async fn forward_s3(
             .iter()
             .filter_map(|n| Some((*n, res.headers().get(*n)?.clone())))
             .collect();
-        let mut r = buffered_reply(res, &[access_key.as_bytes(), secret.as_bytes()]).await;
+        let mut r = buffered_reply(
+            res,
+            &[access_key.as_bytes(), secret.as_bytes()],
+            Some(progress),
+        )
+        .await;
         for (n, v) in keep {
             r.headers_mut().insert(n, v);
         }
@@ -721,11 +737,24 @@ async fn forward_s3(
     // S3 may answer CompleteMultipartUpload with 200 and an <Error> body (the failure shows up after the headers
     // went out). A client checking only the status would think the object exists: make it a 502.
     if target.op == s3::Op::CompleteMultipartUpload {
-        let (status, ctype, body) =
-            match read_reply(res, &[access_key.as_bytes(), secret.as_bytes()]).await {
-                Ok(r) => r,
-                Err(r) => return r,
-            };
+        // The whole reply counts as the upstream's work: S3 may send the headers at once, then keep-alive spaces
+        // (or nothing) while it assembles the parts, then the result. Silence is expected throughout, up to
+        // s3_reply_wait.
+        progress.quiet_for(reply_limit + idle_limit);
+        let secrets = [access_key.as_bytes(), secret.as_bytes()];
+        let read = read_reply(res, &secrets, None);
+        let (status, ctype, body) = match tokio::time::timeout(reply_limit, read).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(r)) => return r,
+            Err(_) => {
+                return reply(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "upstream did not finish CompleteMultipartUpload within s3_reply_wait: the outcome is \
+                     unknown (it may still complete); check the object (HEAD, ListParts) before retrying",
+                );
+            }
+        };
+        progress.touch();
         let failed = body.windows(7).any(|w| w == b"<Error>");
         let status = if failed {
             StatusCode::BAD_GATEWAY
