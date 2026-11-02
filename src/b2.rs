@@ -16,6 +16,7 @@ use hyper::body::Incoming;
 use hyper::{Request, Response, StatusCode};
 use serde_json::Value;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use zeroize::Zeroizing;
 
@@ -264,35 +265,34 @@ async fn buffered(
         Ok(b) => b,
         Err(r) => return r,
     };
+    let code = serde_json::from_slice::<Value>(&b.body)
+        .ok()
+        .and_then(|v| v["code"].as_str().map(str::to_string));
     if b.status != StatusCode::UNAUTHORIZED {
-        session
-            .worked
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        // the token got past B2's check: a success, or B2's own error about the call (a front end's 5xx didn't
+        // look at it)
+        if b.status.is_success() || code.is_some() {
+            session.worked.store(true, Ordering::Relaxed);
+        }
+        return b.into_response();
     }
-    if b.status == StatusCode::UNAUTHORIZED {
-        let code = serde_json::from_slice::<Value>(&b.body)
-            .ok()
-            .and_then(|v| v["code"].as_str().map(str::to_string));
-        let ended = match code.as_deref() {
-            Some("expired_auth_token" | "bad_auth_token") => true,
-            Some(_) => false,
-            None => session.worked.load(std::sync::atomic::Ordering::Relaxed),
-        };
-        if code.is_none() && !ended {
+    match code.as_deref() {
+        Some("expired_auth_token" | "bad_auth_token") => {}
+        None if session.worked.load(Ordering::Relaxed) => {}
+        None => {
             return reply(
                 StatusCode::BAD_GATEWAY,
                 "B2 answered 401 without saying why, to a token that hasn't worked yet: not taken as its end",
             );
         }
-        if ended {
-            vault.expire(service, session);
-            return reply(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "B2 token expired or revoked, so the service is locked: retry (the retry unlocks: Touch ID)",
-            );
-        }
+        // e.g. `unauthorized`: the token is good but may not do this
+        Some(_) => return b.into_response(),
     }
-    b.into_response()
+    vault.expire(service, session);
+    reply(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "B2 token expired or revoked, so the service is locked: retry (the retry unlocks: Touch ID)",
+    )
 }
 
 /// Allowlist first, then the session (unlocking if needed): a refused call never raises a Touch ID prompt.
@@ -483,9 +483,7 @@ async fn download(
         }
         return r;
     }
-    session
-        .worked
-        .store(true, std::sync::atomic::Ordering::Relaxed);
+    session.worked.store(true, Ordering::Relaxed);
     // a header holding the token is dropped (B2 never sends one; the body can't be checked, it streams)
     let token = session.token.as_bytes();
     let keep: Vec<_> = res

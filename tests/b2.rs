@@ -31,6 +31,8 @@ struct B2State {
     other_401: Option<Option<&'static str>>,
     /// answer this many authorize calls with 503 first
     authorize_fail: usize,
+    /// answer this many API calls with a front end's 503 (no B2 JSON) first
+    call_fail: usize,
     /// authorize calls received, failed ones included
     authorize_tries: usize,
     /// wait before answering an authorize call
@@ -117,6 +119,13 @@ async fn fake_b2(state: Arc<Mutex<B2State>>) -> u16 {
                                 401,
                                 json!({"status": 401, "code": "expired_auth_token", "message": "expired"}),
                             ));
+                        }
+                        if s.call_fail > 0 {
+                            s.call_fail -= 1;
+                            return Ok(hyper::Response::builder()
+                                .status(503)
+                                .body(Full::new(Bytes::from("<html>busy</html>")))
+                                .unwrap());
                         }
                         match s.other_401 {
                             Some(None) => {
@@ -727,7 +736,24 @@ async fn lock_stops_an_authorize_in_flight() {
         tries,
         "no try after the lock"
     );
-    assert_eq!(tries, 1);
+    // (0 if the lock came while the first try was still in the fake's delay)
+    assert!(tries <= 1, "{tries}");
     assert!(env.status().contains("b2: locked"));
     assert!(!env.log().contains("b2 unlocked"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_front_end_5xx_doesnt_count_as_the_token_working() {
+    let env = setup("23h").await;
+    // the first call meets a front end's 503, the next a codeless 401: the token never got past B2's check
+    env.st(|s| {
+        s.call_fail = 1;
+        s.other_401 = Some(None);
+    });
+    assert_eq!(env.call("b2_list_buckets", "{}").await.0, 503);
+    assert!(env.status().contains("b2: unlocked"));
+    let (code, body) = env.call("b2_list_buckets", "{}").await;
+    assert_eq!(code, 502, "{body}");
+    assert!(env.status().contains("b2: unlocked"));
+    assert_eq!(env.st(|s| s.authorizes), 1);
 }

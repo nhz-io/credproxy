@@ -45,6 +45,18 @@ impl Unlocked {
     fn expired(&self) -> bool {
         self.expires.is_some_and(|e| SystemTime::now() >= e)
     }
+
+    /// Why this must lock now, if it must: checked at every use and by the sweep (whose timer, like any monotonic
+    /// one, doesn't run while the Mac sleeps).
+    fn stale(&self, idle_lock: Duration) -> Option<&'static str> {
+        if self.expired() {
+            Some("B2 token expired")
+        } else if self.idle_for() >= idle_lock {
+            Some("idle")
+        } else {
+            None
+        }
+    }
 }
 
 /// Outcome of one unlock job, shared by every request waiting for it.
@@ -221,12 +233,13 @@ impl Vault {
             let mut done = {
                 let mut slots = self.slots.lock().unwrap();
                 let slot = slots.entry(service.to_string()).or_default();
-                if slot.unlocked.as_ref().is_some_and(Unlocked::expired) {
+                if let Some(why) = slot
+                    .unlocked
+                    .as_ref()
+                    .and_then(|u| u.stale(self.cfg.idle_lock))
+                {
                     slot.unlocked = None;
-                    log::line(
-                        &self.cfg.log,
-                        &format!("{service} locked (B2 token expired)"),
-                    );
+                    log::line(&self.cfg.log, &format!("{service} locked ({why})"));
                 }
                 if let Some(u) = slot.unlocked.as_mut() {
                     u.last_used = SystemTime::now();
@@ -440,10 +453,8 @@ impl Vault {
         let mut slots = self.slots.lock().unwrap();
         let mut locked = Vec::new();
         for (name, s) in slots.iter_mut() {
-            let why = match &s.unlocked {
-                Some(u) if u.expired() => "B2 token expired",
-                Some(u) if u.idle_for() >= idle => "idle",
-                _ => continue,
+            let Some(why) = s.unlocked.as_ref().and_then(|u| u.stale(idle)) else {
+                continue;
             };
             s.unlocked = None;
             locked.push((name.clone(), why));
@@ -463,7 +474,7 @@ impl Vault {
                 |name| match slots
                     .get(name)
                     .and_then(|s| s.unlocked.as_ref())
-                    .filter(|u| !u.expired())
+                    .filter(|u| u.stale(self.cfg.idle_lock).is_none())
                 {
                     Some(u) => {
                         let idle = self.cfg.idle_lock.saturating_sub(u.idle_for());
@@ -566,8 +577,26 @@ allow = ["GET /x"]
                 SystemTime::now() - Duration::from_secs(3600),
             ));
         }
-        // an expired B2 session shows as locked before the sweep
-        assert!(v.status().contains(&("b2".to_string(), "locked", 0)));
+        // expired and idle sessions show as locked before the sweep, and are dropped at use (stale)
+        let st = v.status();
+        assert!(st.contains(&("b2".to_string(), "locked", 0)), "{st:?}");
+        assert!(st.contains(&("k".to_string(), "locked", 0)), "{st:?}");
+        {
+            let slots = v.slots.lock().unwrap();
+            let why = |n: &str| {
+                slots[n]
+                    .unlocked
+                    .as_ref()
+                    .unwrap()
+                    .stale(Duration::from_secs(3600))
+            };
+            assert_eq!(
+                (why("b2"), why("k")),
+                (Some("B2 token expired"), Some("idle"))
+            );
+            let fresh = unlocked(None, SystemTime::now());
+            assert_eq!(fresh.stale(Duration::from_secs(3600)), None);
+        }
         let mut swept = v.sweep();
         swept.sort();
         assert_eq!(
