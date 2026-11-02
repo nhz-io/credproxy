@@ -78,7 +78,7 @@ fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
 /// its head, then how many body bytes arrived out of Content-Length and their SHA-256. The last path segment picks
 /// the reply: `truncate-cl` (says 1000 bytes, sends 500, closes), `truncate-chunked` (one chunk, then closes
 /// without the final one), `chunked-ok`, `stall` (10 of 1000 bytes, then nothing for 90 s), `error-echo` (403
-/// quoting the access key id), `complete-error` (200 with an <Error> body), `complete-ok`, `not-modified` (304), `redirect` (307), `no-read` (never reads the body or replies), `slow-reply` (replies after 10 s), `pause-reply` (after 2.5 s), `complete-trickle` (keep-alive spaces, then the result), anything else 200
+/// quoting the access key id), `complete-error` (200 with an <Error> body), `complete-ok`, `not-modified` (304), `redirect` (307), `no-read` (never reads the body or replies), `slow-reply` (replies after 10 s), `pause-reply` (after 2.5 s), `complete-trickle` (keep-alive spaces, then the result), `complete-late` (headers late, then spaces: 4 s in all), anything else 200
 /// with no body.
 async fn raw_server(dir: PathBuf) -> u16 {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -157,6 +157,18 @@ async fn raw_server(dir: PathBuf) -> u16 {
                     "pause-reply" => {
                         tokio::time::sleep(Duration::from_millis(2500)).await;
                         b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_vec()
+                    }
+                    "complete-late" => {
+                        // headers after 2 s, then keep-alive spaces for 2 s more: 4 s in all, past s3_reply_wait (3 s)
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        let _ = c
+                            .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: application/xml\r\nconnection: close\r\n\r\n")
+                            .await;
+                        for _ in 0..4 {
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                            let _ = c.write_all(b" ").await;
+                        }
+                        b"<CompleteMultipartUploadResult><ETag>\"t-2\"</ETag></CompleteMultipartUploadResult>".to_vec()
                     }
                     "complete-trickle" => {
                         // headers at once, then a keep-alive space every 0.5 s for 2.5 s (past s3_idle), then the result
@@ -1935,6 +1947,27 @@ async fn trickling_complete_reply_is_not_cut() {
         "{}",
         r.text()
     );
+}
+
+/// s3_reply_wait (3 s here) bounds the whole completion reply, counted from the request: late headers don't buy
+/// the body another full wait.
+#[tokio::test(flavor = "multi_thread")]
+async fn completion_reply_is_bounded_from_the_request() {
+    let env = setup().await;
+    let t = std::time::Instant::now();
+    let r = call(
+        &env,
+        "POST",
+        "/store/raw/vol1/complete-late?uploadId=u1",
+        b"<CompleteMultipartUpload/>".to_vec(),
+        false,
+        &[],
+    )
+    .await;
+    let waited = t.elapsed().as_millis();
+    assert_eq!(r.status, 504, "{}", r.text());
+    assert!(r.text().contains("outcome is unknown"));
+    assert!((2900..3900).contains(&waited), "504 after {waited} ms");
 }
 
 /// A streamed upload whose upstream stays silent past s3_reply_wait gets a 504 (the outcome is unknown).

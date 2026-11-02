@@ -666,6 +666,9 @@ async fn forward_s3(
             }
         }
     };
+    // when a small request (e.g. CompleteMultipartUpload) went out: its reply, body included, must be done
+    // within reply_limit of this
+    let sent_at = tokio::time::Instant::now();
     if !matches!(payload, Payload::Stream(..)) {
         on_sent();
     }
@@ -740,10 +743,11 @@ async fn forward_s3(
         // The whole reply counts as the upstream's work: S3 may send the headers at once, then keep-alive spaces
         // (or nothing) while it assembles the parts, then the result. Silence is expected throughout, up to
         // s3_reply_wait.
-        progress.quiet_for(reply_limit + idle_limit);
+        let left = reply_limit.saturating_sub(sent_at.elapsed());
+        progress.quiet_for(left + idle_limit);
         let secrets = [access_key.as_bytes(), secret.as_bytes()];
         let read = read_reply(res, &secrets, None);
-        let (status, ctype, body) = match tokio::time::timeout(reply_limit, read).await {
+        let (status, ctype, body) = match tokio::time::timeout(left, read).await {
             Ok(Ok(r)) => r,
             Ok(Err(r)) => return r,
             Err(_) => {

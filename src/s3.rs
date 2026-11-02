@@ -204,7 +204,8 @@ pub fn classify(
     let none = params.is_empty();
 
     let op = match (method, key.is_some()) {
-        ("HEAD", false) if none => Op::HeadBucket,
+        // with key_prefixes, which buckets exist is none of the client's business either
+        ("HEAD", false) if none && prefixes.is_empty() => Op::HeadBucket,
         ("GET", false)
             if shape(
                 &["list-type"],
@@ -477,6 +478,8 @@ mod tests {
         assert!(classify("GET", "/vol", Some("list-type=2&prefix=runs/a"), &p).is_ok());
         assert!(classify("GET", "/vol", Some("list-type=2&prefix=.."), &[]).is_err());
         assert!(classify("GET", "/vol", Some("list-type=2&prefix="), &[]).is_ok());
+        assert!(classify("HEAD", "/vol", None, &p).is_err());
+        assert!(classify("HEAD", "/vol", None, &[]).is_ok());
     }
 
     #[test]

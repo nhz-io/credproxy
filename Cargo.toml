@@ -14,7 +14,6 @@ aws-credential-types = "1"
 aws-sigv4 = { version = "1.6.4", default-features = false, features = ["sign-http", "http1"] }
 aws-smithy-runtime-api = "1"
 bytes = "1.12.1"
-form_urlencoded = "1.2.2"
 futures-util = { version = "0.3.34", default-features = false }
 getrandom = "0.4.3"
 graphql-parser = "0.4.1"
