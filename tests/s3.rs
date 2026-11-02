@@ -235,8 +235,8 @@ async fn setup() -> Env {
     let s3 = s3_server(d.join("store"), secret.clone()).await;
     let listen = free_port();
     let raw = raw_server(d.to_path_buf()).await;
-    // nothing listens here: an upstream that is down
-    let down = free_port();
+    // an upstream that is down: port 1 (tcpmux) never listens, and no test can take it
+    let down = 1;
 
     let public = age_identity(d);
     seal(
