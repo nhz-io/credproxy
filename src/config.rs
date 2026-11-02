@@ -397,9 +397,9 @@ fn bounded(s: &str, what: &str, max: Duration) -> Result<Duration, String> {
     if d > max {
         // in the largest unit that states it exactly, as the config would write it
         let secs = max.as_secs();
-        let limit = if secs % 3600 == 0 {
+        let limit = if secs.is_multiple_of(3600) {
             format!("{}h", secs / 3600)
-        } else if secs % 60 == 0 {
+        } else if secs.is_multiple_of(60) {
             format!("{}m", secs / 60)
         } else {
             format!("{secs}s")
