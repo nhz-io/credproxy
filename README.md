@@ -46,11 +46,11 @@ curl -H "Authorization: Bearer $(credproxy token runpod-s3)" http://127.0.0.1:77
 | Upstream | HTTPS only (plain HTTP only to 127.0.0.1, for tests), no redirects followed, own `User-Agent: credproxy/<version>`, `Accept-Encoding: identity` (a compressed reply is refused: the key couldn't be scrubbed from it), 60 s timeout. Only `Content-Type` and `Accept` are forwarded from the client; its auth header, cookies and other headers are dropped. Request body ≤ 1 MiB, response ≤ 16 MiB. |
 | Reply | Status, `Content-Type` and body, with every verbatim copy of the key replaced by `[REDACTED]`. |
 | S3 (SigV4) | For services with `auth.sigv4`. The sealed file holds two lines: access key id, secret. Path-style only (`/<bucket>/<key>`). The operation is worked out from method + path + query and must be in the route's `ops`: `GetObject`, `HeadObject`, `PutObject`, `DeleteObject`, `HeadBucket`, `ListObjectsV2`, `CreateMultipartUpload`, `UploadPart`, `CompleteMultipartUpload`, `AbortMultipartUpload`, `ListParts`. Nothing else passes (no ListBuckets, bucket admin, ACLs, tagging, versions, DeleteObjects). Keys are percent-decoded and refused if they hold `.`/`..` or empty segments or control characters; list prefixes get the same check; optional `key_prefixes` (directories, ending in `/`) limit keys and list prefixes. Path and query are re-encoded canonically, then signed with [`aws-sigv4`](https://crates.io/crates/aws-sigv4). Only these client headers go upstream, all signed: `Content-Type`, `Content-MD5`, `Content-Encoding`, `Content-Disposition`, `Content-Language`, `Cache-Control`, `Expires`, `Range`, `If-Match`, `If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since`, `If-Range` (so a resumed download keeps its precondition). Any of them given twice → 400; `Content-Encoding: aws-chunked` → 400. A client `x-amz-*` header other than `x-amz-content-sha256` (and `x-amz-date`, `x-amz-user-agent`, replaced by the signature) refuses the call: copy, metadata, tagging, SSE and checksum headers would otherwise be dropped and change what the call does (a CopyObject would become an empty PutObject). |
-| S3 payload | PutObject / UploadPart bodies stream through (≤ 512 MiB each) when the client sends their SHA-256 in `x-amz-content-sha256`; the signature covers it and the server checks the body against it. Other bodies (≤ 1 MiB, e.g. the CompleteMultipartUpload XML) are hashed by credproxy. `UNSIGNED-PAYLOAD` only where the route sets `unsigned_payload = true`; aws-chunked (`STREAMING-…`) is refused. 60 s without bytes moving aborts a transfer; one call may take up to 1 h. |
+| S3 payload | PutObject / UploadPart bodies stream through (≤ 512 MiB each) when the client sends their SHA-256 in `x-amz-content-sha256`; the signature covers it and the server checks the body against it. Other bodies (≤ 1 MiB, e.g. the CompleteMultipartUpload XML) are hashed by credproxy. `UNSIGNED-PAYLOAD` only where the route sets `unsigned_payload = true`; aws-chunked (`STREAMING-…`) is refused. S3 calls have no overall time limit: a transfer runs as long as it keeps moving. One that moves no bytes for `s3_idle` (60 s) in either direction is cut off, including a client that stops reading or an upstream that stops accepting (a per-connection watchdog). Once a request is fully sent, the upstream may take up to `s3_reply_wait` (2 h; a big CompleteMultipartUpload can be slow) to start replying, else 504. A cut-off transfer is an error at both ends, never a short success. S3 goes upstream over HTTP/1.1 only. Header values must be ASCII (else 400, rather than being dropped). |
 | S3 reply | Successful replies stream back as they are, with `Content-Type`, `Content-Encoding`, `Content-Disposition`, `Cache-Control`, `Content-Length`, `Content-Range`, `Accept-Ranges`, `ETag`, `Last-Modified` (others, e.g. `x-amz-meta-*`, are dropped): the secret was never sent, so it can't come back in them. Error replies are buffered and scrubbed of the access key id and the secret. A CompleteMultipartUpload that answers 200 with an `<Error>` body (S3 does this when the failure comes after the headers) becomes a 502. |
 | Control | Unix socket `ctl.sock` (0600) in a 0700 runtime dir, peer uid checked: token, status, unlock, lock, stop. |
 | Log | `~/Library/Logs/credproxy.log` (0600): time, service, method, path, status, ms; unlocks and locks. No token, no query string, no key. Rotates at 1 MiB into one `.1` file; reopened if deleted. |
-| Limits | At most 64 client connections at once (logged when reached), one request per connection, headers within 10 s, a small request body within 60 s, 5 minutes per connection (65 for S3 calls). Unknown services get the same 401, with the same text, as a wrong token. |
+| Limits | At most 64 client connections at once (logged when reached), one request per connection, headers within 10 s, a small request body within 60 s, 5 minutes per connection (S3 calls: as long as they make progress, see above). Unknown services get the same 401, with the same text, as a wrong token. |
 | Hardening | Core dumps off; on macOS the daemon requests `PT_DENY_ATTACH` (not tested by the test suite). |
 
 ## Limits (read these)
@@ -65,6 +65,9 @@ curl -H "Authorization: Bearer $(credproxy token runpod-s3)" http://127.0.0.1:77
 - **Scrubbing catches the key verbatim only**, not encoded forms (base64, URL-encoded).
 - **The allowlist covers method and path.** Query strings and REST request bodies are passed through unchecked, so
   an allowed `POST /pods` can create any pod the API allows. (S3 routes do check the query.)
+- **Many clients, services and endpoints at once** are fine (up to 64 connections in all). A service has one key
+  and one token shared by all its clients, so the log can't tell clients apart; a second account is a second
+  service. For an S3 service the token header can't be one credproxy forwards upstream (config check).
 - **An S3 route reaches every bucket the key can**, unless `key_prefixes` narrows it: an allowed `DeleteObject`
   can delete any object there.
 
@@ -110,6 +113,8 @@ download and upload each cut off after 60 s.
 
 ```toml
 idle_lock = "12h"                                  # s, m or h
+# s3_idle = "60s"                                  # S3: cut a transfer after this long without bytes moving
+# s3_reply_wait = "2h"                             # S3: how long the upstream may take to reply once sent
 listen = "127.0.0.1:7777"
 # age = "age"                                      # defaults shown
 # identity = "~/.config/age/se-identity.txt"

@@ -56,21 +56,36 @@ pub fn run(cfg_path: &Path) -> Result<(), String> {
 const MAX_CONNECTIONS: usize = 64;
 /// One request per connection, and no connection lives longer than this (unlock wait + upstream + slack)...
 const CONNECTION_LIFETIME: Duration = Duration::from_secs(300);
-/// ...unless it is an S3 call: the longest upstream call (a transfer) plus the same slack.
-const S3_CONNECTION_LIFETIME: Duration = proxy::S3_TIMEOUT.saturating_add(CONNECTION_LIFETIME);
 /// How long to keep trying the port when it's busy (e.g. the previous daemon still releasing it).
 const BIND_RETRY: Duration = Duration::from_secs(30);
 
-/// Run a connection until it ends or its lifetime is up: CONNECTION_LIFETIME, or S3_CONNECTION_LIFETIME once
-/// `long` says it carries an S3 call. Dropping the future closes the connection.
-async fn within_lifetime<F: std::future::Future>(conn: F, long: &std::sync::atomic::AtomicBool) {
+/// Run a connection until it ends, or until it outlives CONNECTION_LIFETIME, or (once it carries an allowed S3
+/// call, which has no overall limit) until it stops making progress: no bytes for `idle` outside expected
+/// silence. The watchdog sees what the streams' own idle timers can't: a client that stops reading or an upstream
+/// that stops accepting, where nothing polls those streams. Dropping the future closes the connection, and with
+/// it any upstream request in flight.
+async fn within_lifetime<F: std::future::Future>(
+    conn: F,
+    progress: &proxy::Progress,
+    idle: Duration,
+) {
     tokio::pin!(conn);
-    if tokio::time::timeout(CONNECTION_LIFETIME, &mut conn)
-        .await
-        .is_err()
-        && long.load(std::sync::atomic::Ordering::Relaxed)
-    {
-        let _ = tokio::time::timeout(S3_CONNECTION_LIFETIME - CONNECTION_LIFETIME, conn).await;
+    let start = tokio::time::Instant::now();
+    let every = (idle / 4).clamp(Duration::from_millis(50), Duration::from_secs(1));
+    loop {
+        tokio::select! {
+            _ = &mut conn => return,
+            _ = tokio::time::sleep(every) => {
+                let over = if progress.is_s3() {
+                    progress.stalled(idle)
+                } else {
+                    start.elapsed() >= CONNECTION_LIFETIME
+                };
+                if over {
+                    return;
+                }
+            }
+        }
     }
 }
 
@@ -158,20 +173,24 @@ async fn serve(cfg: Config) -> Result<(), String> {
                     continue;
                 };
                 let (vault, http) = (vault.clone(), http.clone());
+                let s3_idle = vault.cfg.s3_idle;
                 tokio::spawn(async move {
                     let _permit = permit;
-                    let long = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                    let is_long = long.clone();
+                    let progress = Arc::new(proxy::Progress::default());
+                    let watched = progress.clone();
                     let svc = service_fn(move |req| {
-                        let (vault, http, long) = (vault.clone(), http.clone(), long.clone());
-                        async move { Ok::<_, std::convert::Infallible>(proxy::handle(vault, http, req, long).await) }
+                        let (vault, http, progress) = (vault.clone(), http.clone(), progress.clone());
+                        async move { Ok::<_, std::convert::Infallible>(proxy::handle(vault, http, req, progress).await) }
                     });
                     let conn = http1::Builder::new()
                         .timer(TokioTimer::new())
                         .header_read_timeout(Duration::from_secs(10))
                         .keep_alive(false)
                         .serve_connection(TokioIo::new(conn), svc);
-                    within_lifetime(conn, &is_long).await;
+                    // boxed to a concrete type: passed generically, the connection future trips a rustc
+                    // limitation when proving the spawned task Send
+                    let conn: std::pin::Pin<Box<dyn std::future::Future<Output = _> + Send>> = Box::pin(conn);
+                    within_lifetime(conn, &watched, s3_idle).await;
                 });
             }
             a = ctl.accept() => {
@@ -243,38 +262,84 @@ async fn control(conn: UnixStream, vault: Arc<Vault>, stop: Arc<Notify>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use proxy::Progress;
 
-    async fn lifetime(long: bool, set_after: Option<Duration>) -> Duration {
-        let flag = Arc::new(AtomicBool::new(false));
-        if let Some(d) = set_after {
-            let f = flag.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(d).await;
-                f.store(long, Ordering::Relaxed);
-            });
-        }
+    /// How long a never-ending connection lives, with `drive` acting on its progress meanwhile.
+    async fn lives(
+        progress: Arc<Progress>,
+        drive: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> Duration {
+        tokio::spawn(drive);
         let start = tokio::time::Instant::now();
-        within_lifetime(std::future::pending::<()>(), &flag).await;
+        within_lifetime(
+            std::future::pending::<()>(),
+            &progress,
+            Duration::from_secs(60),
+        )
+        .await;
         start.elapsed()
     }
 
     #[tokio::test(start_paused = true)]
-    async fn connections_live_5_minutes_s3_ones_65() {
-        assert_eq!(lifetime(false, None).await, Duration::from_secs(300));
-        // an S3 call is known within the first 5 minutes (it is marked once its route is found)
-        assert_eq!(
-            lifetime(true, Some(Duration::from_secs(1))).await,
-            Duration::from_secs(3900)
-        );
-        assert_eq!(
-            lifetime(false, Some(Duration::from_secs(1))).await,
-            Duration::from_secs(300)
-        );
-        // a connection that ends sooner is not held
-        let flag = AtomicBool::new(true);
+    async fn other_connections_live_5_minutes() {
+        let p = Arc::new(Progress::default());
+        assert_eq!(lives(p, async {}).await, Duration::from_secs(300));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn s3_connections_live_while_they_move() {
+        // bytes every 59 s for 3 hours, then nothing: cut 60 s after the last bytes, not at any fixed time
+        let p = Arc::new(Progress::default());
+        p.mark_s3();
+        let q = p.clone();
+        let t = lives(p, async move {
+            for _ in 0..183 {
+                tokio::time::sleep(Duration::from_secs(59)).await;
+                q.touch();
+            }
+        })
+        .await;
+        assert_eq!(t, Duration::from_secs(183 * 59 + 60));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn s3_connection_stalled_from_the_start_is_cut_after_a_minute() {
+        let p = Arc::new(Progress::default());
+        p.mark_s3();
+        assert_eq!(lives(p, async {}).await, Duration::from_secs(60));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expected_silence_is_not_a_stall() {
+        // e.g. the upstream assembling a big multipart upload: quiet for up to 2 h, then 60 s more of nothing
+        let p = Arc::new(Progress::default());
+        p.mark_s3();
+        p.quiet_for(Duration::from_secs(7200));
+        assert_eq!(lives(p.clone(), async {}).await, Duration::from_secs(7200));
+        // and bytes arriving during it end the quiet period early
+        let p = Arc::new(Progress::default());
+        p.mark_s3();
+        p.quiet_for(Duration::from_secs(7200));
+        let q = p.clone();
+        let t = lives(p, async move {
+            tokio::time::sleep(Duration::from_secs(100)).await;
+            q.touch();
+        })
+        .await;
+        assert_eq!(t, Duration::from_secs(160));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_connection_that_ends_is_not_held() {
+        let p = Progress::default();
+        p.mark_s3();
         let start = tokio::time::Instant::now();
-        within_lifetime(tokio::time::sleep(Duration::from_secs(10)), &flag).await;
+        within_lifetime(
+            tokio::time::sleep(Duration::from_secs(10)),
+            &p,
+            Duration::from_secs(60),
+        )
+        .await;
         assert_eq!(start.elapsed(), Duration::from_secs(10));
     }
 }

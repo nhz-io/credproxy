@@ -14,6 +14,28 @@ use std::time::SystemTime;
 
 pub const UNSIGNED_PAYLOAD: &str = "UNSIGNED-PAYLOAD";
 
+/// Client headers an S3 call carries upstream, all signed. Other headers are dropped, except `x-amz-*` ones, which
+/// refuse the call: dropping `x-amz-copy-source` would turn a CopyObject into an empty PutObject over its
+/// destination.
+pub const FORWARDED_HEADERS: [&str; 13] = [
+    "content-type",
+    "content-md5",
+    // what the object is stored with
+    "content-encoding",
+    "content-disposition",
+    "content-language",
+    "cache-control",
+    "expires",
+    // reads and conditional writes: dropping one would change what the call returns or overwrites (a resumed
+    // download without its If-Range could append another version's tail)
+    "range",
+    "if-match",
+    "if-none-match",
+    "if-modified-since",
+    "if-unmodified-since",
+    "if-range",
+];
+
 /// Everything but A-Z a-z 0-9 - . _ ~ is percent-encoded (SigV4's URI encoding).
 const ENCODE: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'-')
@@ -132,7 +154,12 @@ pub fn classify(
     query: Option<&str>,
     prefixes: &[String],
 ) -> Result<Target, String> {
-    let refuse = || format!("{method} {}: not an allowed S3 call", shorten(sub));
+    let refuse = || {
+        format!(
+            "{method} {}: not an allowed S3 call",
+            crate::log::printable(sub)
+        )
+    };
     let rest = sub.strip_prefix('/').ok_or_else(refuse)?;
     let (bucket, key_raw) = match rest.split_once('/') {
         Some((b, k)) if !k.is_empty() => (b, Some(k)),
@@ -238,13 +265,6 @@ pub fn classify(
         .collect::<Vec<_>>()
         .join("&");
     Ok(Target { op, path, query })
-}
-
-fn shorten(p: &str) -> String {
-    p.chars()
-        .take(200)
-        .map(|c| if c.is_ascii_graphic() { c } else { '?' })
-        .collect()
 }
 
 /// A payload hash a client may send in `x-amz-content-sha256`: 64 hex digits (lower-cased here).

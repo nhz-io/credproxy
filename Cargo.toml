@@ -34,7 +34,9 @@ zeroize = "1.9.1"
 
 [dev-dependencies]
 hyper-util = { version = "0.1.21", features = ["server-auto", "tokio"] }
+rcgen = "0.14.10"
 s3s = "0.17"
 s3s-fs = "0.17"
 tempfile = "3.27.0"
 tokio = { version = "1.54.1", features = ["test-util", "macros", "rt"] }
+tokio-rustls = "0.26"

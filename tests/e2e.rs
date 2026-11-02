@@ -11,7 +11,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-const BIN: &str = env!("CARGO_BIN_EXE_credproxy");
+mod common;
+use common::{BIN, age_identity, free_port, seal, sh, start_daemon};
 
 struct Env {
     dir: tempfile::TempDir,
@@ -86,24 +87,6 @@ async fn upstream(hits: Arc<AtomicUsize>) -> u16 {
     port
 }
 
-fn sh(cmd: &mut Command) -> Output {
-    let o = cmd.output().unwrap();
-    assert!(
-        o.status.success(),
-        "{cmd:?}: {}",
-        String::from_utf8_lossy(&o.stderr)
-    );
-    o
-}
-
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 async fn setup(idle: &str) -> Env {
     setup_with(idle, None).await
 }
@@ -122,19 +105,12 @@ async fn setup_with(idle: &str, fake_age: Option<&str>) -> Env {
         rnd.iter().map(|b| format!("{b:02x}")).collect::<String>()
     );
 
-    sh(Command::new("age-keygen").arg("-o").arg(d.join("id.txt")));
-    let public =
-        String::from_utf8(sh(Command::new("age-keygen").arg("-y").arg(d.join("id.txt"))).stdout)
-            .unwrap();
-    std::fs::create_dir_all(d.join("secrets/fake")).unwrap();
-    let mut age = Command::new("age")
-        .args(["-r", public.trim(), "-o"])
-        .arg(d.join("secrets/fake/api-key.age"))
-        .stdin(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    std::io::Write::write_all(age.stdin.as_mut().unwrap(), format!("{key}\n").as_bytes()).unwrap();
-    assert!(age.wait().unwrap().success());
+    let public = age_identity(d);
+    seal(
+        &public,
+        d.join("secrets/fake/api-key.age"),
+        &format!("{key}\n"),
+    );
 
     let cfg = d.join("config.toml");
     std::fs::write(
@@ -177,28 +153,15 @@ allow = ["GET /pods", "GET /pods/{{id}}", "POST /pods", "GET /billing/pods"]
         ),
     )
     .unwrap();
-    let daemon = Command::new(BIN)
-        .arg("serve")
-        .env("CREDPROXY_CONFIG", &cfg)
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .unwrap();
-    let mut env = Env {
+    let daemon = start_daemon(&cfg).await;
+    Env {
         dir,
         cfg,
         key,
         base: format!("http://127.0.0.1:{listen}/fake"),
         hits,
         daemon: Some(daemon),
-    };
-    for _ in 0..100 {
-        if String::from_utf8_lossy(&env.cli(&["status"]).stdout).starts_with("running") {
-            return env;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    env.daemon.take().unwrap().kill().unwrap();
-    panic!("daemon did not start");
 }
 
 impl Env {

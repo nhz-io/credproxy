@@ -24,11 +24,68 @@ pub const MAX_S3_BODY: u64 = 512 << 20;
 pub const USER_AGENT: &str = concat!("credproxy/", env!("CARGO_PKG_VERSION"));
 /// Whole upstream call for key-in-header routes.
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(60);
-/// Whole upstream call for S3 routes (a 500 MB part over a slow uplink; a slow CompleteMultipartUpload).
-pub const S3_TIMEOUT: Duration = Duration::from_secs(3600);
-/// A streamed S3 body (either way) that moves no bytes for this long is aborted; so is a client that takes this
-/// long to send a small body.
+/// A client that takes this long to send a small (key-in-header) body is refused. S3 calls use the config's
+/// `s3_idle` and `s3_reply_wait` instead (defaults 60 s and 2 h: RunPod's docs say a CompleteMultipartUpload of a
+/// 10 GB+ file can take long and suggest a 2 h read timeout); they have no overall time limit.
 const IDLE: Duration = Duration::from_secs(60);
+
+/// What a connection's watchdog (serve.rs) needs to know: whether it carries an allowed S3 call, when bytes last
+/// moved, and until when silence is expected (Touch ID, the upstream preparing its reply).
+pub struct Progress {
+    state: std::sync::Mutex<ProgressState>,
+}
+
+struct ProgressState {
+    s3: bool,
+    last: tokio::time::Instant,
+    quiet_until: Option<tokio::time::Instant>,
+}
+
+impl Default for Progress {
+    fn default() -> Self {
+        Progress {
+            state: std::sync::Mutex::new(ProgressState {
+                s3: false,
+                last: tokio::time::Instant::now(),
+                quiet_until: None,
+            }),
+        }
+    }
+}
+
+impl Progress {
+    pub fn is_s3(&self) -> bool {
+        self.state.lock().unwrap().s3
+    }
+
+    pub(crate) fn mark_s3(&self) {
+        let mut s = self.state.lock().unwrap();
+        s.s3 = true;
+        s.last = tokio::time::Instant::now();
+    }
+
+    /// Bytes moved.
+    pub(crate) fn touch(&self) {
+        let mut s = self.state.lock().unwrap();
+        s.last = tokio::time::Instant::now();
+        s.quiet_until = None;
+    }
+
+    /// Silence is expected for up to `d` from now.
+    pub(crate) fn quiet_for(&self, d: Duration) {
+        self.state.lock().unwrap().quiet_until = Some(tokio::time::Instant::now() + d);
+    }
+
+    /// No bytes for `idle`, and no expected silence left.
+    pub fn stalled(&self, idle: Duration) -> bool {
+        let s = self.state.lock().unwrap();
+        let mut deadline = s.last + idle;
+        if let Some(q) = s.quiet_until {
+            deadline = deadline.max(q);
+        }
+        tokio::time::Instant::now() >= deadline
+    }
+}
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 pub type Body = BoxBody<Bytes, BoxError>;
@@ -41,17 +98,22 @@ pub struct Clients {
     s3: reqwest::Client,
 }
 
+fn api_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(30))
+        .user_agent(USER_AGENT)
+        .no_proxy()
+}
+
+fn s3_builder() -> reqwest::ClientBuilder {
+    api_builder().http1_only()
+}
+
 pub fn clients() -> Clients {
-    let base = || {
-        reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(30))
-            .user_agent(USER_AGENT)
-            .no_proxy()
-    };
     Clients {
-        api: base().build().expect("http client"),
-        s3: base().http1_only().build().expect("http client"),
+        api: api_builder().build().expect("http client"),
+        s3: s3_builder().build().expect("http client"),
     }
 }
 
@@ -67,16 +129,16 @@ fn reply(status: StatusCode, msg: &str) -> Response<Body> {
         .unwrap()
 }
 
-/// `s`, failing with "idle timeout" when no item arrives for `IDLE`.
-fn idle<S, T, E>(s: S) -> impl Stream<Item = Result<T, BoxError>> + Send + 'static
+/// `s`, failing with "idle timeout" when no item arrives for `limit`.
+fn idle<S, T, E>(s: S, limit: Duration) -> impl Stream<Item = Result<T, BoxError>> + Send + 'static
 where
     S: Stream<Item = Result<T, E>> + Send + 'static,
     E: Into<BoxError>,
     T: Send + 'static,
 {
-    futures_util::stream::unfold(Some(Box::pin(s)), |state| async move {
+    futures_util::stream::unfold(Some(Box::pin(s)), move |state| async move {
         let mut s = state?;
-        match tokio::time::timeout(IDLE, s.next()).await {
+        match tokio::time::timeout(limit, s.next()).await {
             Ok(Some(Ok(x))) => Some((Ok(x), Some(s))),
             Ok(Some(Err(e))) => Some((Err(e.into()), None)),
             Ok(None) => None,
@@ -105,14 +167,6 @@ pub fn scrub(body: &[u8], key: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Path for the log: printable, short, never the token.
-fn loggable(p: &str) -> String {
-    p.chars()
-        .take(200)
-        .map(|c| if c.is_ascii_graphic() { c } else { '?' })
-        .collect()
-}
-
 /// The token the client presented in the service's own auth header (e.g. "Bearer <token>").
 fn presented<'a>(headers: &'a hyper::HeaderMap, header: &str, format: &str) -> Option<&'a [u8]> {
     let v = headers.get(header)?.as_bytes();
@@ -139,12 +193,12 @@ fn host_ok(headers: &hyper::HeaderMap, listen: std::net::SocketAddr) -> bool {
     h == format!("{ip}:{port}") || h.eq_ignore_ascii_case(&format!("localhost:{port}"))
 }
 
-/// `long` is set once the request turns out to be an S3 call: only those connections may outlive the short limit.
+/// `progress` tells the connection's watchdog about an allowed S3 call; other calls live within the short limit.
 pub async fn handle(
     vault: Arc<Vault>,
     http: Clients,
     req: Request<Incoming>,
-    long: Arc<std::sync::atomic::AtomicBool>,
+    progress: Arc<Progress>,
 ) -> Response<Body> {
     let start = Instant::now();
     let method = req.method().as_str().to_string();
@@ -181,12 +235,12 @@ pub async fn handle(
     let shown = if rest.is_empty() {
         "/".to_string()
     } else {
-        loggable(&rest)
+        log::printable(&rest)
     };
     let ok = presented(req.headers(), &svc.auth_header, &svc.auth_format)
         .is_some_and(|t| vault.check_token(&service, t));
     let res = if ok {
-        forward(&vault, &http, &service, &method, &rest, req, &long).await
+        forward(&vault, &http, &service, &method, &rest, req, &progress).await
     } else {
         // same text as for an unknown service
         reply(
@@ -213,18 +267,17 @@ async fn forward(
     method: &str,
     rest: &str,
     req: Request<Incoming>,
-    long: &std::sync::atomic::AtomicBool,
+    progress: &Arc<Progress>,
 ) -> Response<Body> {
     let svc = &vault.cfg.services[service];
     let Some((route, sub)) = svc.route(rest) else {
         return reply(StatusCode::FORBIDDEN, "path not allowed");
     };
     if route.s3.is_some() {
-        long.store(true, std::sync::atomic::Ordering::Relaxed);
-        return forward_s3(vault, &http.s3, service, method, route, &sub, req).await;
+        return forward_s3(vault, &http.s3, service, method, route, &sub, req, progress).await;
     }
     let (parts, body) = req.into_parts();
-    let body = match read_small(body).await {
+    let body = match read_small(body, IDLE).await {
         Ok(b) => b,
         Err(r) => return r,
     };
@@ -243,7 +296,7 @@ async fn forward(
         if !route.allow.iter().any(|r| r.matches(method, p)) {
             return reply(
                 StatusCode::FORBIDDEN,
-                &format!("{method} {} not allowed", loggable(p)),
+                &format!("{method} {} not allowed", log::printable(p)),
             );
         }
         body
@@ -293,10 +346,10 @@ async fn forward(
     buffered_reply(res, &[key.as_bytes()]).await
 }
 
-/// A small client body (≤ MAX_REQUEST), read within IDLE.
+/// A small client body (≤ MAX_REQUEST), read within `limit`.
 #[allow(clippy::result_large_err)]
-async fn read_small(body: Incoming) -> Result<Bytes, Response<Body>> {
-    match tokio::time::timeout(IDLE, Limited::new(body, MAX_REQUEST).collect()).await {
+async fn read_small(body: Incoming, limit: Duration) -> Result<Bytes, Response<Body>> {
+    match tokio::time::timeout(limit, Limited::new(body, MAX_REQUEST).collect()).await {
         Ok(Ok(b)) => Ok(b.to_bytes()),
         Ok(Err(_)) => Err(reply(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -317,16 +370,23 @@ fn upstream_failed(e: &reqwest::Error) -> Response<Body> {
     reply(StatusCode::BAD_GATEWAY, &format!("upstream {what}"))
 }
 
-/// The whole upstream reply (≤ MAX_RESPONSE, uncompressed): status, content type and body, with every copy of
-/// each of `secrets` replaced.
-async fn buffered_reply(mut res: reqwest::Response, secrets: &[&[u8]]) -> Response<Body> {
-    let status = res.status();
+/// The whole upstream reply (≤ MAX_RESPONSE, uncompressed) as status, content type and body, with every copy of
+/// each of `secrets` replaced; or the reply to send instead.
+#[allow(clippy::result_large_err)]
+async fn read_reply(
+    mut res: reqwest::Response,
+    secrets: &[&[u8]],
+) -> Result<(StatusCode, Option<hyper::header::HeaderValue>, Vec<u8>), Response<Body>> {
+    let status = StatusCode::from_u16(res.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     if res
         .headers()
         .get("content-encoding")
         .is_some_and(|e| !e.as_bytes().eq_ignore_ascii_case(b"identity"))
     {
-        return reply(StatusCode::BAD_GATEWAY, "upstream sent a compressed reply");
+        return Err(reply(
+            StatusCode::BAD_GATEWAY,
+            "upstream sent a compressed reply",
+        ));
     }
     let ctype = res.headers().get("content-type").cloned();
     let mut buf = Vec::new();
@@ -334,46 +394,44 @@ async fn buffered_reply(mut res: reqwest::Response, secrets: &[&[u8]]) -> Respon
         match res.chunk().await {
             Ok(Some(c)) => {
                 if buf.len() + c.len() > MAX_RESPONSE {
-                    return reply(StatusCode::BAD_GATEWAY, "upstream response too large");
+                    return Err(reply(
+                        StatusCode::BAD_GATEWAY,
+                        "upstream response too large",
+                    ));
                 }
                 buf.extend_from_slice(&c);
             }
             Ok(None) => break,
-            Err(_) => return reply(StatusCode::BAD_GATEWAY, "upstream response broken"),
+            Err(_) => {
+                return Err(reply(StatusCode::BAD_GATEWAY, "upstream response broken"));
+            }
         }
     }
     let clean = |b: &[u8]| secrets.iter().fold(b.to_vec(), |acc, s| scrub(&acc, s));
-    let mut b = Response::builder().status(status.as_u16());
-    if let Some(ct) = ctype
-        && let Ok(v) = hyper::header::HeaderValue::from_bytes(&clean(ct.as_bytes()))
-    {
-        b = b.header("content-type", v);
-    }
-    b.body(full(clean(&buf))).unwrap()
+    let ctype =
+        ctype.and_then(|ct| hyper::header::HeaderValue::from_bytes(&clean(ct.as_bytes())).ok());
+    Ok((status, ctype, clean(&buf)))
 }
 
-/// Client headers an S3 call may carry upstream (all signed). Other headers are dropped, except `x-amz-*` ones,
-/// which refuse the call (see S3_CLIENT_AMZ_OK): dropping `x-amz-copy-source` would turn a CopyObject into an
-/// empty PutObject that overwrites its destination.
-const S3_REQUEST_HEADERS: [&str; 14] = [
-    "content-type",
-    "content-md5",
-    // what the object is stored with
-    "content-encoding",
-    "content-disposition",
-    "content-language",
-    "cache-control",
-    "expires",
-    // reads and conditional writes: dropping one would change what the call returns or overwrites (a resumed
-    // download without its If-Range could append another version's tail)
-    "range",
-    "if-match",
-    "if-none-match",
-    "if-modified-since",
-    "if-unmodified-since",
-    "if-range",
-    "x-amz-content-sha256",
-];
+fn reply_with(
+    status: StatusCode,
+    ctype: Option<hyper::header::HeaderValue>,
+    body: Vec<u8>,
+) -> Response<Body> {
+    let mut b = Response::builder().status(status);
+    if let Some(ct) = ctype {
+        b = b.header("content-type", ct);
+    }
+    b.body(full(body)).unwrap()
+}
+
+async fn buffered_reply(res: reqwest::Response, secrets: &[&[u8]]) -> Response<Body> {
+    match read_reply(res, secrets).await {
+        Ok((status, ctype, body)) => reply_with(status, ctype, body),
+        Err(r) => r,
+    }
+}
+
 /// The only `x-amz-*` headers a client may send: the payload hash, and two the signature replaces anyway.
 const S3_CLIENT_AMZ_OK: [&str; 3] = ["x-amz-content-sha256", "x-amz-date", "x-amz-user-agent"];
 /// Upstream headers a successful S3 reply keeps (multipart needs the ETag).
@@ -398,6 +456,7 @@ enum Payload {
 /// S3: check the operation, settle the payload hash, then the key (unlocking if needed), sign, forward.
 /// Successful replies stream back as they are: the secret never went upstream, so it can't come back in them.
 /// Error replies are small, buffered, and scrubbed of the access key id and secret.
+#[allow(clippy::too_many_arguments)]
 async fn forward_s3(
     vault: &Arc<Vault>,
     http: &reqwest::Client,
@@ -406,6 +465,7 @@ async fn forward_s3(
     route: &Route,
     sub: &str,
     req: Request<Incoming>,
+    progress: &Arc<Progress>,
 ) -> Response<Body> {
     let svc = &vault.cfg.services[service];
     let cfg = route.s3.as_ref().expect("s3 route");
@@ -432,11 +492,22 @@ async fn forward_s3(
         );
     }
     // every check is made before the key: a refused call must never raise a Touch ID prompt
-    if let Some(n) = S3_REQUEST_HEADERS
+    for n in s3::FORWARDED_HEADERS
         .iter()
-        .find(|n| parts.headers.get_all(**n).iter().count() > 1)
+        .chain(&["x-amz-content-sha256"])
     {
-        return reply(StatusCode::BAD_REQUEST, &format!("header {n} given twice"));
+        let mut values = parts.headers.get_all(*n).iter();
+        let first = values.next();
+        if values.next().is_some() {
+            return reply(StatusCode::BAD_REQUEST, &format!("header {n} given twice"));
+        }
+        // a value that isn't visible ASCII would be dropped on the way, silently changing the call
+        if first.is_some_and(|v| v.to_str().is_err()) {
+            return reply(
+                StatusCode::BAD_REQUEST,
+                &format!("header {n}: only ASCII values (percent-encode, e.g. filename*=UTF-8'')"),
+            );
+        }
     }
     if parts.headers.get_all("content-encoding").iter().any(|v| {
         v.as_bytes()
@@ -510,7 +581,7 @@ async fn forward_s3(
                 };
                 return reply(StatusCode::PAYLOAD_TOO_LARGE, msg);
             }
-            let b = match read_small(body).await {
+            let b = match read_small(body, vault.cfg.s3_idle).await {
                 Ok(b) => b,
                 Err(r) => return r,
             };
@@ -525,10 +596,14 @@ async fn forward_s3(
         }
     };
 
+    // allowed: from now on the watchdog (not the short limit) decides, and a Touch ID prompt is expected silence
+    progress.mark_s3();
+    progress.quiet_for(crate::vault::UNLOCK_TIMEOUT + Duration::from_secs(10));
     let key = match vault.key(service, false).await {
         Ok(k) => k,
         Err(e) => return reply(StatusCode::SERVICE_UNAVAILABLE, &e),
     };
+    progress.touch();
     let Some((access_key, secret)) = key.split_once('\n') else {
         return reply(StatusCode::INTERNAL_SERVER_ERROR, "bad key");
     };
@@ -537,10 +612,9 @@ async fn forward_s3(
         url.push('?');
         url.push_str(&target.query);
     }
-    // x-amz-content-sha256 is the signer's to set (from `hash`)
-    let forwarded: Vec<(&str, &str)> = S3_REQUEST_HEADERS
+    // (all ASCII: checked above)
+    let forwarded: Vec<(&str, &str)> = s3::FORWARDED_HEADERS
         .iter()
-        .filter(|n| **n != "x-amz-content-sha256")
         .filter_map(|n| Some((*n, parts.headers.get(*n)?.to_str().ok()?)))
         .collect();
     let hash = match &payload {
@@ -562,10 +636,7 @@ async fn forward_s3(
     let Ok(m) = reqwest::Method::from_bytes(method.as_bytes()) else {
         return reply(StatusCode::METHOD_NOT_ALLOWED, "bad method");
     };
-    let mut out = http
-        .request(m, &url)
-        .timeout(S3_TIMEOUT)
-        .header("accept-encoding", "identity");
+    let mut out = http.request(m, &url).header("accept-encoding", "identity");
     for (n, v) in forwarded.iter() {
         out = out.header(*n, *v);
     }
@@ -576,21 +647,71 @@ async fn forward_s3(
         v.set_sensitive(n.eq_ignore_ascii_case("authorization"));
         out = out.header(n.as_str(), v);
     }
+    // Once the whole request is out, the upstream may be silent for up to s3_reply_wait before replying.
+    let (idle_limit, reply_limit) = (vault.cfg.s3_idle, vault.cfg.s3_reply_wait);
+    let (sent_tx, sent_rx) = tokio::sync::oneshot::channel::<()>();
+    // called once the last request byte has been handed on: from then on silence is the upstream working
+    let mut on_sent = {
+        let progress = progress.clone();
+        let mut sent_tx = Some(sent_tx);
+        move || {
+            if let Some(t) = sent_tx.take() {
+                progress.quiet_for(reply_limit + idle_limit);
+                let _ = t.send(());
+            }
+        }
+    };
     out = match payload {
         // hyper sends no Content-Length for an empty body; some S3 front ends answer a bodiless POST/PUT with 411
         Payload::Small(b, _) if b.is_empty() && matches!(method, "POST" | "PUT") => {
+            on_sent();
             out.header("content-length", "0")
         }
-        Payload::Small(b, _) if b.is_empty() => out,
-        Payload::Small(b, _) => out.body(b),
-        Payload::Stream(body, n, _) => out
-            .header("content-length", n)
-            .body(reqwest::Body::wrap_stream(idle(body.into_data_stream()))),
+        Payload::Small(b, _) if b.is_empty() => {
+            on_sent();
+            out
+        }
+        Payload::Small(b, _) => {
+            on_sent();
+            out.body(b)
+        }
+        Payload::Stream(body, n, _) => {
+            // counted, not waited for: hyper stops polling the body once Content-Length bytes are out, so the
+            // stream's own end may never be seen
+            if n == 0 {
+                on_sent();
+            }
+            let progress = progress.clone();
+            let mut sent = 0u64;
+            let chunks = idle(body.into_data_stream(), idle_limit).inspect_ok(move |b: &Bytes| {
+                progress.touch();
+                sent += b.len() as u64;
+                if sent >= n {
+                    on_sent();
+                }
+            });
+            out.header("content-length", n)
+                .body(reqwest::Body::wrap_stream(chunks))
+        }
     };
-    let res = match out.send().await {
-        Ok(r) => r,
-        Err(e) => return upstream_failed(&e),
+    let no_reply = async {
+        // a dropped sender (the request failed before its end) never starts the clock; send() reports that
+        if sent_rx.await.is_ok() {
+            tokio::time::sleep(reply_limit).await;
+        } else {
+            std::future::pending::<()>().await;
+        }
     };
+    let res = tokio::select! {
+        r = out.send() => match r {
+            Ok(r) => r,
+            Err(e) => return upstream_failed(&e),
+        },
+        _ = no_reply => {
+            return reply(StatusCode::GATEWAY_TIMEOUT, "upstream sent no reply in time (s3_reply_wait)");
+        }
+    };
+    progress.touch();
     if !res.status().is_success() {
         // 304 and 412 need the validators, 416 the object size; a redirect's Location is not passed on
         let keep: Vec<_> = ["etag", "last-modified", "content-range"]
@@ -606,18 +727,18 @@ async fn forward_s3(
     // S3 may answer CompleteMultipartUpload with 200 and an <Error> body (the failure shows up after the headers
     // went out). A client checking only the status would think the object exists: make it a 502.
     if target.op == s3::Op::CompleteMultipartUpload {
-        let r = buffered_reply(res, &[access_key.as_bytes(), secret.as_bytes()]).await;
-        let (head, body) = r.into_parts();
-        let bytes = match body.collect().await {
-            Ok(b) => b.to_bytes(),
-            Err(_) => return reply(StatusCode::BAD_GATEWAY, "upstream response broken"),
+        let (status, ctype, body) =
+            match read_reply(res, &[access_key.as_bytes(), secret.as_bytes()]).await {
+                Ok(r) => r,
+                Err(r) => return r,
+            };
+        let failed = body.windows(7).any(|w| w == b"<Error>");
+        let status = if failed {
+            StatusCode::BAD_GATEWAY
+        } else {
+            status
         };
-        if bytes.windows(7).any(|w| w == b"<Error>") {
-            let mut r = Response::from_parts(head, full(bytes));
-            *r.status_mut() = StatusCode::BAD_GATEWAY;
-            return r;
-        }
-        return Response::from_parts(head, full(bytes));
+        return reply_with(status, ctype, body);
     }
     let mut b = Response::builder().status(res.status().as_u16());
     for n in S3_REPLY_HEADERS {
@@ -628,10 +749,12 @@ async fn forward_s3(
     // The request is logged when the reply starts; a reply that breaks off later gets its own line.
     let (log_file, what) = (
         vault.cfg.log.clone(),
-        format!("{service} {method} {}{}", route.prefix, loggable(sub)),
+        format!("{service} {method} {}{}", route.prefix, log::printable(sub)),
     );
-    let stream = idle(res.bytes_stream())
-        .inspect_err(move |_| {
+    let moved = progress.clone();
+    let stream = idle(res.bytes_stream(), idle_limit)
+        .inspect_ok(move |_: &Bytes| moved.touch())
+        .inspect_err(move |_: &BoxError| {
             log::line(
                 &log_file,
                 &format!("{what} reply broke off (stalled or upstream closed)"),
@@ -664,7 +787,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn idle_passes_slow_but_moving_streams() {
-        let s = super::idle(gaps(&[59, 59, 59, 59])).take(4);
+        let s = super::idle(gaps(&[59, 59, 59, 59]), Duration::from_secs(60)).take(4);
         let got: Vec<_> = s.map(|r| r.unwrap()).collect().await;
         assert_eq!(got, [0, 1, 2, 3]);
     }
@@ -672,7 +795,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn idle_cuts_off_a_stalled_stream() {
         let start = tokio::time::Instant::now();
-        let mut s = Box::pin(super::idle(gaps(&[1, 5])));
+        let mut s = Box::pin(super::idle(gaps(&[1, 5]), Duration::from_secs(60)));
         assert_eq!(s.next().await.unwrap().unwrap(), 0);
         assert_eq!(s.next().await.unwrap().unwrap(), 1);
         let e = s.next().await.unwrap().unwrap_err();
@@ -684,9 +807,56 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn idle_ends_after_an_upstream_error() {
         let s = futures_util::stream::iter([Ok(1u32), Err(std::io::Error::other("broken")), Ok(2)]);
-        let got: Vec<_> = super::idle(s).collect().await;
+        let got: Vec<_> = super::idle(s, Duration::from_secs(60)).collect().await;
         assert_eq!(got.len(), 2);
         assert!(got[1].is_err());
+    }
+
+    /// The protocol a client built from `builder` picks with a TLS server that offers both h2 and http/1.1.
+    async fn negotiated(builder: reqwest::ClientBuilder) -> Vec<u8> {
+        use tokio::io::AsyncWriteExt;
+        use tokio_rustls::rustls;
+        let ck = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
+        let cert = ck.cert.der().clone();
+        let key = rustls::pki_types::PrivatePkcs8KeyDer::from(ck.signing_key.serialize_der());
+        let provider = std::sync::Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let mut cfg = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.clone()], key.into())
+            .unwrap();
+        cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(cfg));
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = l.accept().await.unwrap();
+            let mut tls = acceptor.accept(tcp).await.unwrap();
+            let alpn = tls.get_ref().1.alpn_protocol().unwrap_or_default().to_vec();
+            if alpn == b"http/1.1" {
+                let _ = tls
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                    .await;
+            }
+            alpn
+        });
+        let client = builder
+            .add_root_certificate(reqwest::Certificate::from_der(&cert).unwrap())
+            .build()
+            .unwrap();
+        let _ = client
+            .get(format!("https://127.0.0.1:{port}/"))
+            .send()
+            .await;
+        server.await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn s3_upstreams_speak_http1_only() {
+        assert_eq!(negotiated(super::s3_builder()).await, b"http/1.1");
+        // the same server and setup do get HTTP/2 from the other client: the check can tell them apart
+        assert_eq!(negotiated(super::api_builder()).await, b"h2");
     }
 
     #[test]

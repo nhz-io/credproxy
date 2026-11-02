@@ -6,6 +6,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// A path or name as it may appear in the log or a refusal: visible ASCII only, at most 200 characters.
+pub fn printable(p: &str) -> String {
+    p.chars()
+        .take(200)
+        .map(|c| if c.is_ascii_graphic() { c } else { '?' })
+        .collect()
+}
+
 /// UTC "YYYY-MM-DDTHH:MM:SSZ" without a date crate (civil-from-days).
 pub fn now() -> String {
     let t = SystemTime::now()

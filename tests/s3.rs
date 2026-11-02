@@ -7,7 +7,8 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Output};
 use std::time::Duration;
 
-const BIN: &str = env!("CARGO_BIN_EXE_credproxy");
+mod common;
+use common::{BIN, age_identity, free_port, seal, start_daemon};
 const ACCESS_KEY: &str = "AKIDCREDPROXYTEST";
 
 struct Env {
@@ -47,36 +48,6 @@ impl Env {
     }
 }
 
-fn sh(cmd: &mut Command) -> Output {
-    let o = cmd.output().unwrap();
-    assert!(
-        o.status.success(),
-        "{cmd:?}: {}",
-        String::from_utf8_lossy(&o.stderr)
-    );
-    o
-}
-
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
-fn seal(public: &str, file: PathBuf, content: &str) {
-    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-    let mut age = Command::new("age")
-        .args(["-r", public, "-o"])
-        .arg(file)
-        .stdin(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    std::io::Write::write_all(age.stdin.as_mut().unwrap(), content.as_bytes()).unwrap();
-    assert!(age.wait().unwrap().success());
-}
-
 /// s3s-fs on a free port, serving `root` (each directory is a bucket), accepting only ACCESS_KEY/`secret`.
 async fn s3_server(root: PathBuf, secret: String) -> u16 {
     let fs = s3s_fs::FileSystem::new(root).unwrap();
@@ -107,7 +78,7 @@ fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
 /// its head, then how many body bytes arrived out of Content-Length and their SHA-256. The last path segment picks
 /// the reply: `truncate-cl` (says 1000 bytes, sends 500, closes), `truncate-chunked` (one chunk, then closes
 /// without the final one), `chunked-ok`, `stall` (10 of 1000 bytes, then nothing for 90 s), `error-echo` (403
-/// quoting the access key id), `complete-error` (200 with an <Error> body), `complete-ok`, `not-modified` (304), `redirect` (307), anything else 200
+/// quoting the access key id), `complete-error` (200 with an <Error> body), `complete-ok`, `not-modified` (304), `redirect` (307), `no-read` (never reads the body or replies), `slow-reply` (replies after 10 s), `pause-reply` (after 2.5 s), anything else 200
 /// with no body.
 async fn raw_server(dir: PathBuf) -> u16 {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -149,7 +120,7 @@ async fn raw_server(dir: PathBuf) -> u16 {
                     })
                     .unwrap_or(0);
                 let mut body = buf[end..].to_vec();
-                while body.len() < cl {
+                while body.len() < cl && name != "no-read" {
                     let n = c.read(&mut tmp).await.unwrap_or(0);
                     if n == 0 {
                         break;
@@ -181,6 +152,19 @@ async fn raw_server(dir: PathBuf) -> u16 {
                     "stall" => {
                         let _ = c.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 1000\r\n\r\n0123456789").await;
                         tokio::time::sleep(Duration::from_secs(90)).await;
+                        return;
+                    }
+                    "pause-reply" => {
+                        tokio::time::sleep(Duration::from_millis(2500)).await;
+                        b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_vec()
+                    }
+                    "slow-reply" => {
+                        tokio::time::sleep(Duration::from_secs(10)).await;
+                        b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_vec()
+                    }
+                    "no-read" => {
+                        // never reads the body, never replies (the body read above stops at what was sent so far)
+                        tokio::time::sleep(Duration::from_secs(200)).await;
                         return;
                     }
                     "not-modified" => b"HTTP/1.1 304 Not Modified\r\netag: \"e1\"\r\nlast-modified: Wed, 21 Oct 2015 07:28:00 GMT\r\nconnection: close\r\n\r\n".to_vec(),
@@ -215,18 +199,15 @@ async fn setup() -> Env {
     let listen = free_port();
     let raw = raw_server(d.to_path_buf()).await;
 
-    sh(Command::new("age-keygen").arg("-o").arg(d.join("id.txt")));
-    let public =
-        String::from_utf8(sh(Command::new("age-keygen").arg("-y").arg(d.join("id.txt"))).stdout)
-            .unwrap();
+    let public = age_identity(d);
     seal(
-        public.trim(),
+        &public,
         d.join("secrets/s3/key.age"),
         &format!("{ACCESS_KEY}\n{secret}\n"),
     );
     // same secret, another access key id: the server refuses it
     seal(
-        public.trim(),
+        &public,
         d.join("secrets/s3/wrong.age"),
         &format!("AKIDWRONG\n{secret}\n"),
     );
@@ -236,6 +217,9 @@ async fn setup() -> Env {
         &cfg,
         format!(
             r#"listen = "127.0.0.1:{listen}"
+# short S3 timeouts so the tests that wait them out take seconds (defaults: 60s, 2h)
+s3_idle = "2s"
+s3_reply_wait = "3s"
 identity = "{d}/id.txt"
 secrets_dir = "{d}/secrets"
 runtime_dir = "{d}/run"
@@ -278,27 +262,14 @@ s3 = {{ region = "dc-1", ops = ["GetObject"] }}
         ),
     )
     .unwrap();
-    let daemon = Command::new(BIN)
-        .arg("serve")
-        .env("CREDPROXY_CONFIG", &cfg)
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .unwrap();
-    let mut env = Env {
+    let daemon = start_daemon(&cfg).await;
+    Env {
         dir,
         cfg,
         secret,
         base: format!("http://127.0.0.1:{listen}"),
         daemon: Some(daemon),
-    };
-    for _ in 0..100 {
-        if String::from_utf8_lossy(&env.cli(&["status"]).stdout).starts_with("running") {
-            return env;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    env.daemon.take().unwrap().kill().unwrap();
-    panic!("daemon did not start");
 }
 
 fn hex_sha256(b: &[u8]) -> String {
@@ -1276,9 +1247,8 @@ async fn odd_keys_round_trip_and_list_completely() {
     assert_eq!(unique, keys);
 }
 
-/// 60 s+: an upstream that stops sending mid-body is cut off and the client sees an error.
+/// An upstream that stops sending mid-body is cut off (s3_idle) and the client sees an error.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
 async fn stalled_download_is_cut_off() {
     let env = setup().await;
     let t = std::time::Instant::now();
@@ -1293,7 +1263,10 @@ async fn stalled_download_is_cut_off() {
         "a stalled body arrived as if complete"
     );
     let waited = t.elapsed().as_secs();
-    assert!((59..80).contains(&waited), "cut off after {waited}s");
+    assert!(
+        (1..6).contains(&waited),
+        "cut off after {waited}s (s3_idle is 2s)"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1502,6 +1475,17 @@ async fn refused_calls_never_unlock() {
             r.text()
         );
     }
+    // a header value that isn't ASCII would be dropped on the way: refused instead
+    let head = put_head(
+        &env,
+        "/store/dc-1/vol1/a",
+        1,
+        &hex_sha256(b"x"),
+        "Content-Disposition: attachment; filename=\"модель.bin\"\r\n",
+    );
+    let out = raw_client(&env, head, b"x", None).await;
+    assert!(out.starts_with("HTTP/1.1 400"), "{out}");
+    assert!(out.contains("content-disposition"), "{out}");
     // a wrong or missing token never gets that far either
     let r = reqwest::get(format!("{}/store/dc-1/vol1/a", env.base))
         .await
@@ -1670,21 +1654,26 @@ async fn daemon_stop_during_an_upload_never_completes_it() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn more_parallel_parts_than_connections_still_assemble_exactly() {
+async fn parts_refused_at_the_connection_limit_retry_and_assemble_exactly() {
     let env = std::sync::Arc::new(setup().await);
     let p = "/store/dc-1/vol1/many.bin";
     let r = call(&env, "POST", &format!("{p}?uploads"), vec![], false, &[]).await;
     let id = url_encode(between(&r.text(), "<UploadId>", "</UploadId>"));
-    // 66 parts > the 64-connection limit; the server wants parts of at least 5 MiB
-    let parts: Vec<Vec<u8>> = (0..66).map(|i| random_bytes((5 << 20) + i)).collect();
+    let parts: Vec<Vec<u8>> = (0..6).map(|i| random_bytes((5 << 20) + i)).collect();
     let token = env.token("store");
+    // fill all 64 connection slots with idle connections (the proxy gives them 10 s to send their headers)
+    let addr = env.base.strip_prefix("http://").unwrap().to_string();
+    let mut held = Vec::new();
+    for _ in 0..64 {
+        held.push(tokio::net::TcpStream::connect(&addr).await.unwrap());
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
     let mut set = tokio::task::JoinSet::new();
     for (i, part) in parts.iter().enumerate() {
         let (base, part, id, token) = (env.base.clone(), part.clone(), id.clone(), token.clone());
         set.spawn(async move {
             let n = i + 1;
-            // the proxy closes connections over its limit: retry like a client would
-            for attempt in 0..50 {
+            for attempt in 0..200 {
                 let r = reqwest::Client::new()
                     .put(format!("{base}{p}?partNumber={n}&uploadId={id}"))
                     .header("authorization", format!("Bearer {token}"))
@@ -1706,9 +1695,20 @@ async fn more_parallel_parts_than_connections_still_assemble_exactly() {
             panic!("part {n} never went through");
         });
     }
+    // free the slots after a second
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    drop(held);
     let mut etags = set.join_all().await;
     etags.sort();
-    let retried = etags.iter().filter(|(_, _, a)| *a > 0).count();
+    assert!(
+        etags.iter().all(|(_, _, a)| *a > 0),
+        "every part should have been refused at first: {etags:?}"
+    );
+    assert!(
+        env.log().contains("connection limit (64) reached"),
+        "{}",
+        env.log()
+    );
     let xml: String = etags
         .iter()
         .map(|(n, e, _)| format!("<Part><PartNumber>{n}</PartNumber><ETag>{e}</ETag></Part>"))
@@ -1725,12 +1725,10 @@ async fn more_parallel_parts_than_connections_still_assemble_exactly() {
     assert_eq!(r.status, 200, "{}", r.text());
     let r = call(&env, "GET", p, vec![], false, &[]).await;
     assert_eq!(hex_sha256(&r.body), hex_sha256(&parts.concat()));
-    println!("{retried} of 66 parts needed a retry");
 }
 
-/// 60 s+: a client that stops sending mid-upload is cut off; upstream never gets a complete request.
+/// A client that stops sending mid-upload is cut off (s3_idle); upstream never gets a complete request.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
 async fn stalled_upload_is_cut_off() {
     use tokio::io::AsyncWriteExt;
     let env = setup().await;
@@ -1753,7 +1751,7 @@ async fn stalled_upload_is_cut_off() {
             break s;
         }
         assert!(
-            t.elapsed() < Duration::from_secs(90),
+            t.elapsed() < Duration::from_secs(15),
             "upstream request never ended"
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1761,7 +1759,10 @@ async fn stalled_upload_is_cut_off() {
     let waited = t.elapsed().as_secs();
     let got: usize = between(&rec, "--- body ", " of").parse().unwrap();
     assert!(got < body.len(), "{rec}");
-    assert!((59..80).contains(&waited), "cut off after {waited}s");
+    assert!(
+        (1..6).contains(&waited),
+        "cut off after {waited}s (s3_idle is 2s)"
+    );
     drop(c);
 }
 
@@ -1797,5 +1798,101 @@ async fn boto3_through_the_proxy() {
         out.status.success() && so.trim() == "ok",
         "stdout:\n{so}\nstderr:\n{se}\nlog:\n{}",
         env.log()
+    );
+}
+
+/// A client that stops reading a download is cut off (the watchdog: nothing polls the stream then).
+#[tokio::test(flavor = "multi_thread")]
+async fn client_that_stops_reading_is_cut_off() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let env = setup().await;
+    let body = random_bytes(64 << 20);
+    let r = call(
+        &env,
+        "PUT",
+        "/store/dc-1/vol1/unread.bin",
+        body.clone(),
+        true,
+        &[],
+    )
+    .await;
+    assert_eq!(r.status, 200);
+    let mut c = tokio::net::TcpStream::connect(env.base.strip_prefix("http://").unwrap())
+        .await
+        .unwrap();
+    let head = format!(
+        "GET /store/dc-1/vol1/unread.bin HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\n\r\n",
+        env.base.strip_prefix("http://").unwrap(),
+        env.token("store")
+    );
+    c.write_all(head.as_bytes()).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let mut got = Vec::new();
+    let done = tokio::time::timeout(Duration::from_secs(20), c.read_to_end(&mut got)).await;
+    assert!(done.is_ok(), "the proxy kept the stalled download open");
+    assert!(got.len() < body.len(), "the whole body arrived anyway");
+    assert!(env.log().contains("reply broke off") || got.len() < body.len());
+}
+
+/// An upstream that stops accepting an upload's bytes (and never replies) is cut off.
+#[tokio::test(flavor = "multi_thread")]
+async fn upstream_that_stops_reading_is_cut_off() {
+    let env = setup().await;
+    let body = random_bytes(64 << 20);
+    let t = std::time::Instant::now();
+    let r = reqwest::Client::new()
+        .put(format!("{}/store/raw/vol1/no-read", env.base))
+        .header("authorization", format!("Bearer {}", env.token("store")))
+        .header("x-amz-content-sha256", hex_sha256(&body))
+        .body(body)
+        .send()
+        .await;
+    let waited = t.elapsed().as_secs();
+    assert!(r.is_err() || !r.unwrap().status().is_success());
+    assert!(
+        (1..10).contains(&waited),
+        "cut off after {waited}s (s3_idle is 2s)"
+    );
+}
+
+/// An upstream silent for longer than s3_reply_wait after the request (3 s here) gets a 504, not a hang.
+#[tokio::test(flavor = "multi_thread")]
+async fn upstream_too_slow_to_reply_is_a_504() {
+    let env = setup().await;
+    let t = std::time::Instant::now();
+    let r = call(
+        &env,
+        "PUT",
+        "/store/raw/vol1/slow-reply",
+        random_bytes(3 << 20),
+        true,
+        &[],
+    )
+    .await;
+    let waited = t.elapsed().as_secs();
+    assert_eq!(r.status, 504, "{}", r.text());
+    assert!((3..8).contains(&waited), "504 after {waited}s");
+}
+
+/// After a streamed upload the upstream may be silent past s3_idle (2 s here) while it works, as long as it replies
+/// within s3_reply_wait (3 s): that silence is not a stall.
+#[tokio::test(flavor = "multi_thread")]
+async fn upstream_working_after_an_upload_is_not_a_stall() {
+    let env = setup().await;
+    let body = random_bytes(3 << 20);
+    let r = call(
+        &env,
+        "PUT",
+        "/store/raw/vol1/pause-reply",
+        body.clone(),
+        true,
+        &[],
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    let rec = raw_record(&env, "pause-reply").await;
+    assert!(
+        rec.contains(&format!("--- body {} of {}", body.len(), body.len())),
+        "{rec}"
     );
 }

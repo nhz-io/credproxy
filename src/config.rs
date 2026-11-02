@@ -12,6 +12,10 @@ use std::time::Duration;
 struct RawConfig {
     #[serde(default = "default_idle")]
     idle_lock: String,
+    #[serde(default = "default_s3_idle")]
+    s3_idle: String,
+    #[serde(default = "default_s3_reply_wait")]
+    s3_reply_wait: String,
     #[serde(default = "default_age")]
     age: String,
     #[serde(default = "default_identity")]
@@ -90,6 +94,12 @@ struct RawS3 {
 fn default_idle() -> String {
     "12h".into()
 }
+fn default_s3_idle() -> String {
+    "60s".into()
+}
+fn default_s3_reply_wait() -> String {
+    "2h".into()
+}
 fn default_age() -> String {
     "age".into()
 }
@@ -121,6 +131,11 @@ fn default_sigv4_service() -> String {
 #[derive(Debug)]
 pub struct Config {
     pub idle_lock: Duration,
+    /// S3 transfers have no overall limit; one that moves no bytes for this long is cut off.
+    pub s3_idle: Duration,
+    /// How long an S3 upstream may take to start its reply once the request is sent (a big
+    /// CompleteMultipartUpload can take long).
+    pub s3_reply_wait: Duration,
     pub age: String,
     pub identity: PathBuf,
     pub secrets_dir: PathBuf,
@@ -401,6 +416,19 @@ pub fn parse(text: &str) -> Result<Config, String> {
         if s.routes.is_empty() {
             return Err(format!("service {name}: no routes"));
         }
+        // for S3 the token header must be one credproxy never forwards upstream (and not an x-amz-* header,
+        // which refuses the call)
+        let h = s.auth.header.to_ascii_lowercase();
+        if s.auth.sigv4.is_some()
+            && (h.starts_with("x-amz-")
+                || crate::s3::FORWARDED_HEADERS.contains(&h.as_str())
+                || ["host", "content-length", "transfer-encoding", "expect"].contains(&h.as_str()))
+        {
+            return Err(format!(
+                "service {name}: auth.header {:?} can't carry the token for an S3 service",
+                s.auth.header
+            ));
+        }
         if let Some(v) = &s.auth.sigv4
             && (v.service.is_empty()
                 || !v
@@ -488,6 +516,9 @@ pub fn parse(text: &str) -> Result<Config, String> {
     }
     Ok(Config {
         idle_lock: parse_duration(&raw.idle_lock)?,
+        s3_idle: parse_duration(&raw.s3_idle).map_err(|e| format!("s3_idle: {e}"))?,
+        s3_reply_wait: parse_duration(&raw.s3_reply_wait)
+            .map_err(|e| format!("s3_reply_wait: {e}"))?,
         age: raw.age,
         identity: expand(&raw.identity),
         secrets_dir: expand(&raw.secrets_dir),
@@ -585,6 +616,19 @@ allow = ["GET /pods", "DELETE /pods/{id}", "GET /catalog/gpus"]
     fn defaults_and_routes() {
         let c = parse(RUNPOD).unwrap();
         assert_eq!(c.idle_lock, Duration::from_secs(12 * 3600));
+        assert_eq!(
+            (c.s3_idle, c.s3_reply_wait),
+            (Duration::from_secs(60), Duration::from_secs(7200))
+        );
+        let c = parse(&format!(
+            "s3_idle = \"2s\"\ns3_reply_wait = \"5m\"\n{RUNPOD}"
+        ))
+        .unwrap();
+        assert_eq!(
+            (c.s3_idle, c.s3_reply_wait),
+            (Duration::from_secs(2), Duration::from_secs(300))
+        );
+        assert!(parse(&format!("s3_idle = \"0s\"\n{RUNPOD}")).is_err());
         let s = &c.services["runpod"];
         assert_eq!(s.secret, PathBuf::from("runpod/api-key.age"));
         assert_eq!(s.auth_format, "Bearer {key}");
@@ -652,6 +696,14 @@ s3 = { region = "EU-RO-1", ops = ["GetObject", "PutObject"] }
         assert_eq!((s3.region.as_str(), rest.as_str()), ("EU-RO-1", "/vol/a"));
         assert_eq!(s3.ops, [Op::GetObject, Op::PutObject]);
         assert!(!s3.unsigned_payload && s3.key_prefixes.is_empty());
+        // a header of its own is fine
+        assert!(
+            parse(&S3.replace(
+                "auth = { sigv4 = { service = \"s3\" } }",
+                "auth = { header = \"X-Credproxy-Token\", format = \"{key}\", sigv4 = {} }"
+            ))
+            .is_ok()
+        );
         let bad = [
             S3.replace("auth = { sigv4 = { service = \"s3\" } }", ""),
             S3.replace("\"PutObject\"", "\"CreateBucket\""),
@@ -664,6 +716,18 @@ s3 = { region = "EU-RO-1", ops = ["GetObject", "PutObject"] }
             S3.replace("ops = [", "key_prefixes = [\"a/../b/\"], ops = ["),
             S3.replace("ops = [", "key_prefixes = [\"/\"], ops = ["),
             S3.replace("ops = [", "key_prefixes = [\"runs//\"], ops = ["),
+            S3.replace(
+                "auth = { sigv4 = { service = \"s3\" } }",
+                "auth = { header = \"If-Match\", format = \"{key}\", sigv4 = {} }",
+            ),
+            S3.replace(
+                "auth = { sigv4 = { service = \"s3\" } }",
+                "auth = { header = \"X-Amz-Token\", sigv4 = {} }",
+            ),
+            S3.replace(
+                "auth = { sigv4 = { service = \"s3\" } }",
+                "auth = { header = \"Content-Type\", sigv4 = {} }",
+            ),
             format!(
                 "{S3}[[services.runpod-s3.routes]]\nprefix = \"/v1\"\nupstream = \"https://x\"\nallow = [\"GET /x\"]\n"
             ),
