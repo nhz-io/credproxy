@@ -107,7 +107,8 @@ fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
 /// its head, then how many body bytes arrived out of Content-Length and their SHA-256. The last path segment picks
 /// the reply: `truncate-cl` (says 1000 bytes, sends 500, closes), `truncate-chunked` (one chunk, then closes
 /// without the final one), `chunked-ok`, `stall` (10 of 1000 bytes, then nothing for 90 s), `error-echo` (403
-/// quoting the access key id), anything else 200 with no body.
+/// quoting the access key id), `complete-error` (200 with an <Error> body), `complete-ok`, anything else 200
+/// with no body.
 async fn raw_server(dir: PathBuf) -> u16 {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -182,6 +183,8 @@ async fn raw_server(dir: PathBuf) -> u16 {
                         tokio::time::sleep(Duration::from_secs(90)).await;
                         return;
                     }
+                    "complete-error" => b"HTTP/1.1 200 OK\r\ncontent-type: application/xml\r\nconnection: close\r\n\r\n<?xml version=\"1.0\"?>\n<Error><Code>InternalError</Code><Message>We encountered an internal error.</Message></Error>".to_vec(),
+                    "complete-ok" => b"HTTP/1.1 200 OK\r\ncontent-type: application/xml\r\nconnection: close\r\n\r\n<CompleteMultipartUploadResult><ETag>\"x-2\"</ETag></CompleteMultipartUploadResult>".to_vec(),
                     "error-echo" => format!(
                         "HTTP/1.1 403 Forbidden\r\ncontent-type: application/xml\r\nconnection: close\r\n\r\n<Error><Code>SignatureDoesNotMatch</Code><AWSAccessKeyId>{ACCESS_KEY}</AWSAccessKeyId></Error>"
                     )
@@ -253,7 +256,12 @@ s3 = {{ region = "dc-1", ops = ["GetObject", "ListObjectsV2"], key_prefixes = ["
 [[services.store.routes]]
 prefix = "/raw"
 upstream = "http://127.0.0.1:{raw}"
-s3 = {{ region = "dc-1", ops = ["GetObject", "HeadObject", "PutObject", "CreateMultipartUpload", "UploadPart"] }}
+s3 = {{ region = "dc-1", ops = ["GetObject", "HeadObject", "PutObject", "CreateMultipartUpload", "UploadPart", "CompleteMultipartUpload"], unsigned_payload = true }}
+
+[[services.store.routes]]
+prefix = "/unsigned"
+upstream = "http://127.0.0.1:{s3}"
+s3 = {{ region = "dc-1", ops = ["GetObject", "PutObject"], unsigned_payload = true }}
 
 [services.wrong]
 secret = "s3/wrong"
@@ -745,6 +753,11 @@ async fn big_transfer_memory() {
     let t = std::time::Instant::now();
     let r = call(&env, "GET", p, vec![], false, &[]).await;
     assert_eq!((r.status, r.body.len()), (200, 600_000_000));
+    assert_eq!(
+        hex_sha256(&r.body),
+        hex_sha256(&parts.concat()),
+        "600 MB came back different"
+    );
     let down = t.elapsed();
     watcher.abort();
     println!(
@@ -831,6 +844,7 @@ async fn every_size_and_byte_value_survives() {
                 &[],
             )
             .await;
+            assert_eq!(r.status, 200);
             assert_eq!(r.headers["content-length"], n.to_string().as_str());
         }
     }
@@ -1058,16 +1072,26 @@ async fn client_that_hangs_up_mid_upload_never_completes_one() {
     let body = random_bytes(4 << 20);
     let sum = hex_sha256(&body);
     // upstream sees a short body and a closed connection, not a complete request
-    raw_client(
-        &env,
-        put_head(&env, "/store/raw/vol1/abort1", body.len(), &sum, ""),
-        &body,
-        Some(1 << 20),
-    )
-    .await;
-    let rec = raw_record(&env, "abort1").await;
-    let got: usize = between(&rec, "--- body ", " of").parse().unwrap();
-    assert!(got < body.len(), "upstream got the whole body: {rec}");
+    // also UNSIGNED-PAYLOAD, where no hash would catch a short body: only the framing does
+    for (name, hash) in [("abort1", sum.as_str()), ("abort2", "UNSIGNED-PAYLOAD")] {
+        let head = put_head(
+            &env,
+            &format!("/store/raw/vol1/{name}"),
+            body.len(),
+            hash,
+            "",
+        );
+        raw_client(&env, head, &body, Some(1 << 20)).await;
+        let rec = raw_record(&env, name).await;
+        let got: usize = between(&rec, "--- body ", " of").parse().unwrap();
+        let declared: usize = between(&rec, " of ", " sha256").parse().unwrap();
+        assert_eq!(
+            declared,
+            body.len(),
+            "upstream was told another length: {rec}"
+        );
+        assert!(got < body.len(), "upstream got the whole body: {rec}");
+    }
 
     // against a real S3 server: an existing object is left as it was
     let p = "/store/dc-1/vol1/abort.bin";
@@ -1251,4 +1275,132 @@ async fn chunked_upload_without_length_is_refused() {
     let out = raw_client(&env, head, b"5\r\nhello\r\n0\r\n\r\n", None).await;
     assert!(out.starts_with("HTTP/1.1 411"), "{out}");
     assert!(!env.dir.path().join("store/vol1/chunked.bin").exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unsigned_payload_round_trip_is_byte_exact() {
+    let env = setup().await;
+    let body = random_bytes((3 << 20) + 11);
+    let p = "/store/unsigned/vol1/u.bin";
+    let r = call(
+        &env,
+        "PUT",
+        p,
+        body.clone(),
+        false,
+        &[("x-amz-content-sha256", "UNSIGNED-PAYLOAD")],
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    assert_eq!(hex_sha256(&on_disk(&env, "vol1/u.bin")), hex_sha256(&body));
+    let r = call(&env, "GET", p, vec![], false, &[]).await;
+    assert_eq!(hex_sha256(&r.body), hex_sha256(&body));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn complete_with_error_body_is_not_a_success() {
+    let env = setup().await;
+    let xml = b"<CompleteMultipartUpload/>".to_vec();
+    let r = call(
+        &env,
+        "POST",
+        "/store/raw/vol1/complete-error?uploadId=u1",
+        xml.clone(),
+        false,
+        &[],
+    )
+    .await;
+    assert_eq!(r.status, 502, "{}", r.text());
+    assert!(r.text().contains("InternalError"));
+    let r = call(
+        &env,
+        "POST",
+        "/store/raw/vol1/complete-ok?uploadId=u1",
+        xml,
+        false,
+        &[],
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    assert!(r.text().contains("<CompleteMultipartUploadResult>"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn conditional_and_object_headers_reach_upstream() {
+    let env = setup().await;
+    let cond = [
+        ("range", "bytes=100-"),
+        ("if-range", "\"etag-1\""),
+        ("if-unmodified-since", "Wed, 21 Oct 2015 07:28:00 GMT"),
+        ("if-modified-since", "Wed, 21 Oct 2015 07:28:00 GMT"),
+        ("if-match", "\"etag-1\""),
+    ];
+    call(&env, "GET", "/store/raw/vol1/cond", vec![], false, &cond).await;
+    let rec = raw_record(&env, "cond").await.to_ascii_lowercase();
+    let signed = between(&rec, "signedheaders=", ",").to_string();
+    for (n, v) in cond {
+        assert!(
+            rec.contains(&format!("{n}: {}", v.to_ascii_lowercase())),
+            "{n} missing:\n{rec}"
+        );
+        assert!(
+            signed.split(';').any(|h| h == n),
+            "{n} not signed: {signed}"
+        );
+    }
+    let obj = [
+        ("content-encoding", "gzip"),
+        ("content-disposition", "attachment; filename=\"a.bin\""),
+        ("cache-control", "no-cache"),
+        ("content-type", "application/octet-stream"),
+    ];
+    call(
+        &env,
+        "PUT",
+        "/store/raw/vol1/objhdr",
+        b"x".to_vec(),
+        true,
+        &obj,
+    )
+    .await;
+    let rec = raw_record(&env, "objhdr").await.to_ascii_lowercase();
+    for (n, v) in obj {
+        assert!(
+            rec.contains(&format!("{n}: {}", v.to_ascii_lowercase())),
+            "{n} missing:\n{rec}"
+        );
+    }
+
+    // against the real server (s3s-fs checks preconditions on writes): a failed one stops the call
+    let p = "/store/dc-1/vol1/cond.bin";
+    call(&env, "PUT", p, b"version 2".to_vec(), true, &[]).await;
+    for h in [("if-match", "\"not-the-etag\""), ("if-none-match", "*")] {
+        let r = call(&env, "PUT", p, b"version 3".to_vec(), true, &[h]).await;
+        assert_eq!(r.status, 412, "{h:?}: {}", r.text());
+    }
+    // refused: aws-chunked bodies, a header given twice
+    let r = call(
+        &env,
+        "PUT",
+        p,
+        b"abc".to_vec(),
+        true,
+        &[("content-encoding", "aws-chunked")],
+    )
+    .await;
+    assert_eq!(r.status, 400, "{}", r.text());
+    let r = call(
+        &env,
+        "GET",
+        p,
+        vec![],
+        false,
+        &[("range", "bytes=0-1"), ("range", "bytes=5-6")],
+    )
+    .await;
+    assert_eq!(r.status, 400, "{}", r.text());
+    assert_eq!(
+        call(&env, "GET", p, vec![], false, &[]).await.body,
+        b"version 2"
+    );
 }

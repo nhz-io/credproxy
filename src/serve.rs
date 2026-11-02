@@ -54,9 +54,10 @@ pub fn run(cfg_path: &Path) -> Result<(), String> {
 
 /// At most this many client connections at once; more are closed right away.
 const MAX_CONNECTIONS: usize = 64;
-/// One request per connection, and no connection lives longer than this (the longest upstream call, an S3
-/// transfer, plus unlock wait and slack).
-const CONNECTION_LIFETIME: Duration = proxy::S3_TIMEOUT.saturating_add(Duration::from_secs(300));
+/// One request per connection, and no connection lives longer than this (unlock wait + upstream + slack)...
+const CONNECTION_LIFETIME: Duration = Duration::from_secs(300);
+/// ...unless it is an S3 call: the longest upstream call (a transfer) plus the same slack.
+const S3_CONNECTION_LIFETIME: Duration = proxy::S3_TIMEOUT.saturating_add(CONNECTION_LIFETIME);
 /// How long to keep trying the port when it's busy (e.g. the previous daemon still releasing it).
 const BIND_RETRY: Duration = Duration::from_secs(30);
 
@@ -146,16 +147,23 @@ async fn serve(cfg: Config) -> Result<(), String> {
                 let (vault, http) = (vault.clone(), http.clone());
                 tokio::spawn(async move {
                     let _permit = permit;
+                    let long = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let is_long = long.clone();
                     let svc = service_fn(move |req| {
-                        let (vault, http) = (vault.clone(), http.clone());
-                        async move { Ok::<_, std::convert::Infallible>(proxy::handle(vault, http, req).await) }
+                        let (vault, http, long) = (vault.clone(), http.clone(), long.clone());
+                        async move { Ok::<_, std::convert::Infallible>(proxy::handle(vault, http, req, long).await) }
                     });
                     let conn = http1::Builder::new()
                         .timer(TokioTimer::new())
                         .header_read_timeout(Duration::from_secs(10))
                         .keep_alive(false)
                         .serve_connection(TokioIo::new(conn), svc);
-                    let _ = tokio::time::timeout(CONNECTION_LIFETIME, conn).await;
+                    tokio::pin!(conn);
+                    if tokio::time::timeout(CONNECTION_LIFETIME, &mut conn).await.is_err()
+                        && is_long.load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        let _ = tokio::time::timeout(S3_CONNECTION_LIFETIME - CONNECTION_LIFETIME, conn).await;
+                    }
                 });
             }
             a = ctl.accept() => {

@@ -332,7 +332,8 @@ fn check_s3(r: RawS3) -> Result<S3Route, String> {
         p.starts_with('/')
             || !p.ends_with('/')
             || p.chars().any(char::is_control)
-            || p.trim_end_matches('/')
+            || p.strip_suffix('/')
+                .unwrap_or(p)
                 .split('/')
                 .any(|s| s.is_empty() || s == "." || s == "..")
     }) {
@@ -641,6 +642,7 @@ s3 = { region = "EU-RO-1", ops = ["GetObject", "PutObject"] }
             S3.replace("ops = [", "key_prefixes = [\"runs\"], ops = ["),
             S3.replace("ops = [", "key_prefixes = [\"a/../b/\"], ops = ["),
             S3.replace("ops = [", "key_prefixes = [\"/\"], ops = ["),
+            S3.replace("ops = [", "key_prefixes = [\"runs//\"], ops = ["),
             format!(
                 "{S3}[[services.runpod-s3.routes]]\nprefix = \"/v1\"\nupstream = \"https://x\"\nallow = [\"GET /x\"]\n"
             ),

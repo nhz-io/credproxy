@@ -127,10 +127,12 @@ fn host_ok(headers: &hyper::HeaderMap, listen: std::net::SocketAddr) -> bool {
     h == format!("{ip}:{port}") || h.eq_ignore_ascii_case(&format!("localhost:{port}"))
 }
 
+/// `long` is set once the request turns out to be an S3 call: only those connections may outlive the short limit.
 pub async fn handle(
     vault: Arc<Vault>,
     http: reqwest::Client,
     req: Request<Incoming>,
+    long: Arc<std::sync::atomic::AtomicBool>,
 ) -> Response<Body> {
     let start = Instant::now();
     let method = req.method().as_str().to_string();
@@ -172,7 +174,7 @@ pub async fn handle(
     let ok = presented(req.headers(), &svc.auth_header, &svc.auth_format)
         .is_some_and(|t| vault.check_token(&service, t));
     let res = if ok {
-        forward(&vault, &http, &service, &method, &rest, req).await
+        forward(&vault, &http, &service, &method, &rest, req, &long).await
     } else {
         // same text as for an unknown service
         reply(
@@ -199,12 +201,14 @@ async fn forward(
     method: &str,
     rest: &str,
     req: Request<Incoming>,
+    long: &std::sync::atomic::AtomicBool,
 ) -> Response<Body> {
     let svc = &vault.cfg.services[service];
     let Some((route, sub)) = svc.route(rest) else {
         return reply(StatusCode::FORBIDDEN, "path not allowed");
     };
     if route.s3.is_some() {
+        long.store(true, std::sync::atomic::Ordering::Relaxed);
         return forward_s3(vault, http, service, method, route, &sub, req).await;
     }
     let (parts, body) = req.into_parts();
@@ -338,12 +342,24 @@ async fn buffered_reply(mut res: reqwest::Response, secrets: &[&[u8]]) -> Respon
 /// Client headers an S3 call may carry upstream (all signed). Other headers are dropped, except `x-amz-*` ones,
 /// which refuse the call (see S3_CLIENT_AMZ_OK): dropping `x-amz-copy-source` would turn a CopyObject into an
 /// empty PutObject that overwrites its destination.
-const S3_REQUEST_HEADERS: [&str; 5] = [
+const S3_REQUEST_HEADERS: [&str; 14] = [
     "content-type",
     "content-md5",
+    // what the object is stored with
+    "content-encoding",
+    "content-disposition",
+    "content-language",
+    "cache-control",
+    "expires",
+    // reads and conditional writes: dropping one would change what the call returns or overwrites (a resumed
+    // download without its If-Range could append another version's tail)
     "range",
     "if-match",
     "if-none-match",
+    "if-modified-since",
+    "if-unmodified-since",
+    "if-range",
+    "x-amz-content-sha256",
 ];
 /// The only `x-amz-*` headers a client may send: the payload hash, and two the signature replaces anyway.
 const S3_CLIENT_AMZ_OK: [&str; 3] = ["x-amz-content-sha256", "x-amz-date", "x-amz-user-agent"];
@@ -400,6 +416,17 @@ async fn forward_s3(
         return reply(
             StatusCode::FORBIDDEN,
             &format!("header {} not allowed", h.as_str()),
+        );
+    }
+    if parts.headers.get_all("content-encoding").iter().any(|v| {
+        v.as_bytes()
+            .to_ascii_lowercase()
+            .windows(11)
+            .any(|w| w == b"aws-chunked")
+    }) {
+        return reply(
+            StatusCode::BAD_REQUEST,
+            "aws-chunked bodies are not supported; send the body's SHA-256 in x-amz-content-sha256",
         );
     }
     let claimed = match parts
@@ -490,10 +517,18 @@ async fn forward_s3(
         url.push('?');
         url.push_str(&target.query);
     }
+    // x-amz-content-sha256 is the signer's to set (from `hash`)
     let forwarded: Vec<(&str, &str)> = S3_REQUEST_HEADERS
         .iter()
+        .filter(|n| **n != "x-amz-content-sha256")
         .filter_map(|n| Some((*n, parts.headers.get(*n)?.to_str().ok()?)))
         .collect();
+    if let Some(n) = S3_REQUEST_HEADERS
+        .iter()
+        .find(|n| parts.headers.get_all(**n).iter().count() > 1)
+    {
+        return reply(StatusCode::BAD_REQUEST, &format!("header {n} given twice"));
+    }
     let hash = match &payload {
         Payload::Small(_, h) | Payload::Stream(_, _, h) => h.as_str(),
     };
@@ -544,6 +579,22 @@ async fn forward_s3(
     };
     if !res.status().is_success() {
         return buffered_reply(res, &[access_key.as_bytes(), secret.as_bytes()]).await;
+    }
+    // S3 may answer CompleteMultipartUpload with 200 and an <Error> body (the failure shows up after the headers
+    // went out). A client checking only the status would think the object exists: make it a 502.
+    if target.op == s3::Op::CompleteMultipartUpload {
+        let r = buffered_reply(res, &[access_key.as_bytes(), secret.as_bytes()]).await;
+        let (head, body) = r.into_parts();
+        let bytes = match body.collect().await {
+            Ok(b) => b.to_bytes(),
+            Err(_) => return reply(StatusCode::BAD_GATEWAY, "upstream response broken"),
+        };
+        if bytes.windows(7).any(|w| w == b"<Error>") {
+            let mut r = Response::from_parts(head, full(bytes));
+            *r.status_mut() = StatusCode::BAD_GATEWAY;
+            return r;
+        }
+        return Response::from_parts(head, full(bytes));
     }
     let mut b = Response::builder().status(res.status().as_u16());
     for n in S3_REPLY_HEADERS {
