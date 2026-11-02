@@ -59,8 +59,8 @@ const CONNECTION_LIFETIME: Duration = Duration::from_secs(300);
 /// How long to keep trying the port when it's busy (e.g. the previous daemon still releasing it).
 const BIND_RETRY: Duration = Duration::from_secs(30);
 
-/// Run a connection until it ends, or until it outlives CONNECTION_LIFETIME, or (once it carries an allowed S3
-/// call, which has no overall limit) until it stops making progress: no bytes for `idle` outside expected
+/// Run a connection until it ends, or until it outlives CONNECTION_LIFETIME, or (once it carries an allowed streaming
+/// call, an S3 call or a B2 download, which has no overall limit) until it stops making progress: no bytes for `idle` outside expected
 /// silence. The watchdog sees what the streams' own idle timers can't: a client that stops reading or an upstream
 /// that stops accepting, where nothing polls those streams. Dropping the future closes the connection, and with
 /// it any upstream request in flight.

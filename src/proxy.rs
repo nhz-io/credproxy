@@ -36,7 +36,8 @@ pub(crate) const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(60);
 /// they have no overall time limit.
 pub(crate) const IDLE: Duration = Duration::from_secs(60);
 
-/// What a connection's watchdog (serve.rs) needs to know: whether it carries an allowed S3 call, when bytes last
+/// What a connection's watchdog (serve.rs) needs to know: whether it carries an allowed streaming call (S3,
+/// a B2 download), when bytes last
 /// moved, and until when silence is expected (Touch ID, the upstream preparing its reply).
 pub struct Progress {
     state: std::sync::Mutex<ProgressState>,
@@ -188,7 +189,8 @@ fn host_ok(headers: &hyper::HeaderMap, listen: std::net::SocketAddr) -> bool {
     h == format!("{ip}:{port}") || h.eq_ignore_ascii_case(&format!("localhost:{port}"))
 }
 
-/// `progress` tells the connection's watchdog about an allowed S3 call; other calls live within the short limit.
+/// `progress` tells the connection's watchdog about an allowed streaming call (S3, a B2 download); other calls live
+/// within the short limit.
 pub async fn handle(
     vault: Arc<Vault>,
     http: Clients,
