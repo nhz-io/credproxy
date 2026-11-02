@@ -445,8 +445,13 @@ impl Vault {
                 }
                 // same as pressing Cancel: requests don't raise a new prompt for UNLOCK_BACKOFF
                 s.failed_at = Some(Instant::now());
-                p.done
-                    .send_replace(Some(Err("locked while waiting for Touch ID".into())));
+                // age runs only while the prompt may be up; after it, a B2 unlock is authorizing
+                let msg = if p.pgid.is_some() {
+                    "locked while waiting for Touch ID"
+                } else {
+                    "locked while unlocking"
+                };
+                p.done.send_replace(Some(Err(msg.into())));
             }
             if had_key || pending.is_some() {
                 locked.push(name.clone());

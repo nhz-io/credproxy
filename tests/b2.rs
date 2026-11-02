@@ -770,7 +770,7 @@ async fn lock_stops_an_authorize_in_flight() {
     assert!(env.cli(&["lock", "b2"]).status.success());
     let (code, body) = call.await.unwrap();
     assert_eq!(code, 503);
-    assert!(body.contains("locked"), "{body}");
+    assert!(body.contains("locked while unlocking"), "{body}");
     let tries = env.st(|s| s.authorize_tries);
     tokio::time::sleep(Duration::from_millis(3000)).await;
     assert_eq!(
