@@ -435,12 +435,14 @@ async fn forward_s3(
             }
             Payload::Stream(body, n, hash)
         }
-        (claimed, _) => {
+        (claimed, streams) => {
             if length.is_some_and(|n| n > MAX_REQUEST as u64) {
-                return reply(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "bodies over 1 MiB need x-amz-content-sha256 (the body's SHA-256)",
-                );
+                let msg = if streams {
+                    "bodies over 1 MiB need x-amz-content-sha256 (the body's SHA-256)"
+                } else {
+                    "request body too large"
+                };
+                return reply(StatusCode::PAYLOAD_TOO_LARGE, msg);
             }
             let b = match read_small(body).await {
                 Ok(b) => b,
@@ -507,6 +509,10 @@ async fn forward_s3(
         out = out.header(n.as_str(), v);
     }
     out = match payload {
+        // hyper sends no Content-Length for an empty body; some S3 front ends answer a bodiless POST/PUT with 411
+        Payload::Small(b, _) if b.is_empty() && matches!(method, "POST" | "PUT") => {
+            out.header("content-length", "0")
+        }
         Payload::Small(b, _) if b.is_empty() => out,
         Payload::Small(b, _) => out.body(b),
         Payload::Stream(body, n, _) => out
@@ -526,7 +532,19 @@ async fn forward_s3(
             b = b.header(n, v.clone());
         }
     }
-    let stream = idle(res.bytes_stream()).map_ok(Frame::data);
+    // The request is logged when the reply starts; a reply that breaks off later gets its own line.
+    let (log_file, what) = (
+        vault.cfg.log.clone(),
+        format!("{service} {method} {}{}", route.prefix, loggable(sub)),
+    );
+    let stream = idle(res.bytes_stream())
+        .inspect_err(move |_| {
+            log::line(
+                &log_file,
+                &format!("{what} reply broke off (stalled or upstream closed)"),
+            )
+        })
+        .map_ok(Frame::data);
     b.body(BodyExt::boxed(StreamBody::new(stream))).unwrap()
 }
 

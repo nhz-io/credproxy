@@ -99,6 +99,25 @@ async fn s3_server(root: PathBuf, secret: String) -> u16 {
     port
 }
 
+/// Records the head of each request it gets in `file`, answers 200 with an empty body.
+async fn raw_server(file: PathBuf) -> u16 {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = l.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let (mut c, _) = l.accept().await.unwrap();
+            let mut buf = vec![0u8; 16384];
+            let n = c.read(&mut buf).await.unwrap_or(0);
+            std::fs::write(&file, &buf[..n]).unwrap();
+            let _ = c
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                .await;
+        }
+    });
+    port
+}
+
 async fn setup() -> Env {
     let dir = tempfile::Builder::new().prefix("cps3").tempdir().unwrap();
     let d = dir.path();
@@ -111,6 +130,7 @@ async fn setup() -> Env {
     std::fs::create_dir_all(d.join("store/vol1")).unwrap();
     let s3 = s3_server(d.join("store"), secret.clone()).await;
     let listen = free_port();
+    let raw = raw_server(d.join("raw-request.txt")).await;
 
     sh(Command::new("age-keygen").arg("-o").arg(d.join("id.txt")));
     let public =
@@ -151,6 +171,11 @@ s3 = {{ region = "dc-1", ops = ["GetObject", "HeadObject", "PutObject", "DeleteO
 prefix = "/ro"
 upstream = "http://127.0.0.1:{s3}"
 s3 = {{ region = "dc-1", ops = ["GetObject", "ListObjectsV2"], key_prefixes = ["pub/"] }}
+
+[[services.store.routes]]
+prefix = "/raw"
+upstream = "http://127.0.0.1:{raw}"
+s3 = {{ region = "dc-1", ops = ["CreateMultipartUpload"] }}
 
 [services.wrong]
 secret = "s3/wrong"
@@ -453,6 +478,27 @@ async fn multipart_upload() {
     )
     .await;
     assert_eq!(r.status, 204, "{}", r.text());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bodiless_post_says_content_length_zero() {
+    let env = setup().await;
+    let r = call(
+        &env,
+        "POST",
+        "/store/raw/vol1/k?uploads",
+        vec![],
+        false,
+        &[],
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    let head = std::fs::read_to_string(env.dir.path().join("raw-request.txt")).unwrap();
+    let head = head.to_ascii_lowercase();
+    assert!(head.starts_with("post /vol1/k?uploads= http/1.1"), "{head}");
+    assert!(head.contains("\r\ncontent-length: 0\r\n"), "{head}");
+    assert!(head.contains("authorization: aws4-hmac-sha256 credential=akidcredproxytest/"));
+    assert!(!head.contains("bearer") && !head.contains(&env.secret.to_ascii_lowercase()));
 }
 
 fn url_encode(s: &str) -> String {
