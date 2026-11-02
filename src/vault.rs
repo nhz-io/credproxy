@@ -29,13 +29,19 @@ pub enum Secret {
 
 struct Unlocked {
     secret: Secret,
-    last_used: Instant,
+    /// Wall-clock, like `expires`: idle_lock counts time the Mac sleeps.
+    last_used: SystemTime,
     /// B2: the token's end (`relock_after` after the unlock); the service locks then. Wall-clock time: B2's token
     /// lifetime counts while the Mac sleeps, which `Instant` (uptime on macOS) doesn't.
     expires: Option<SystemTime>,
 }
 
 impl Unlocked {
+    /// Time since last use (zero if the clock went back).
+    fn idle_for(&self) -> Duration {
+        self.last_used.elapsed().unwrap_or_default()
+    }
+
     fn expired(&self) -> bool {
         self.expires.is_some_and(|e| SystemTime::now() >= e)
     }
@@ -45,11 +51,13 @@ impl Unlocked {
 type Outcome = Option<Result<(), String>>;
 
 /// An unlock in progress. It runs as its own task, so a waiting client that goes away doesn't cancel it;
-/// `lock` and `stop` do (they kill age and its plugin, which closes the prompt).
+/// `lock` and `stop` do (they kill age and its plugin, which closes the prompt, and abort the task: a B2 authorize
+/// in flight stops there, and the key it holds is zeroed as the task is dropped).
 struct Pending {
     id: u64,
     pgid: Option<libc::pid_t>,
     done: Arc<watch::Sender<Outcome>>,
+    task: Option<tokio::task::AbortHandle>,
 }
 
 #[derive(Default)]
@@ -221,7 +229,7 @@ impl Vault {
                     );
                 }
                 if let Some(u) = slot.unlocked.as_mut() {
-                    u.last_used = Instant::now();
+                    u.last_used = SystemTime::now();
                     return Ok(u.secret.clone());
                 }
                 match &slot.pending {
@@ -239,12 +247,18 @@ impl Vault {
                         let id = self.next_job.fetch_add(1, Ordering::Relaxed);
                         let (tx, rx) = watch::channel(None);
                         let done = Arc::new(tx);
+                        // (the slots lock is held: the job can't look at its Pending before `task` is set)
+                        let task = tokio::spawn(self.clone().unlock_job(
+                            service.to_string(),
+                            id,
+                            done.clone(),
+                        ));
                         slot.pending = Some(Pending {
                             id,
                             pgid: None,
-                            done: done.clone(),
+                            done,
+                            task: Some(task.abort_handle()),
                         });
-                        tokio::spawn(self.clone().unlock_job(service.to_string(), id, done));
                         rx
                     }
                 }
@@ -291,7 +305,7 @@ impl Vault {
                 slot.failed_at = None;
                 slot.unlocked = Some(Unlocked {
                     secret,
-                    last_used: Instant::now(),
+                    last_used: SystemTime::now(),
                     expires,
                 });
                 log::line(&self.cfg.log, &format!("{service} unlocked"));
@@ -404,6 +418,9 @@ impl Vault {
                 if let Some(g) = p.pgid {
                     kill_group(g);
                 }
+                if let Some(t) = &p.task {
+                    t.abort();
+                }
                 // same as pressing Cancel: requests don't raise a new prompt for UNLOCK_BACKOFF
                 s.failed_at = Some(Instant::now());
                 p.done
@@ -425,7 +442,7 @@ impl Vault {
         for (name, s) in slots.iter_mut() {
             let why = match &s.unlocked {
                 Some(u) if u.expired() => "B2 token expired",
-                Some(u) if u.last_used.elapsed() >= idle => "idle",
+                Some(u) if u.idle_for() >= idle => "idle",
                 _ => continue,
             };
             s.unlocked = None;
@@ -449,7 +466,7 @@ impl Vault {
                     .filter(|u| !u.expired())
                 {
                     Some(u) => {
-                        let idle = self.cfg.idle_lock.saturating_sub(u.last_used.elapsed());
+                        let idle = self.cfg.idle_lock.saturating_sub(u.idle_for());
                         let left = match u.expires {
                             Some(e) => {
                                 idle.min(e.duration_since(SystemTime::now()).unwrap_or_default())
@@ -543,9 +560,11 @@ allow = ["GET /x"]
         };
         {
             let mut slots = v.slots.lock().unwrap();
-            slots.get_mut("b2").unwrap().unlocked = Some(unlocked(Some(past), Instant::now()));
-            slots.get_mut("k").unwrap().unlocked =
-                Some(unlocked(None, Instant::now() - Duration::from_secs(3600)));
+            slots.get_mut("b2").unwrap().unlocked = Some(unlocked(Some(past), SystemTime::now()));
+            slots.get_mut("k").unwrap().unlocked = Some(unlocked(
+                None,
+                SystemTime::now() - Duration::from_secs(3600),
+            ));
         }
         // an expired B2 session shows as locked before the sweep
         assert!(v.status().contains(&("b2".to_string(), "locked", 0)));

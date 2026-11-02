@@ -590,15 +590,19 @@ async fn downloads_stream_with_b2_headers_only() {
         .unwrap();
     assert_eq!(r.status().as_u16(), 503);
     assert!(env.status().contains("b2: locked"));
-    // a HEAD's 401 has no body: still taken as an expired token
-    let r = c
-        .head(format!("{}/file/my-bkt/x.bin", env.base))
-        .header("authorization", format!("Bearer {tok}"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(r.status().as_u16(), 503);
+    // a HEAD's 401 has no body to say why: taken as the end of a token that has worked
+    env.st(|s| s.expire = false);
+    let head = |env: &Env| {
+        reqwest::Client::new()
+            .head(format!("{}/file/my-bkt/x.bin", env.base))
+            .header("authorization", format!("Bearer {}", env.token()))
+            .send()
+    };
+    assert_eq!(head(&env).await.unwrap().status().as_u16(), 200);
+    env.st(|s| s.expire = true);
+    assert_eq!(head(&env).await.unwrap().status().as_u16(), 503);
     assert_eq!(env.st(|s| s.authorizes), 2);
+    assert!(env.status().contains("b2: locked"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -661,10 +665,16 @@ async fn a_401_ends_the_token_unless_b2_says_unauthorized() {
     assert_eq!(r.headers()["retry-after"], "7");
     assert!(r.text().await.unwrap().contains("\"unauthorized\""));
     assert!(env.status().contains("b2: unlocked"));
-    // a 401 without B2's code (a front end's page): the token is taken as ended
+    // a 401 without B2's code (a front end's page) to a token that has worked: taken as its end
     env.st(|s| s.other_401 = Some(None));
     assert_eq!(env.call("b2_list_buckets", "{}").await.0, 503);
     assert!(env.status().contains("b2: locked"));
+    // the retry unlocks; the same 401 to the new token, which never worked, is a refusal: 502, no unlock loop
+    let (code, body) = env.call("b2_list_buckets", "{}").await;
+    assert_eq!(code, 502, "{body}");
+    assert!(env.status().contains("b2: unlocked"));
+    assert_eq!(env.call("b2_list_buckets", "{}").await.0, 502);
+    assert_eq!(env.st(|s| s.authorizes), 2);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -684,4 +694,40 @@ async fn a_download_waits_through_a_slow_unlock() {
     assert_eq!(r.status().as_u16(), 200);
     assert_eq!(r.text().await.unwrap(), "contents of /file/my-bkt/x.bin");
     assert!(!env.log().contains("cut off"), "{}", env.log());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lock_stops_an_authorize_in_flight() {
+    let env = setup("23h").await;
+    env.st(|s| {
+        s.authorize_fail = 10;
+        s.authorize_delay = Duration::from_millis(500);
+    });
+    let base = env.base.clone();
+    let tok = env.token();
+    let call = tokio::spawn(async move {
+        let r = reqwest::Client::new()
+            .post(format!("{base}/b2api/v3/b2_list_buckets"))
+            .header("authorization", format!("Bearer {tok}"))
+            .send()
+            .await
+            .unwrap();
+        (r.status().as_u16(), r.text().await.unwrap())
+    });
+    // the first try is answered (503) at ~0.5 s; the second would go out at ~1.5 s
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    assert!(env.cli(&["lock", "b2"]).status.success());
+    let (code, body) = call.await.unwrap();
+    assert_eq!(code, 503);
+    assert!(body.contains("locked"), "{body}");
+    let tries = env.st(|s| s.authorize_tries);
+    tokio::time::sleep(Duration::from_millis(3000)).await;
+    assert_eq!(
+        env.st(|s| s.authorize_tries),
+        tries,
+        "no try after the lock"
+    );
+    assert_eq!(tries, 1);
+    assert!(env.status().contains("b2: locked"));
+    assert!(!env.log().contains("b2 unlocked"));
 }

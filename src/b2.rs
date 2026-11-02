@@ -67,6 +67,9 @@ pub struct Session {
     pub api_url: String,
     pub download_url: String,
     pub account_id: String,
+    /// Some call with this token got a reply other than 401: a later 401 without B2's reason is then taken as the
+    /// token's end; before that, as a refusal.
+    pub worked: std::sync::atomic::AtomicBool,
 }
 
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -105,8 +108,9 @@ fn check_b2_url(u: &str, local: bool) -> Result<String, String> {
     Ok(u)
 }
 
-/// b2_authorize_account with `key` ("<key id>\n<application key>"). The key, and every copy credproxy made of
-/// it, is zeroed once the reply's headers are in, before its body is read.
+/// b2_authorize_account with `key` ("<key id>\n<application key>"). credproxy's own buffers holding it (the key,
+/// `id:key`, the Basic header string) are zeroed once the reply's headers are in, before its body is read; the
+/// header values handed to the HTTP client (one per try) are freed without zeroing, like its internal buffers.
 pub async fn authorize(
     http: &reqwest::Client,
     cfg: &B2Auth,
@@ -220,6 +224,7 @@ pub async fn authorize(
         download_url: url("downloadUrl")?,
         token,
         account_id,
+        worked: Default::default(),
     })
 }
 
@@ -244,10 +249,11 @@ fn token_value(session: &Session) -> Result<reqwest::header::HeaderValue, Respon
     Ok(v)
 }
 
-/// A reply other than a successful download: buffered and scrubbed of the token. A 401 means the token ended
-/// (expired, revoked, or a reply without B2's code, e.g. a HEAD's), except B2's `unauthorized` (the token is good
-/// but may not do this): the service locks and the client gets a 503 (a retry unlocks again). The call is not
-/// replayed, it may change state.
+/// A reply other than a successful download: buffered and scrubbed of the token. A 401 saying the token expired or
+/// is bad, or one without B2's code (e.g. a HEAD's) to a token that has worked before, means the token ended: the
+/// service locks and the client gets a 503 (a retry unlocks again). The call is not replayed, it may change state.
+/// A codeless 401 to a token that never worked isn't taken as its end: it becomes a 502, so a client doesn't unlock (Touch ID)
+/// again and again for a refusal. B2's `unauthorized` (the token is good but may not do this) is passed on.
 async fn buffered(
     vault: &Vault,
     service: &str,
@@ -258,11 +264,27 @@ async fn buffered(
         Ok(b) => b,
         Err(r) => return r,
     };
+    if b.status != StatusCode::UNAUTHORIZED {
+        session
+            .worked
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     if b.status == StatusCode::UNAUTHORIZED {
         let code = serde_json::from_slice::<Value>(&b.body)
             .ok()
             .and_then(|v| v["code"].as_str().map(str::to_string));
-        if code.as_deref() != Some("unauthorized") {
+        let ended = match code.as_deref() {
+            Some("expired_auth_token" | "bad_auth_token") => true,
+            Some(_) => false,
+            None => session.worked.load(std::sync::atomic::Ordering::Relaxed),
+        };
+        if code.is_none() && !ended {
+            return reply(
+                StatusCode::BAD_GATEWAY,
+                "B2 answered 401 without saying why, to a token that hasn't worked yet: not taken as its end",
+            );
+        }
+        if ended {
             vault.expire(service, session);
             return reply(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -461,6 +483,9 @@ async fn download(
         }
         return r;
     }
+    session
+        .worked
+        .store(true, std::sync::atomic::Ordering::Relaxed);
     // a header holding the token is dropped (B2 never sends one; the body can't be checked, it streams)
     let token = session.token.as_bytes();
     let keep: Vec<_> = res
