@@ -22,7 +22,7 @@ pub const MAX_RESPONSE: usize = 16 << 20;
 /// Largest S3 request body (one PutObject or UploadPart). RunPod's limit per part is 500 MB.
 pub const MAX_S3_BODY: u64 = 512 << 20;
 pub const USER_AGENT: &str = concat!("credproxy/", env!("CARGO_PKG_VERSION"));
-/// Upstream TCP connect (DNS included), for both clients.
+/// Upstream TCP connect (DNS included) for key-in-header routes; S3 uses the config's s3_connect_timeout.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// How S3 refusals and failures after a state-changing request may have reached the upstream say so.
 const OUTCOME_UNKNOWN: &str = "the outcome is unknown (it may still complete); check the object (HEAD, ListParts) before retrying";
@@ -116,14 +116,14 @@ fn api_builder() -> reqwest::ClientBuilder {
         .no_proxy()
 }
 
-fn s3_builder() -> reqwest::ClientBuilder {
-    api_builder().http1_only()
+fn s3_builder(connect: Duration) -> reqwest::ClientBuilder {
+    api_builder().http1_only().connect_timeout(connect)
 }
 
-pub fn clients() -> Clients {
+pub fn clients(s3_connect: Duration) -> Clients {
     Clients {
         api: api_builder().build().expect("http client"),
-        s3: s3_builder().build().expect("http client"),
+        s3: s3_builder(s3_connect).build().expect("http client"),
     }
 }
 
@@ -607,8 +607,8 @@ async fn forward_s3(
         Err(e) => return reply(StatusCode::SERVICE_UNAVAILABLE, &e),
     };
     // connecting to the upstream (and TLS) comes before any byte can move: expected silence too
-    let idle_limit = vault.cfg.s3_idle;
-    progress.quiet_for(CONNECT_TIMEOUT + idle_limit);
+    let (idle_limit, connect_limit) = (vault.cfg.s3_idle, vault.cfg.s3_connect_timeout);
+    progress.quiet_for(connect_limit + idle_limit);
     let Some((access_key, secret)) = key.split_once('\n') else {
         return reply(StatusCode::INTERNAL_SERVER_ERROR, "bad key");
     };
@@ -659,6 +659,10 @@ async fn forward_s3(
     } else {
         idle_limit
     };
+    // A small request is handed on whole before the connection exists, so its clock includes connecting; a
+    // streamed one is only counted sent once its last byte went through the open connection.
+    let small = !matches!(payload, Payload::Stream(..));
+    let reply_clock = reply_limit + if small { connect_limit } else { Duration::ZERO };
     let (sent_tx, sent_rx) = tokio::sync::oneshot::channel::<()>();
     // once a state-changing request has gone out, a failure can't tell whether the upstream acted on it
     let changes = method != "GET" && method != "HEAD";
@@ -671,7 +675,7 @@ async fn forward_s3(
         move || {
             if let Some(t) = sent_tx.take() {
                 sent.store(true, std::sync::atomic::Ordering::Relaxed);
-                progress.quiet_for(reply_limit + idle_limit);
+                progress.quiet_for(reply_clock + idle_limit);
                 let _ = t.send(());
             }
         }
@@ -679,7 +683,7 @@ async fn forward_s3(
     // when a small request (e.g. CompleteMultipartUpload) went out: its reply, body included, must be done
     // within reply_limit of this
     let sent_at = tokio::time::Instant::now();
-    if !matches!(payload, Payload::Stream(..)) {
+    if small {
         on_sent();
     }
     out = match payload {
@@ -711,7 +715,7 @@ async fn forward_s3(
     let no_reply = async {
         // a dropped sender (the request failed before its end) never starts the clock; send() reports that
         if sent_rx.await.is_ok() {
-            tokio::time::sleep(reply_limit).await;
+            tokio::time::sleep(reply_clock).await;
         } else {
             std::future::pending::<()>().await;
         }
@@ -761,7 +765,7 @@ async fn forward_s3(
         // The whole reply counts as the upstream's work: S3 may send the headers at once, then keep-alive spaces
         // (or nothing) while it assembles the parts, then the result. Silence is expected throughout, up to
         // s3_reply_wait.
-        let left = reply_limit.saturating_sub(sent_at.elapsed());
+        let left = reply_clock.saturating_sub(sent_at.elapsed());
         progress.quiet_for(left + idle_limit);
         let secrets = [access_key.as_bytes(), secret.as_bytes()];
         let read = read_reply(res, &secrets, None);
@@ -846,6 +850,7 @@ async fn forward_s3(
 #[cfg(test)]
 mod tests {
     use super::scrub;
+    use std::time::Duration;
 
     /// The protocol a client built from `builder` picks with a TLS server that offers both h2 and http/1.1.
     async fn negotiated(builder: reqwest::ClientBuilder) -> Vec<u8> {
@@ -889,7 +894,10 @@ mod tests {
 
     #[tokio::test]
     async fn s3_upstreams_speak_http1_only() {
-        assert_eq!(negotiated(super::s3_builder()).await, b"http/1.1");
+        assert_eq!(
+            negotiated(super::s3_builder(Duration::from_secs(30))).await,
+            b"http/1.1"
+        );
         // the same server and setup do get HTTP/2 from the other client: the check can tell them apart
         assert_eq!(negotiated(super::api_builder()).await, b"h2");
     }

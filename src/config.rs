@@ -16,6 +16,8 @@ struct RawConfig {
     s3_idle: String,
     #[serde(default = "default_s3_reply_wait")]
     s3_reply_wait: String,
+    #[serde(default = "default_s3_connect_timeout")]
+    s3_connect_timeout: String,
     #[serde(default = "default_age")]
     age: String,
     #[serde(default = "default_identity")]
@@ -100,6 +102,9 @@ fn default_s3_idle() -> String {
 fn default_s3_reply_wait() -> String {
     "2h".into()
 }
+fn default_s3_connect_timeout() -> String {
+    "30s".into()
+}
 fn default_age() -> String {
     "age".into()
 }
@@ -136,6 +141,9 @@ pub struct Config {
     /// How long an S3 upstream may take to start its reply once the request is sent (a big
     /// CompleteMultipartUpload can take long).
     pub s3_reply_wait: Duration,
+    /// Connecting to an S3 upstream (DNS, TCP, TLS): counted as expected silence, and into the reply wait of
+    /// requests whose clock starts before the connection exists.
+    pub s3_connect_timeout: Duration,
     pub age: String,
     pub identity: PathBuf,
     pub secrets_dir: PathBuf,
@@ -531,6 +539,11 @@ pub fn parse(text: &str) -> Result<Config, String> {
         idle_lock: parse_duration(&raw.idle_lock)?,
         // bounded: they are added to clock readings, which must not overflow
         s3_idle: bounded(&raw.s3_idle, "s3_idle", Duration::from_secs(24 * 3600))?,
+        s3_connect_timeout: bounded(
+            &raw.s3_connect_timeout,
+            "s3_connect_timeout",
+            Duration::from_secs(300),
+        )?,
         s3_reply_wait: bounded(
             &raw.s3_reply_wait,
             "s3_reply_wait",
@@ -649,6 +662,8 @@ allow = ["GET /pods", "DELETE /pods/{id}", "GET /catalog/gpus"]
         assert!(parse(&format!("s3_idle = \"25h\"\n{RUNPOD}")).is_err());
         assert!(parse(&format!("s3_reply_wait = \"99999999999999h\"\n{RUNPOD}")).is_err());
         assert!(parse(&format!("s3_reply_wait = \"168h\"\n{RUNPOD}")).is_ok());
+        assert_eq!(c.s3_connect_timeout, Duration::from_secs(30));
+        assert!(parse(&format!("s3_connect_timeout = \"6m\"\n{RUNPOD}")).is_err());
         let s = &c.services["runpod"];
         assert_eq!(s.secret, PathBuf::from("runpod/api-key.age"));
         assert_eq!(s.auth_format, "Bearer {key}");

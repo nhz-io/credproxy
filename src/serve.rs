@@ -129,7 +129,7 @@ async fn serve(cfg: Config) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
 
     let vault = Arc::new(Vault::new(cfg));
-    let http = proxy::clients();
+    let http = proxy::clients(vault.cfg.s3_connect_timeout);
     let stop = Arc::new(Notify::new());
     let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     let mut full_logged: Option<std::time::Instant> = None;
@@ -341,6 +341,22 @@ mod tests {
         })
         .await;
         assert_eq!(t, Duration::from_secs(160));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connecting_upstream_is_expected_silence() {
+        // as forward_s3 does after the key: up to s3_connect_timeout (30 s) + s3_idle of silence while the
+        // connection comes up; 25 s later the first bytes move, then nothing: cut s3_idle after those bytes
+        let p = Arc::new(Progress::default());
+        p.mark_s3("t".into());
+        p.quiet_for(Duration::from_secs(30 + 60));
+        let q = p.clone();
+        let t = lives(p, async move {
+            tokio::time::sleep(Duration::from_secs(25)).await;
+            q.touch();
+        })
+        .await;
+        assert_eq!(t, Duration::from_secs(25 + 60));
     }
 
     #[tokio::test(start_paused = true)]
