@@ -130,7 +130,8 @@ failing the unlock, `credproxy lock` stopping an authorize in flight, a codeless
 worked (a front end's 5xx doesn't count), a slow download error body under a 1 s `s3_idle`, `version = "v4"` going
 out as v4, uploads (20 MiB byte-exact with its SHA-1, the bucket id and upload URL reused, parallel uploads on their
 own URLs, refusals before unlocking, B2's refusals as retry or pass-through with the URL dropped, an ended account
-token locking), and no key or token in the log. Signing is also checked against AWS's published examples. Also covered: refused calls never
+token locking, a deleted or recreated bucket looked up again while a refused delete keeps the cache, an upload B2
+drops after the body as outcome unknown, a client hanging up mid-body), and no key or token in the log. Signing is also checked against AWS's published examples. Also covered: refused calls never
 unlock, lock or stop during an upload (finishes intact / never completes), 304/416/404/307 replies, more parallel
 parts than the connection limit, the log never showing queries, and (simulated time) the idle cut-off and connection
 lifetimes. `CREDPROXY_TEST_PYTHON=<python with boto3> cargo test` adds a real boto3 run through the proxy. `cargo test --release --test s3 -- --ignored --nocapture` also runs the slow ones: 600 MB up and
