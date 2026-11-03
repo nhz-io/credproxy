@@ -1161,6 +1161,7 @@ async fn a_refused_upload_says_whether_to_retry_and_drops_its_url() {
         (503, "service_unavailable", 2),
         (401, "expired_auth_token", 3),
         (408, "request_timeout", 4),
+        (429, "too_many_requests", 5),
     ] {
         env.st(|s| s.upload_fail = Some((status, code)));
         let (c, reply) = put().await;
@@ -1202,7 +1203,7 @@ async fn a_refused_upload_says_whether_to_retry_and_drops_its_url() {
     assert_eq!(c, 400);
     assert!(reply.contains("Sha1 did not match"), "{reply}");
     assert_eq!(put().await.0, 200);
-    assert_eq!(env.st(|s| s.upload_tokens.len()), 7);
+    assert_eq!(env.st(|s| s.upload_tokens.len()), 8);
     // a bucket the account doesn't have
     let (c, reply) = env
         .put(
