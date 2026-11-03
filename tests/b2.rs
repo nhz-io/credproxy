@@ -44,6 +44,8 @@ struct B2State {
     bucket_gen: usize,
     /// drop the connection after reading an upload's body, without replying
     drop_after_body: bool,
+    /// refuse b2_delete_bucket (as B2 does for a bucket that still has files)
+    delete_fail: bool,
     /// answer the next upload with this status and B2 code
     upload_fail: Option<(u16, &'static str)>,
     /// wait before answering an upload
@@ -266,6 +268,9 @@ async fn fake_b2(state: Arc<Mutex<B2State>>) -> u16 {
                                     json!([{"bucketId": format!("bid{}g{}", name.replace('-', ""), s.bucket_gen), "bucketName": name}])
                                 };
                                 return Ok(json_reply(200, json!({ "buckets": buckets })));
+                            }
+                            if call == "b2_delete_bucket" && s.delete_fail {
+                                return Ok(json_reply(400, json!({"status": 400, "code": "cannot_delete_non_empty_bucket", "message": "not empty"})));
                             }
                             if call == "b2_get_upload_url" {
                                 let id = v["got"]["bucketId"].as_str().unwrap_or("").to_string();
@@ -1296,6 +1301,16 @@ async fn a_recreated_bucket_is_looked_up_again() {
         (3, 3),
         "the refused b2_get_upload_url handed out no URL"
     );
+    // a refused delete keeps the cache: the next upload needs no lookup and no new URL
+    let id = format!("bidmybktg{}", env.st(|s| s.bucket_gen));
+    env.st(|s| s.delete_fail = true);
+    let (c, _) = env
+        .call("b2_delete_bucket", &format!(r#"{{"bucketId": "{id}"}}"#))
+        .await;
+    assert_eq!(c, 400);
+    env.st(|s| s.delete_fail = false);
+    assert_eq!(put().await.0, 200);
+    assert_eq!(env.st(|s| (s.list_lookups, s.upload_tokens.len())), (3, 3));
     // deleted through credproxy: its id and URLs are forgotten at once
     let id = format!("bidmybktg{}", env.st(|s| s.bucket_gen));
     let (c, _) = env

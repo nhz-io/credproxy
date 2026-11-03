@@ -829,12 +829,14 @@ async fn upload(
         Err(e) => return reply(StatusCode::SERVICE_UNAVAILABLE, &e),
     };
     let (idle, connect) = (vault.cfg.s3_idle, vault.cfg.s3_connect_timeout);
-    progress.quiet_for(UPSTREAM_TIMEOUT * 2 + idle);
     // a cached id B2 no longer knows (the bucket was deleted, maybe recreated): forget it and look it up again,
     // once
     let mut looked_again = false;
     let up = loop {
+        // each of credproxy's own calls (up to four here) is expected silence
+        progress.quiet_for(UPSTREAM_TIMEOUT + idle);
         let id = or_reply!(bucket_id(vault, &http.api, service, &session, bucket).await);
+        progress.quiet_for(UPSTREAM_TIMEOUT + idle);
         match upload_url(vault, &http.api, service, &session, &id).await {
             Ok(u) => break u,
             Err(UrlError::BadBucket) if !looked_again => {
@@ -904,7 +906,16 @@ async fn upload(
     );
     if b.status.is_success() {
         session.worked.store(true, Ordering::Relaxed);
-        session.upload_urls.lock().unwrap().push(up);
+        // back to the pool, unless its bucket was forgotten (deleted) while this upload ran
+        let known = session
+            .bucket_ids
+            .lock()
+            .unwrap()
+            .values()
+            .any(|id| *id == up.bucket_id);
+        if known {
+            session.upload_urls.lock().unwrap().push(up);
+        }
         return b.into_response();
     }
     // B2 refused the upload, so nothing was stored; for these B2 says to get a new upload URL and try again
