@@ -819,8 +819,8 @@ async fn upload(
             );
         }
     };
-    // allowed: the watchdog decides from now on; a Touch ID prompt and credproxy's own two calls are expected
-    // silence
+    // allowed: the watchdog decides from now on; a Touch ID prompt and credproxy's own calls (below) are
+    // expected silence
     let what = format!("{service} {method} {prefix}{}", log::printable(sub));
     progress.mark_streaming(what);
     progress.quiet_for(unlock_wait());
@@ -918,8 +918,19 @@ async fn upload(
         }
         return b.into_response();
     }
-    // B2 refused the upload, so nothing was stored; for these B2 says to get a new upload URL and try again
+    // B2 refused the upload, so nothing was stored, for the codes its docs say to get a new upload URL and try
+    // again for (and a bucket id it doesn't know); other 5xx don't say whether it was stored
     let code = b2_code(&b);
+    if b.status.is_server_error() && b.status != StatusCode::SERVICE_UNAVAILABLE {
+        return reply(
+            StatusCode::BAD_GATEWAY,
+            &format!(
+                "B2 answered the upload with {} {}: {UPLOAD_OUTCOME_UNKNOWN}",
+                b.status.as_u16(),
+                code.as_deref().unwrap_or("-")
+            ),
+        );
+    }
     let retry = match b.status.as_u16() {
         // the pooled URL's bucket is gone (deleted, maybe recreated): the retry looks it up again
         400 if code.as_deref() == Some("bad_bucket_id") => {
@@ -927,7 +938,7 @@ async fn upload(
             true
         }
         401 => code.as_deref() != Some("unauthorized"),
-        408 | 429 | 500..=599 => true,
+        408 | 429 | 503 => true,
         _ => false,
     };
     if retry {

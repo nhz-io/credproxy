@@ -1178,6 +1178,15 @@ async fn a_refused_upload_says_whether_to_retry_and_drops_its_url() {
             "a new upload URL after {status}"
         );
     }
+    // a 5xx B2's docs don't name: maybe stored
+    env.st(|s| s.upload_fail = Some((500, "internal_error")));
+    let (c, reply) = put().await;
+    assert_eq!(c, 502, "{reply}");
+    assert!(
+        reply.contains("500 internal_error") && reply.contains("outcome is unknown"),
+        "{reply}"
+    );
+    assert_eq!(put().await.0, 200);
     // B2's other refusals are passed on (scrubbed); the URL is dropped too
     env.st(|s| s.upload_fail = Some((400, "bad_request")));
     let (c, reply) = put().await;
@@ -1193,7 +1202,7 @@ async fn a_refused_upload_says_whether_to_retry_and_drops_its_url() {
     assert_eq!(c, 400);
     assert!(reply.contains("Sha1 did not match"), "{reply}");
     assert_eq!(put().await.0, 200);
-    assert_eq!(env.st(|s| s.upload_tokens.len()), 6);
+    assert_eq!(env.st(|s| s.upload_tokens.len()), 7);
     // a bucket the account doesn't have
     let (c, reply) = env
         .put(
