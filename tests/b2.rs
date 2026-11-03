@@ -38,6 +38,12 @@ struct B2State {
     list_lookups: usize,
     /// upload tokens handed out by b2_get_upload_url (the URL /upload/<index> goes with each)
     upload_tokens: Vec<String>,
+    /// the bucket id each of those URLs is for
+    upload_buckets: Vec<String>,
+    /// bumped when a bucket is "recreated": its id changes, old ids get 400 bad_bucket_id
+    bucket_gen: usize,
+    /// drop the connection after reading an upload's body, without replying
+    drop_after_body: bool,
     /// answer the next upload with this status and B2 code
     upload_fail: Option<(u16, &'static str)>,
     /// wait before answering an upload
@@ -183,6 +189,14 @@ async fn fake_b2(state: Arc<Mutex<B2State>>) -> u16 {
                             if auth.as_deref() != s.upload_tokens.get(i).map(String::as_str) {
                                 return Ok(json_reply(401, json!({"status": 401, "code": "bad_auth_token", "message": "upload token"})));
                             }
+                            if s.drop_after_body {
+                                drop(s);
+                                std::panic::resume_unwind(Box::new("drop the connection"));
+                            }
+                            let current = format!("bid{}g{}", "mybkt", s.bucket_gen);
+                            if s.upload_buckets[i].starts_with("bidmybkt") && s.upload_buckets[i] != current {
+                                return Ok(json_reply(400, json!({"status": 400, "code": "bad_bucket_id", "message": "bucket"})));
+                            }
                             if let Some((status, code)) = s.upload_fail.take() {
                                 return Ok(json_reply(status, json!({"status": status, "code": code, "message": "refused"})));
                             }
@@ -249,11 +263,16 @@ async fn fake_b2(state: Arc<Mutex<B2State>>) -> u16 {
                                 let buckets = if name == "missing" {
                                     json!([])
                                 } else {
-                                    json!([{"bucketId": format!("bid{}", name.replace('-', "")), "bucketName": name}])
+                                    json!([{"bucketId": format!("bid{}g{}", name.replace('-', ""), s.bucket_gen), "bucketName": name}])
                                 };
                                 return Ok(json_reply(200, json!({ "buckets": buckets })));
                             }
                             if call == "b2_get_upload_url" {
+                                let id = v["got"]["bucketId"].as_str().unwrap_or("").to_string();
+                                if id.starts_with("bidmybkt") && id != format!("bidmybktg{}", s.bucket_gen) {
+                                    return Ok(json_reply(400, json!({"status": 400, "code": "bad_bucket_id", "message": "bucket"})));
+                                }
+                                s.upload_buckets.push(id);
                                 let i = s.upload_tokens.len();
                                 let tok = rnd("up_tok_");
                                 s.upload_tokens.push(tok.clone());
@@ -389,7 +408,7 @@ auth = {{ b2 = {{ version = "{version}", relock_after = "{relock}", authorize_ur
 
 [[services.b2.routes]]
 prefix = "/b2api/{version}"
-b2 = {{ calls = ["b2_list_buckets", "b2_create_key", "b2_list_keys", "b2_list_file_names"] }}
+b2 = {{ calls = ["b2_list_buckets", "b2_create_key", "b2_list_keys", "b2_list_file_names", "b2_delete_bucket"] }}
 
 [[services.b2.routes]]
 prefix = "/file"
@@ -1245,4 +1264,105 @@ async fn an_ended_account_token_during_an_upload_locks() {
     assert_eq!(c, 503);
     assert!(reply.contains("B2 token expired or revoked"), "{reply}");
     assert!(env.status().contains("b2: locked"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_recreated_bucket_is_looked_up_again() {
+    let env = setup("23h").await;
+    let body = b"a".to_vec();
+    let sha = sha1_hex(&body);
+    let put = || {
+        env.put(
+            "/my-bkt/x",
+            body.clone(),
+            vec![("x-bz-content-sha1", sha.clone())],
+        )
+    };
+    assert_eq!(put().await.0, 200);
+    // recreated behind credproxy's back: the pooled URL is refused, nothing stored; the retry looks the id up again
+    env.st(|s| s.bucket_gen += 1);
+    let (c, reply) = put().await;
+    assert_eq!(c, 503, "{reply}");
+    assert!(reply.contains("bad_bucket_id"), "{reply}");
+    assert_eq!(put().await.0, 200);
+    assert_eq!(env.st(|s| (s.list_lookups, s.upload_tokens.len())), (2, 2));
+    // no pooled URL but a stale cached id: b2_get_upload_url refuses it, credproxy looks it up again by itself
+    env.st(|s| s.upload_fail = Some((503, "service_unavailable")));
+    assert_eq!(put().await.0, 503);
+    env.st(|s| s.bucket_gen += 1);
+    assert_eq!(put().await.0, 200);
+    assert_eq!(
+        env.st(|s| (s.list_lookups, s.upload_tokens.len())),
+        (3, 3),
+        "the refused b2_get_upload_url handed out no URL"
+    );
+    // deleted through credproxy: its id and URLs are forgotten at once
+    let id = format!("bidmybktg{}", env.st(|s| s.bucket_gen));
+    let (c, _) = env
+        .call("b2_delete_bucket", &format!(r#"{{"bucketId": "{id}"}}"#))
+        .await;
+    assert_eq!(c, 200);
+    env.st(|s| s.bucket_gen += 1);
+    assert_eq!(put().await.0, 200);
+    assert_eq!(env.st(|s| (s.list_lookups, s.upload_tokens.len())), (4, 4));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_upload_that_breaks_off_says_whether_it_was_stored() {
+    let env = setup("23h").await;
+    let body = b"payload".to_vec();
+    let sha = sha1_hex(&body);
+    assert_eq!(
+        env.put(
+            "/my-bkt/x",
+            body.clone(),
+            vec![("x-bz-content-sha1", sha.clone())]
+        )
+        .await
+        .0,
+        200
+    );
+    // B2 drops the connection after the whole body: maybe stored
+    env.st(|s| s.drop_after_body = true);
+    let (c, reply) = env
+        .put(
+            "/my-bkt/x",
+            body.clone(),
+            vec![("x-bz-content-sha1", sha.clone())],
+        )
+        .await;
+    assert_eq!(c, 502, "{reply}");
+    assert!(
+        reply.contains("outcome is unknown") && reply.contains("b2_list_file_names"),
+        "{reply}"
+    );
+    env.st(|s| s.drop_after_body = false);
+    // the client hangs up mid-body: not stored (credproxy's reply goes nowhere, the log has it)
+    let addr = env
+        .base
+        .trim_start_matches("http://")
+        .split('/')
+        .next()
+        .unwrap()
+        .to_string();
+    {
+        use tokio::io::AsyncWriteExt;
+        let mut s = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        let head = format!(
+            "PUT /b2/upload/my-bkt/cut HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {}\r\nX-Bz-Content-Sha1: {sha}\r\nContent-Length: 1000\r\n\r\n0123456789",
+            env.token()
+        );
+        s.write_all(head.as_bytes()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let mut logged = false;
+    for _ in 0..50 {
+        if env.log().contains("b2 PUT /upload/my-bkt/cut 503") {
+            logged = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(logged, "{}", env.log());
+    assert!(env.st(|s| s.stored.clone()).unwrap().0 != "cut");
 }

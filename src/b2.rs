@@ -7,8 +7,8 @@
 use crate::config::{B2Auth, B2Route, check_upstream};
 use crate::log;
 use crate::proxy::{
-    Body, Clients, IDLE, NotDone, Outgoing, Progress, UPSTREAM_TIMEOUT, read_buffered, read_small,
-    reply, send_watched, stream_reply, upstream_failed,
+    Body, Buffered, Clients, IDLE, NotDone, Outgoing, Progress, UPSTREAM_TIMEOUT, read_buffered,
+    read_small, reply, send_watched, stream_reply, upstream_failed,
 };
 use crate::s3;
 use crate::vault::Vault;
@@ -76,6 +76,18 @@ pub struct Session {
     /// Upload URLs not in use. An upload takes one to itself (B2 refuses a token another upload is using), puts it
     /// back after success and drops it after any failure (B2: a refused upload's URL may no longer be good).
     pub upload_urls: std::sync::Mutex<Vec<UploadUrl>>,
+}
+
+impl Session {
+    /// Forget bucket `id` (deleted, or recreated under its name with a new id): its cached name and pooled
+    /// upload URLs.
+    fn forget_bucket(&self, id: &str) {
+        self.bucket_ids.lock().unwrap().retain(|_, v| v != id);
+        self.upload_urls
+            .lock()
+            .unwrap()
+            .retain(|u| u.bucket_id != id);
+    }
 }
 
 /// One of B2's upload URLs, with the token that goes with it (valid with it, at most 24 h). No Debug.
@@ -277,13 +289,22 @@ async fn buffered(
     progress: Option<&Progress>,
 ) -> Response<Body> {
     // a download's watchdog must see the error body's bytes move
-    let b = match read_buffered(res, &[session.token.as_bytes()], progress).await {
-        Ok(b) => b,
-        Err(r) => return r,
-    };
-    let code = serde_json::from_slice::<Value>(&b.body)
+    match read_buffered(res, &[session.token.as_bytes()], progress).await {
+        Ok(b) => judge(vault, service, session, b),
+        Err(r) => r,
+    }
+}
+
+/// B2's `code` in an error reply, if it has one.
+fn b2_code(b: &Buffered) -> Option<String> {
+    serde_json::from_slice::<Value>(&b.body)
         .ok()
-        .and_then(|v| v["code"].as_str().map(str::to_string));
+        .and_then(|v| v["code"].as_str().map(str::to_string))
+}
+
+/// What `buffered` sends for a reply already read (see there).
+fn judge(vault: &Vault, service: &str, session: &Arc<Session>, b: Buffered) -> Response<Body> {
+    let code = b2_code(&b);
     if b.status != StatusCode::UNAUTHORIZED {
         // the token got past B2's check: a success, or B2's own error about the call (a front end's 5xx didn't
         // look at it)
@@ -386,10 +407,18 @@ async fn api(
             Value::String(session.account_id.clone()),
         );
     }
-    match post_account(vault, http, service, &session, call, &json).await {
+    let r = match post_account(vault, http, service, &session, call, &json).await {
         Ok(r) => buffered(vault, service, &session, r, None).await,
         Err(r) => r,
+    };
+    // a deleted bucket's cached id and upload URLs go with it
+    if call == "b2_delete_bucket"
+        && r.status().is_success()
+        && let Some(id) = json["bucketId"].as_str()
+    {
+        session.forget_bucket(id);
     }
+    r
 }
 
 /// POST <apiUrl>/b2api/<version>/<call> with the account token.
@@ -623,6 +652,13 @@ async fn bucket_id(
     Ok(id.to_string())
 }
 
+/// Why there's no upload URL: B2 doesn't know the bucket id (deleted or recreated since it was looked up), or
+/// another reply to send.
+enum UrlError {
+    BadBucket,
+    Reply(Response<Body>),
+}
+
 /// An upload URL for the bucket for this upload alone: one from the pool, or a new one.
 #[allow(clippy::result_large_err)]
 async fn upload_url(
@@ -631,7 +667,7 @@ async fn upload_url(
     service: &str,
     session: &Arc<Session>,
     bucket_id: &str,
-) -> Result<UploadUrl, Response<Body>> {
+) -> Result<UploadUrl, UrlError> {
     {
         let mut pool = session.upload_urls.lock().unwrap();
         if let Some(i) = pool.iter().position(|u| u.bucket_id == bucket_id) {
@@ -639,12 +675,28 @@ async fn upload_url(
         }
     }
     let json = serde_json::json!({ "bucketId": bucket_id });
-    let mut v = account_call(vault, http, service, session, "b2_get_upload_url", json).await?;
+    let res = post_account(vault, http, service, session, "b2_get_upload_url", &json)
+        .await
+        .map_err(UrlError::Reply)?;
+    let ok = res.status().is_success();
+    let b = read_buffered(res, &[session.token.as_bytes()], None)
+        .await
+        .map_err(UrlError::Reply)?;
+    if !ok {
+        if b.status == StatusCode::BAD_REQUEST && b2_code(&b).as_deref() == Some("bad_bucket_id") {
+            return Err(UrlError::BadBucket);
+        }
+        return Err(UrlError::Reply(judge(vault, service, session, b)));
+    }
+    session.worked.store(true, Ordering::Relaxed);
     let bad = |what: &str| {
-        reply(
+        UrlError::Reply(reply(
             StatusCode::BAD_GATEWAY,
             &format!("B2 b2_get_upload_url: {what}"),
-        )
+        ))
+    };
+    let Ok(mut v) = serde_json::from_slice::<Value>(&b.body) else {
+        return Err(bad("reply is not JSON"));
     };
     // taken out of the parsed reply, not copied (zeroed when the URL is dropped)
     let token = match v["authorizationToken"].take() {
@@ -778,8 +830,27 @@ async fn upload(
     };
     let (idle, connect) = (vault.cfg.s3_idle, vault.cfg.s3_connect_timeout);
     progress.quiet_for(UPSTREAM_TIMEOUT * 2 + idle);
-    let bucket_id = or_reply!(bucket_id(vault, &http.api, service, &session, bucket).await);
-    let up = or_reply!(upload_url(vault, &http.api, service, &session, &bucket_id).await);
+    // a cached id B2 no longer knows (the bucket was deleted, maybe recreated): forget it and look it up again,
+    // once
+    let mut looked_again = false;
+    let up = loop {
+        let id = or_reply!(bucket_id(vault, &http.api, service, &session, bucket).await);
+        match upload_url(vault, &http.api, service, &session, &id).await {
+            Ok(u) => break u,
+            Err(UrlError::BadBucket) if !looked_again => {
+                session.forget_bucket(&id);
+                looked_again = true;
+            }
+            Err(UrlError::BadBucket) => {
+                session.forget_bucket(&id);
+                return reply(
+                    StatusCode::NOT_FOUND,
+                    &format!("no bucket {bucket:?} in this account (B2: bad_bucket_id)"),
+                );
+            }
+            Err(UrlError::Reply(r)) => return r,
+        }
+    };
     progress.quiet_for(connect + idle);
     let Ok(mut auth) = reqwest::header::HeaderValue::from_str(&up.token) else {
         return reply(StatusCode::INTERNAL_SERVER_ERROR, "bad upload token");
@@ -837,10 +908,13 @@ async fn upload(
         return b.into_response();
     }
     // B2 refused the upload, so nothing was stored; for these B2 says to get a new upload URL and try again
-    let code = serde_json::from_slice::<Value>(&b.body)
-        .ok()
-        .and_then(|v| v["code"].as_str().map(str::to_string));
+    let code = b2_code(&b);
     let retry = match b.status.as_u16() {
+        // the pooled URL's bucket is gone (deleted, maybe recreated): the retry looks it up again
+        400 if code.as_deref() == Some("bad_bucket_id") => {
+            session.forget_bucket(&up.bucket_id);
+            true
+        }
         401 => code.as_deref() != Some("unauthorized"),
         408 | 429 | 500..=599 => true,
         _ => false,
