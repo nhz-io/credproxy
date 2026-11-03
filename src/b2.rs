@@ -918,8 +918,9 @@ async fn upload(
         }
         return b.into_response();
     }
-    // B2 refused the upload, so nothing was stored, for the codes its docs say to get a new upload URL and try
-    // again for (and a bucket id it doesn't know); other 5xx don't say whether it was stored
+    // B2 refused the upload, so nothing was stored: for the codes its b2_upload_file doc says to get a new upload
+    // URL and try again for (401 bad/expired token, 503), a bucket id it doesn't know, and (credproxy's reading)
+    // 408 (it timed out reading the body) and 429 (throttled); other 5xx don't say whether it was stored
     let code = b2_code(&b);
     if b.status.is_server_error() && b.status != StatusCode::SERVICE_UNAVAILABLE {
         return reply(
