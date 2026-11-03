@@ -599,8 +599,8 @@ pub fn parse(text: &str) -> Result<Config, String> {
                 s.auth.header
             ));
         }
-        // B2 downloads forward the client's Range
-        if s.auth.b2.is_some() && h == "range" {
+        // B2 downloads forward the client's Range, uploads its X-Bz-* headers (and refuse the others)
+        if s.auth.b2.is_some() && (h == "range" || h.starts_with("x-bz-")) {
             return Err(format!(
                 "service {name}: auth.header {:?} can't carry the token for a B2 service",
                 s.auth.header
@@ -1147,6 +1147,10 @@ b2 = { upload = true }
             B2.replace("b2 = {}", "b2 = { version = \"v4\" }"),
             B2.replace("/b2api/v3", "/api"),
             B2.replace("b2 = {}", "header = \"Range\", format = \"{key}\", b2 = {}"),
+            B2.replace(
+                "b2 = {}",
+                "header = \"X-Bz-Token\", format = \"{key}\", b2 = {}",
+            ),
             B2.replace("auth = { b2 = {} }", ""),
             B2.replace("\"b2_create_key\"", "\"B2_list\""),
             B2.replace("\"b2_create_key\"", "\"b2_\""),
