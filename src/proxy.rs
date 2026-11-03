@@ -271,7 +271,18 @@ async fn forward(
         return reply(StatusCode::FORBIDDEN, "path not allowed");
     };
     if let Some(b) = &route.b2 {
-        return b2::forward(vault, http, service, method, b, &sub, req, progress).await;
+        return b2::forward(
+            vault,
+            http,
+            service,
+            method,
+            &route.prefix,
+            b,
+            &sub,
+            req,
+            progress,
+        )
+        .await;
     }
     if route.s3.is_some() {
         return forward_s3(vault, &http.s3, service, method, route, &sub, req, progress).await;
@@ -720,73 +731,33 @@ async fn forward_s3(
     // streamed one is only counted sent once its last byte went through the open connection.
     let small = !matches!(payload, Payload::Stream(..));
     let reply_clock = reply_limit + if small { connect_limit } else { Duration::ZERO };
-    // Whether the whole request has been handed on: it starts the reply clock, and once a state-changing request
-    // has gone out a failure can't tell whether the upstream acted on it.
-    let (sent_tx, sent_rx) = tokio::sync::watch::channel(false);
     let changes = method != "GET" && method != "HEAD";
-    // called once the last request byte has been handed on: from then on silence is the upstream working
-    let on_sent = {
-        let progress = progress.clone();
-        move || {
-            if !sent_tx.send_replace(true) {
-                progress.quiet_for(reply_clock + idle_limit);
-            }
-        }
-    };
     // when a small request (e.g. CompleteMultipartUpload) went out: its reply, body included, must be done
     // within reply_limit of this
     let sent_at = tokio::time::Instant::now();
-    if small {
-        on_sent();
-    }
-    out = match payload {
+    let outgoing = match payload {
         // hyper sends no Content-Length for an empty body; some S3 front ends answer a bodiless POST/PUT with 411
         Payload::Small(b, _) if b.is_empty() && matches!(method, "POST" | "PUT") => {
-            out.header("content-length", "0")
+            out = out.header("content-length", "0");
+            Outgoing::Small(b)
         }
-        Payload::Small(b, _) if b.is_empty() => out,
-        Payload::Small(b, _) => out.body(b),
-        Payload::Stream(body, n, _) => {
-            // counted, not waited for: hyper stops polling the body once Content-Length bytes are out, so the
-            // stream's own end may never be seen
-            if n == 0 {
-                on_sent();
-            }
-            let progress = progress.clone();
-            let mut sent = 0u64;
-            let chunks = body.into_data_stream().inspect_ok(move |b: &Bytes| {
-                progress.touch();
-                sent += b.len() as u64;
-                if sent >= n {
-                    on_sent();
-                }
-            });
-            out.header("content-length", n)
-                .body(reqwest::Body::wrap_stream(chunks))
-        }
+        Payload::Small(b, _) => Outgoing::Small(b),
+        Payload::Stream(body, n, _) => Outgoing::Stream(body, n),
     };
-    let mut sent_seen = sent_rx.clone();
-    let no_reply = async move {
-        // a dropped sender (the request failed before its end) never starts the clock; send() reports that
-        if sent_seen.wait_for(|s| *s).await.is_ok() {
-            tokio::time::sleep(reply_clock).await;
-        } else {
-            std::future::pending::<()>().await;
+    let res = match send_watched(out, outgoing, progress, reply_clock, idle_limit).await {
+        Ok(r) => r,
+        // a connect error means nothing reached the upstream, whatever the clock says
+        Err(NotDone {
+            sent: true,
+            error: Some(e),
+        }) if changes && !e.is_connect() => {
+            return reply(
+                StatusCode::BAD_GATEWAY,
+                &format!("upstream failed after the request was sent: {OUTCOME_UNKNOWN}"),
+            );
         }
-    };
-    let res = tokio::select! {
-        r = out.send() => match r {
-            Ok(r) => r,
-            // a connect error means nothing reached the upstream, whatever the clock says
-            Err(e) if changes && *sent_rx.borrow() && !e.is_connect() => {
-                return reply(
-                    StatusCode::BAD_GATEWAY,
-                    &format!("upstream failed after the request was sent: {OUTCOME_UNKNOWN}"),
-                );
-            }
-            Err(e) => return upstream_failed(&e),
-        },
-        _ = no_reply => {
+        Err(NotDone { error: Some(e), .. }) => return upstream_failed(&e),
+        Err(NotDone { error: None, .. }) => {
             return reply(
                 StatusCode::GATEWAY_TIMEOUT,
                 &format!(
@@ -868,6 +839,81 @@ async fn forward_s3(
         })
         .collect();
     stream_reply(res, method, changes, keep, &vault.cfg.log, what, progress)
+}
+
+/// A request body as it goes upstream: whole, or streamed from the client (exactly `n` bytes).
+pub(crate) enum Outgoing {
+    Small(Bytes),
+    Stream(Incoming, u64),
+}
+
+/// Why `send_watched` has no reply: the request failed (`error`), or no reply came within the reply clock
+/// (`error` None). `sent`: the whole request had been handed on, so a state-changing one may have been acted on.
+pub(crate) struct NotDone {
+    pub sent: bool,
+    pub error: Option<reqwest::Error>,
+}
+
+/// Send `out` with `body`, keeping the connection's watchdog informed: a streamed body's bytes are progress, and
+/// once the whole request is handed on, silence is expected for `reply_clock` (+ `idle`); a reply that hasn't
+/// started by the end of `reply_clock` is given up on.
+pub(crate) async fn send_watched(
+    out: reqwest::RequestBuilder,
+    body: Outgoing,
+    progress: &Arc<Progress>,
+    reply_clock: Duration,
+    idle: Duration,
+) -> Result<reqwest::Response, NotDone> {
+    // Whether the whole request has been handed on: it starts the reply clock, and once a state-changing request
+    // has gone out a failure can't tell whether the upstream acted on it.
+    let (sent_tx, sent_rx) = tokio::sync::watch::channel(false);
+    // called once the last request byte has been handed on: from then on silence is the upstream working
+    let on_sent = {
+        let progress = progress.clone();
+        move || {
+            if !sent_tx.send_replace(true) {
+                progress.quiet_for(reply_clock + idle);
+            }
+        }
+    };
+    let out = match body {
+        Outgoing::Small(b) => {
+            // handed on whole before the connection exists (its reply clock includes connecting)
+            on_sent();
+            if b.is_empty() { out } else { out.body(b) }
+        }
+        Outgoing::Stream(body, n) => {
+            // counted, not waited for: hyper stops polling the body once Content-Length bytes are out, so the
+            // stream's own end may never be seen
+            if n == 0 {
+                on_sent();
+            }
+            let progress = progress.clone();
+            let mut sent = 0u64;
+            let chunks = body.into_data_stream().inspect_ok(move |b: &Bytes| {
+                progress.touch();
+                sent += b.len() as u64;
+                if sent >= n {
+                    on_sent();
+                }
+            });
+            out.header("content-length", n)
+                .body(reqwest::Body::wrap_stream(chunks))
+        }
+    };
+    let mut sent_seen = sent_rx.clone();
+    let no_reply = async move {
+        // a dropped sender (the request failed before its end) never starts the clock; send() reports that
+        if sent_seen.wait_for(|s| *s).await.is_ok() {
+            tokio::time::sleep(reply_clock).await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
+    tokio::select! {
+        r = out.send() => r.map_err(|e| NotDone { sent: *sent_rx.borrow(), error: Some(e) }),
+        _ = no_reply => Err(NotDone { sent: true, error: None }),
+    }
 }
 
 /// A successful reply streamed back with `headers`. A body that ends when the connection closes can't be told from

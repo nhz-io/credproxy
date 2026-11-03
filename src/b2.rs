@@ -7,8 +7,8 @@
 use crate::config::{B2Auth, B2Route, check_upstream};
 use crate::log;
 use crate::proxy::{
-    Body, Clients, IDLE, Progress, UPSTREAM_TIMEOUT, read_buffered, read_small, reply,
-    stream_reply, upstream_failed,
+    Body, Clients, IDLE, NotDone, Outgoing, Progress, UPSTREAM_TIMEOUT, read_buffered, read_small,
+    reply, send_watched, stream_reply, upstream_failed,
 };
 use crate::s3;
 use crate::vault::Vault;
@@ -71,6 +71,18 @@ pub struct Session {
     /// Some call with this token got a reply other than 401: a later 401 without B2's reason is then taken as the
     /// token's end; before that, as a refusal.
     pub worked: std::sync::atomic::AtomicBool,
+    /// Bucket name → id, looked up once per session (uploads name the bucket, b2_get_upload_url wants its id).
+    pub bucket_ids: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    /// Upload URLs not in use. An upload takes one to itself (B2 refuses a token another upload is using), puts it
+    /// back after success and drops it after any failure (B2: a refused upload's URL may no longer be good).
+    pub upload_urls: std::sync::Mutex<Vec<UploadUrl>>,
+}
+
+/// One of B2's upload URLs, with the token that goes with it (valid with it, at most 24 h). No Debug.
+pub struct UploadUrl {
+    pub bucket_id: String,
+    pub url: String,
+    pub token: Zeroizing<String>,
 }
 
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -226,6 +238,8 @@ pub async fn authorize(
         token,
         account_id,
         worked: Default::default(),
+        bucket_ids: Default::default(),
+        upload_urls: Default::default(),
     })
 }
 
@@ -304,6 +318,7 @@ pub async fn forward(
     http: &Clients,
     service: &str,
     method: &str,
+    prefix: &str,
     route: &B2Route,
     sub: &str,
     req: Request<Incoming>,
@@ -311,7 +326,10 @@ pub async fn forward(
 ) -> Response<Body> {
     match route {
         B2Route::Api(calls) => api(vault, &http.api, service, method, calls, sub, req).await,
-        B2Route::Download => download(vault, &http.s3, service, method, sub, req, progress).await,
+        B2Route::Download => {
+            download(vault, &http.s3, service, method, prefix, sub, req, progress).await
+        }
+        B2Route::Upload => upload(vault, http, service, method, prefix, sub, req, progress).await,
     }
 }
 
@@ -368,36 +386,90 @@ async fn api(
             Value::String(session.account_id.clone()),
         );
     }
+    match post_account(vault, http, service, &session, call, &json).await {
+        Ok(r) => buffered(vault, service, &session, r, None).await,
+        Err(r) => r,
+    }
+}
+
+/// POST <apiUrl>/b2api/<version>/<call> with the account token.
+#[allow(clippy::result_large_err)]
+async fn post_account(
+    vault: &Vault,
+    http: &reqwest::Client,
+    service: &str,
+    session: &Session,
+    call: &str,
+    json: &Value,
+) -> Result<reqwest::Response, Response<Body>> {
     let version = &vault.cfg.services[service]
         .b2
         .as_ref()
         .expect("b2 service")
         .version;
     let url = format!("{}/b2api/{version}/{call}", session.api_url);
-    let auth = match token_value(&session) {
-        Ok(v) => v,
-        Err(r) => return r,
-    };
-    let res = http
-        .post(&url)
+    let auth = token_value(session)?;
+    http.post(&url)
         .timeout(UPSTREAM_TIMEOUT)
         .header("authorization", auth)
         .header("accept-encoding", "identity")
         .header("content-type", "application/json")
         .body(json.to_string())
         .send()
-        .await;
-    match res {
-        Ok(r) => buffered(vault, service, &session, r, None).await,
-        Err(e) => upstream_failed(&e),
-    }
+        .await
+        .map_err(|e| upstream_failed(&e))
 }
 
+/// A call credproxy makes itself (bucket lookup, upload URL): its JSON reply, or the reply to send instead (B2's
+/// error, scrubbed; an ended token locks the service as for any call).
+#[allow(clippy::result_large_err)]
+async fn account_call(
+    vault: &Vault,
+    http: &reqwest::Client,
+    service: &str,
+    session: &Arc<Session>,
+    call: &str,
+    json: Value,
+) -> Result<Value, Response<Body>> {
+    let res = post_account(vault, http, service, session, call, &json).await?;
+    if !res.status().is_success() {
+        return Err(buffered(vault, service, session, res, None).await);
+    }
+    session.worked.store(true, Ordering::Relaxed);
+    let b = read_buffered(res, &[session.token.as_bytes()], None).await?;
+    serde_json::from_slice(&b.body).map_err(|_| {
+        reply(
+            StatusCode::BAD_GATEWAY,
+            &format!("B2 {call}: reply is not JSON"),
+        )
+    })
+}
+
+/// `/<bucket>/<file name>` (the name percent-encoded), checked: the bucket and the decoded name.
+#[allow(clippy::result_large_err)]
+fn bucket_and_name(sub: &str) -> Result<(&str, String), Response<Body>> {
+    let Some((bucket, raw)) = sub.strip_prefix('/').and_then(|p| p.split_once('/')) else {
+        return Err(reply(StatusCode::FORBIDDEN, "path: /<bucket>/<file name>"));
+    };
+    if !valid_bucket(bucket) {
+        return Err(reply(StatusCode::FORBIDDEN, "bad bucket name"));
+    }
+    let Some(name) = s3::decode(raw).filter(|n| s3::valid_key(n)) else {
+        return Err(reply(
+            StatusCode::FORBIDDEN,
+            "bad file name (no empty, . or .. segments, no control characters)",
+        ));
+    };
+    Ok((bucket, name))
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn download(
     vault: &Arc<Vault>,
     http: &reqwest::Client,
     service: &str,
     method: &str,
+    prefix: &str,
     sub: &str,
     req: Request<Incoming>,
     progress: &Arc<Progress>,
@@ -412,20 +484,9 @@ async fn download(
     if req.uri().query().is_some() {
         return reply(StatusCode::FORBIDDEN, "no query string on downloads");
     }
-    let Some((bucket, raw)) = sub.strip_prefix('/').and_then(|p| p.split_once('/')) else {
-        return reply(
-            StatusCode::FORBIDDEN,
-            "download path: /<bucket>/<file name>",
-        );
-    };
-    if !valid_bucket(bucket) {
-        return reply(StatusCode::FORBIDDEN, "bad bucket name");
-    }
-    let Some(name) = s3::decode(raw).filter(|n| s3::valid_key(n)) else {
-        return reply(
-            StatusCode::FORBIDDEN,
-            "bad file name (no empty, . or .. segments, no control characters)",
-        );
+    let (bucket, name) = match bucket_and_name(sub) {
+        Ok(x) => x,
+        Err(r) => return r,
     };
     let mut ranges = req.headers().get_all("range").iter();
     let range = ranges.next().cloned();
@@ -437,7 +498,7 @@ async fn download(
     }
     // allowed: the watchdog decides from now on (a download runs as long as it moves), and a Touch ID prompt is
     // expected silence
-    let what = format!("{service} {method} /file{}", log::printable(sub));
+    let what = format!("{service} {method} {prefix}{}", log::printable(sub));
     progress.mark_streaming(what.clone());
     progress.quiet_for(unlock_wait());
     let session = match vault.b2(service).await {
@@ -500,6 +561,311 @@ async fn download(
     stream_reply(res, method, false, keep, &vault.cfg.log, what, progress)
 }
 
+/// Client headers an upload can't carry: B2 refuses them on uploads, and dropping one would change what is stored.
+const UPLOAD_REFUSED_HEADERS: [&str; 5] = [
+    "content-encoding",
+    "content-disposition",
+    "content-language",
+    "content-range",
+    "expires",
+];
+
+/// An upload URL from b2_get_upload_url: https on a backblaze.com or backblazeb2.com host (B2's examples use
+/// pod-….backblaze.com), with its path; or, when authorizing on this machine (tests), a URL on this machine.
+fn check_upload_url(u: &str, local: bool) -> Result<String, String> {
+    let u = check_upstream(u)?;
+    if local {
+        return match u.starts_with("http://") {
+            true => Ok(u),
+            false => Err(format!("{u:?} is not on this machine")),
+        };
+    }
+    let host = u
+        .strip_prefix("https://")
+        .and_then(|r| r.split(['/', ':']).next())
+        .unwrap_or("");
+    if !(host.ends_with(".backblaze.com") || host.ends_with(".backblazeb2.com")) {
+        return Err(format!("{u:?} is not a backblaze.com URL"));
+    }
+    Ok(u)
+}
+
+/// The bucket's id, looked up once per session.
+#[allow(clippy::result_large_err)]
+async fn bucket_id(
+    vault: &Vault,
+    http: &reqwest::Client,
+    service: &str,
+    session: &Arc<Session>,
+    bucket: &str,
+) -> Result<String, Response<Body>> {
+    if let Some(id) = session.bucket_ids.lock().unwrap().get(bucket) {
+        return Ok(id.clone());
+    }
+    let json = serde_json::json!({"accountId": session.account_id, "bucketName": bucket});
+    let v = account_call(vault, http, service, session, "b2_list_buckets", json).await?;
+    let id = v["buckets"]
+        .as_array()
+        .and_then(|b| b.iter().find(|x| x["bucketName"].as_str() == Some(bucket)))
+        .and_then(|x| x["bucketId"].as_str())
+        .filter(|id| !id.is_empty() && id.bytes().all(|c| c.is_ascii_alphanumeric()));
+    let Some(id) = id else {
+        return Err(reply(
+            StatusCode::NOT_FOUND,
+            &format!("no bucket {bucket:?} in this account"),
+        ));
+    };
+    session
+        .bucket_ids
+        .lock()
+        .unwrap()
+        .insert(bucket.to_string(), id.to_string());
+    Ok(id.to_string())
+}
+
+/// An upload URL for the bucket for this upload alone: one from the pool, or a new one.
+#[allow(clippy::result_large_err)]
+async fn upload_url(
+    vault: &Vault,
+    http: &reqwest::Client,
+    service: &str,
+    session: &Arc<Session>,
+    bucket_id: &str,
+) -> Result<UploadUrl, Response<Body>> {
+    {
+        let mut pool = session.upload_urls.lock().unwrap();
+        if let Some(i) = pool.iter().position(|u| u.bucket_id == bucket_id) {
+            return Ok(pool.swap_remove(i));
+        }
+    }
+    let json = serde_json::json!({ "bucketId": bucket_id });
+    let mut v = account_call(vault, http, service, session, "b2_get_upload_url", json).await?;
+    let bad = |what: &str| {
+        reply(
+            StatusCode::BAD_GATEWAY,
+            &format!("B2 b2_get_upload_url: {what}"),
+        )
+    };
+    // taken out of the parsed reply, not copied (zeroed when the URL is dropped)
+    let token = match v["authorizationToken"].take() {
+        Value::String(t) => Zeroizing::new(t),
+        _ => return Err(bad("no authorizationToken")),
+    };
+    if token.is_empty() || token.len() > 4096 || !token.bytes().all(|b| (0x21..=0x7e).contains(&b))
+    {
+        return Err(bad("bad authorizationToken"));
+    }
+    let b2 = vault.cfg.services[service].b2.as_ref().expect("b2 service");
+    let local = b2.authorize_url.starts_with("http://");
+    let url = check_upload_url(v["uploadUrl"].as_str().unwrap_or(""), local)
+        .map_err(|e| bad(&format!("uploadUrl {e}")))?;
+    Ok(UploadUrl {
+        bucket_id: bucket_id.to_string(),
+        url,
+        token,
+    })
+}
+
+/// The one value of client header `n`, if any: given twice or not ASCII is a 400.
+#[allow(clippy::result_large_err)]
+fn one_header<'a>(h: &'a hyper::HeaderMap, n: &str) -> Result<Option<&'a str>, Response<Body>> {
+    let mut values = h.get_all(n).iter();
+    let first = values.next();
+    if values.next().is_some() {
+        return Err(reply(
+            StatusCode::BAD_REQUEST,
+            &format!("header {n} given twice"),
+        ));
+    }
+    first.map(|v| v.to_str()).transpose().map_err(|_| {
+        reply(
+            StatusCode::BAD_REQUEST,
+            &format!("header {n}: only ASCII values"),
+        )
+    })
+}
+
+/// PUT <prefix>/<bucket>/<file name>: every check first (no Touch ID for a refused upload), then the session, the
+/// bucket's id and an upload URL (credproxy's own calls), then the body streams to B2. A failed upload isn't
+/// replayed (the body went by): the reply says whether the client should retry.
+#[allow(clippy::too_many_arguments)]
+async fn upload(
+    vault: &Arc<Vault>,
+    http: &Clients,
+    service: &str,
+    method: &str,
+    prefix: &str,
+    sub: &str,
+    req: Request<Incoming>,
+    progress: &Arc<Progress>,
+) -> Response<Body> {
+    macro_rules! or_reply {
+        ($e:expr) => {
+            match $e {
+                Ok(v) => v,
+                Err(r) => return r,
+            }
+        };
+    }
+    if method != "PUT" {
+        return reply(
+            StatusCode::FORBIDDEN,
+            &format!("{method} not allowed on uploads (PUT)"),
+        );
+    }
+    if req.uri().query().is_some() {
+        return reply(StatusCode::FORBIDDEN, "no query string on uploads");
+    }
+    let (bucket, name) = or_reply!(bucket_and_name(sub));
+    let h = req.headers();
+    // a header that selects something else (SSE, retention, other file info) is refused, not dropped
+    if let Some(n) = h.keys().map(|n| n.as_str()).find(|n| {
+        UPLOAD_REFUSED_HEADERS.contains(n)
+            || (n.starts_with("x-bz-")
+                && *n != "x-bz-content-sha1"
+                && *n != "x-bz-info-src_last_modified_millis")
+    }) {
+        return reply(
+            StatusCode::FORBIDDEN,
+            &format!("header {n} not allowed on uploads"),
+        );
+    }
+    let Some(length) = or_reply!(one_header(h, "content-length")) else {
+        return reply(
+            StatusCode::LENGTH_REQUIRED,
+            "content-length required (B2 takes no chunked bodies)",
+        );
+    };
+    let Ok(length) = length.parse::<u64>() else {
+        return reply(StatusCode::BAD_REQUEST, "bad content-length");
+    };
+    let sha1 = match or_reply!(one_header(h, "x-bz-content-sha1")) {
+        Some(v) if v.len() == 40 && v.bytes().all(|b| b.is_ascii_hexdigit()) => {
+            v.to_ascii_lowercase()
+        }
+        _ => {
+            return reply(
+                StatusCode::BAD_REQUEST,
+                "x-bz-content-sha1 must be the body's SHA-1 (40 hex digits)",
+            );
+        }
+    };
+    let ctype = match or_reply!(one_header(h, "content-type")) {
+        None => "b2/x-auto".to_string(),
+        Some(v) if !v.is_empty() && v.bytes().all(|b| (0x20..=0x7e).contains(&b)) => v.to_string(),
+        Some(_) => return reply(StatusCode::BAD_REQUEST, "bad content-type"),
+    };
+    let mtime = match or_reply!(one_header(h, "x-bz-info-src_last_modified_millis")) {
+        None => None,
+        Some(v) if !v.is_empty() && v.len() <= 20 && v.bytes().all(|b| b.is_ascii_digit()) => {
+            Some(v.to_string())
+        }
+        Some(_) => {
+            return reply(
+                StatusCode::BAD_REQUEST,
+                "x-bz-info-src_last_modified_millis: milliseconds since the epoch",
+            );
+        }
+    };
+    // allowed: the watchdog decides from now on; a Touch ID prompt and credproxy's own two calls are expected
+    // silence
+    let what = format!("{service} {method} {prefix}{}", log::printable(sub));
+    progress.mark_streaming(what);
+    progress.quiet_for(unlock_wait());
+    let session = match vault.b2(service).await {
+        Ok(s) => s,
+        Err(e) => return reply(StatusCode::SERVICE_UNAVAILABLE, &e),
+    };
+    let (idle, connect) = (vault.cfg.s3_idle, vault.cfg.s3_connect_timeout);
+    progress.quiet_for(UPSTREAM_TIMEOUT * 2 + idle);
+    let bucket_id = or_reply!(bucket_id(vault, &http.api, service, &session, bucket).await);
+    let up = or_reply!(upload_url(vault, &http.api, service, &session, &bucket_id).await);
+    progress.quiet_for(connect + idle);
+    let Ok(mut auth) = reqwest::header::HeaderValue::from_str(&up.token) else {
+        return reply(StatusCode::INTERNAL_SERVER_ERROR, "bad upload token");
+    };
+    auth.set_sensitive(true);
+    let mut out = http
+        .s3
+        .post(&up.url)
+        .header("authorization", auth)
+        .header("x-bz-file-name", encode_name(&name))
+        .header("content-type", ctype)
+        .header("x-bz-content-sha1", sha1)
+        .header("accept-encoding", "identity");
+    if let Some(m) = mtime {
+        out = out.header("x-bz-info-src_last_modified_millis", m);
+    }
+    let body = Outgoing::Stream(req.into_body(), length);
+    // the upload URL (`up`) goes back to the pool only after a success; on every other path it's dropped
+    let res = match send_watched(out, body, progress, vault.cfg.s3_reply_wait, idle).await {
+        Ok(r) => r,
+        Err(NotDone {
+            sent: true,
+            error: Some(e),
+        }) if !e.is_connect() => {
+            return reply(
+                StatusCode::BAD_GATEWAY,
+                &format!("upload broke off after the body was sent: {UPLOAD_OUTCOME_UNKNOWN}"),
+            );
+        }
+        Err(NotDone { error: Some(_), .. }) => {
+            return reply(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "upload not stored (it broke off before the body was sent): retry",
+            );
+        }
+        Err(NotDone { error: None, .. }) => {
+            return reply(
+                StatusCode::GATEWAY_TIMEOUT,
+                &format!("B2 sent no reply in time (s3_reply_wait): {UPLOAD_OUTCOME_UNKNOWN}"),
+            );
+        }
+    };
+    progress.touch();
+    let b = or_reply!(
+        read_buffered(
+            res,
+            &[session.token.as_bytes(), up.token.as_bytes()],
+            Some(progress)
+        )
+        .await
+    );
+    if b.status.is_success() {
+        session.worked.store(true, Ordering::Relaxed);
+        session.upload_urls.lock().unwrap().push(up);
+        return b.into_response();
+    }
+    // B2 refused the upload, so nothing was stored; for these B2 says to get a new upload URL and try again
+    let code = serde_json::from_slice::<Value>(&b.body)
+        .ok()
+        .and_then(|v| v["code"].as_str().map(str::to_string));
+    let retry = match b.status.as_u16() {
+        401 => code.as_deref() != Some("unauthorized"),
+        408 | 429 | 500..=599 => true,
+        _ => false,
+    };
+    if retry {
+        let mut r = reply(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &format!(
+                "upload not stored (B2: {} {}): retry (with a new upload URL)",
+                b.status.as_u16(),
+                code.as_deref().unwrap_or("-")
+            ),
+        );
+        if let Some(v) = b.retry_after {
+            r.headers_mut().insert("retry-after", v);
+        }
+        return r;
+    }
+    b.into_response()
+}
+
+/// How a client finds out whether a broken-off upload was stored.
+const UPLOAD_OUTCOME_UNKNOWN: &str = "the outcome is unknown; check with b2_list_file_names (contentSha1) before \
+     uploading again (another upload of the same name only adds a version)";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -525,6 +891,29 @@ mod tests {
     #[test]
     fn unlock_wait_covers_touch_id_and_authorize() {
         assert!(unlock_wait() > crate::vault::UNLOCK_TIMEOUT + AUTHORIZE_TIMEOUT);
+    }
+
+    #[test]
+    fn upload_urls() {
+        for ok in [
+            "https://pod-000-1007-13.backblaze.com/b2api/v4/b2_upload_file/bid/c001",
+            "https://pod-1.backblazeb2.com/b2api/v3/b2_upload_file/x",
+        ] {
+            assert!(check_upload_url(ok, false).is_ok(), "{ok}");
+        }
+        for bad in [
+            "http://pod-1.backblaze.com/x",
+            "https://pod-1.backblaze.com.evil.example/x",
+            "https://evilbackblaze.com/x",
+            "https://pod-1.backblaze.com/x?y",
+            "https://u@pod-1.backblaze.com/x",
+            "http://127.0.0.1:9/upload/0",
+            "",
+        ] {
+            assert!(check_upload_url(bad, false).is_err(), "{bad}");
+        }
+        assert!(check_upload_url("http://127.0.0.1:9/upload/0", true).is_ok());
+        assert!(check_upload_url("https://pod-1.backblaze.com/x", true).is_err());
     }
 
     #[test]

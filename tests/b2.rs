@@ -34,6 +34,16 @@ struct B2State {
     authorize_fail: usize,
     /// answer this many API calls with a front end's 503 (no B2 JSON) first
     call_fail: usize,
+    /// b2_list_buckets calls that named a bucket (credproxy's own lookups)
+    list_lookups: usize,
+    /// upload tokens handed out by b2_get_upload_url (the URL /upload/<index> goes with each)
+    upload_tokens: Vec<String>,
+    /// answer the next upload with this status and B2 code
+    upload_fail: Option<(u16, &'static str)>,
+    /// wait before answering an upload
+    upload_delay: Duration,
+    /// the last stored upload: X-Bz-File-Name, Content-Type, src_last_modified_millis, length, SHA-1 of the body
+    stored: Option<(String, String, Option<String>, usize, String)>,
     /// authorize calls received, failed ones included
     authorize_tries: usize,
     /// wait before answering an authorize call
@@ -51,6 +61,22 @@ fn rnd(prefix: &str) -> String {
         "{prefix}{}",
         b.iter().map(|x| format!("{x:02x}")).collect::<String>()
     )
+}
+
+/// SHA-1 of `b` in hex, by the system's shasum.
+fn sha1_hex(b: &[u8]) -> String {
+    let mut c = Command::new("shasum")
+        .args(["-a", "1"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = c.stdin.take().unwrap();
+    let data = b.to_vec();
+    let w = std::thread::spawn(move || std::io::Write::write_all(&mut stdin, &data).unwrap());
+    let out = c.wait_with_output().unwrap();
+    w.join().unwrap();
+    String::from_utf8(out.stdout).unwrap()[..40].to_string()
 }
 
 fn json_reply(status: u16, v: Value) -> hyper::Response<Full<Bytes>> {
@@ -104,10 +130,20 @@ async fn fake_b2(state: Arc<Mutex<B2State>>) -> u16 {
                                 .map(|v| v.to_str().unwrap().to_string())
                         };
                         let (auth, range) = (h("authorization"), h("range"));
+                        let upload_headers = (
+                            h("x-bz-file-name").unwrap_or_default(),
+                            h("content-type").unwrap_or_default(),
+                            h("x-bz-info-src_last_modified_millis"),
+                            h("x-bz-content-sha1").unwrap_or_default(),
+                        );
                         let method = req.method().to_string();
                         let path = req.uri().path().to_string();
-                        let body = req.into_body().collect().await.unwrap().to_bytes();
-                        let body = String::from_utf8_lossy(&body).to_string();
+                        let raw = req.into_body().collect().await.unwrap().to_bytes();
+                        let body = String::from_utf8_lossy(&raw).to_string();
+                        let up_delay = state.lock().unwrap().upload_delay;
+                        if path.starts_with("/upload/") && !up_delay.is_zero() {
+                            tokio::time::sleep(up_delay).await;
+                        }
                         let delay = state.lock().unwrap().authorize_delay;
                         let authorize = path.ends_with("/b2_authorize_account");
                         if authorize && !delay.is_zero() {
@@ -142,6 +178,26 @@ async fn fake_b2(state: Arc<Mutex<B2State>>) -> u16 {
                         }
                         s.hits += 1;
                         s.last = Some((path.clone(), auth.clone(), body.clone(), range.clone()));
+                        if let Some(i) = path.strip_prefix("/upload/") {
+                            let i: usize = i.parse().unwrap();
+                            if auth.as_deref() != s.upload_tokens.get(i).map(String::as_str) {
+                                return Ok(json_reply(401, json!({"status": 401, "code": "bad_auth_token", "message": "upload token"})));
+                            }
+                            if let Some((status, code)) = s.upload_fail.take() {
+                                return Ok(json_reply(status, json!({"status": status, "code": code, "message": "refused"})));
+                            }
+                            let (name, ctype, mtime, sha_header) = upload_headers;
+                            let sha = sha1_hex(&raw);
+                            if sha != sha_header {
+                                return Ok(json_reply(400, json!({"status": 400, "code": "bad_request", "message": "Sha1 did not match data received"})));
+                            }
+                            s.stored = Some((name.clone(), ctype, mtime, raw.len(), sha.clone()));
+                            return Ok(json_reply(
+                                200,
+                                json!({"fileId": "4_zf1", "fileName": name, "contentLength": raw.len(), "contentSha1": sha,
+                                       "echo": [s.token.clone(), s.upload_tokens[i].clone()]}),
+                            ));
+                        }
                         if s.expire {
                             return Ok(json_reply(
                                 401,
@@ -187,6 +243,24 @@ async fn fake_b2(state: Arc<Mutex<B2State>>) -> u16 {
                             let mut v = json!({"call": call, "got": serde_json::from_str::<Value>(&body).unwrap_or(Value::Null), "echo": s.token});
                             if call == "b2_create_key" {
                                 v["applicationKey"] = json!("K005NEWKEYSECRET");
+                            }
+                            if let Some(name) = v["got"]["bucketName"].as_str().map(str::to_string) {
+                                s.list_lookups += 1;
+                                let buckets = if name == "missing" {
+                                    json!([])
+                                } else {
+                                    json!([{"bucketId": format!("bid{}", name.replace('-', "")), "bucketName": name}])
+                                };
+                                return Ok(json_reply(200, json!({ "buckets": buckets })));
+                            }
+                            if call == "b2_get_upload_url" {
+                                let i = s.upload_tokens.len();
+                                let tok = rnd("up_tok_");
+                                s.upload_tokens.push(tok.clone());
+                                return Ok(json_reply(
+                                    200,
+                                    json!({"bucketId": v["got"]["bucketId"], "uploadUrl": format!("http://127.0.0.1:{port}/upload/{i}"), "authorizationToken": tok}),
+                                ));
                             }
                             if call == "b2_list_keys" {
                                 return Ok(json_reply(
@@ -320,6 +394,10 @@ b2 = {{ calls = ["b2_list_buckets", "b2_create_key", "b2_list_keys", "b2_list_fi
 [[services.b2.routes]]
 prefix = "/file"
 b2 = {{ download = true }}
+
+[[services.b2.routes]]
+prefix = "/upload"
+b2 = {{ upload = true }}
 "#,
             d = d.display(),
         ),
@@ -842,4 +920,329 @@ async fn a_slow_download_error_body_isnt_cut() {
         r.text().await.unwrap(),
         "missing missing missing missing missing "
     );
+}
+
+impl Env {
+    async fn put(
+        &self,
+        path: &str,
+        body: Vec<u8>,
+        headers: Vec<(&'static str, String)>,
+    ) -> (u16, String) {
+        let mut r = reqwest::Client::new()
+            .put(format!("{}/upload{path}", self.base))
+            .header("authorization", format!("Bearer {}", self.token()));
+        for (n, v) in headers {
+            r = r.header(n, v);
+        }
+        let r = r.body(body).send().await.unwrap();
+        (r.status().as_u16(), r.text().await.unwrap())
+    }
+}
+
+fn random_bytes(n: usize) -> Vec<u8> {
+    let mut b = vec![0u8; n];
+    getrandom::fill(&mut b).unwrap();
+    b
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn uploads_stream_to_b2_through_credproxys_own_upload_url() {
+    let env = setup("23h").await;
+    let body = random_bytes(20 << 20);
+    let sha = sha1_hex(&body);
+    let (code, reply) = env
+        .put(
+            "/my-bkt/sessions/s1/in/a%20b.bin",
+            body.clone(),
+            vec![("x-bz-content-sha1", sha.to_string())],
+        )
+        .await;
+    assert_eq!(code, 200, "{reply}");
+    let v: Value = serde_json::from_str(&reply).unwrap();
+    assert_eq!(
+        (v["contentLength"].as_u64(), v["contentSha1"].as_str()),
+        (Some(body.len() as u64), Some(sha.as_str()))
+    );
+    // neither the account token nor the upload token comes back
+    assert_eq!(v["echo"], json!(["[REDACTED]", "[REDACTED]"]));
+    let (name, ctype, mtime, len, stored_sha) = env.st(|s| s.stored.clone()).unwrap();
+    assert_eq!(
+        (
+            name.as_str(),
+            ctype.as_str(),
+            mtime,
+            len,
+            stored_sha.as_str()
+        ),
+        (
+            "sessions/s1/in/a%20b.bin",
+            "b2/x-auto",
+            None,
+            body.len(),
+            sha.as_str()
+        )
+    );
+    // a second upload reuses the bucket's id and the upload URL
+    let small = b"hello".to_vec();
+    let (code, reply) = env
+        .put(
+            "/my-bkt/sessions/s1/in/hello.txt",
+            small.clone(),
+            vec![
+                ("x-bz-content-sha1", sha1_hex(&small).to_string()),
+                ("content-type", "text/plain".to_string()),
+                (
+                    "x-bz-info-src_last_modified_millis",
+                    "1700000000000".to_string(),
+                ),
+            ],
+        )
+        .await;
+    assert_eq!(code, 200, "{reply}");
+    let stored = env.st(|s| s.stored.clone()).unwrap();
+    assert_eq!(
+        (stored.1.as_str(), stored.2.as_deref()),
+        ("text/plain", Some("1700000000000"))
+    );
+    assert_eq!(
+        env.st(|s| (s.list_lookups, s.upload_tokens.len(), s.authorizes)),
+        (1, 1, 1)
+    );
+    let log = env.log();
+    let tokens = env.st(|s| (s.token.clone(), s.upload_tokens.clone()));
+    for t in std::iter::once(&tokens.0).chain(&tokens.1) {
+        assert!(!log.contains(t.as_str()), "{log}");
+    }
+    assert!(
+        log.contains("b2 PUT /upload/my-bkt/sessions/s1/in/a%20b.bin 200"),
+        "{log}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn refused_uploads_never_unlock_or_reach_b2() {
+    let env = setup("23h").await;
+    let sha = sha1_hex(b"x");
+    let c = reqwest::Client::new();
+    let tok = env.token();
+    let send = |m: reqwest::Method, path: &str, headers: Vec<(&'static str, String)>| {
+        let mut r = c
+            .request(m, format!("{}/upload{path}", env.base))
+            .header("authorization", format!("Bearer {tok}"))
+            .body("x");
+        for (n, v) in headers {
+            r = r.header(n, v);
+        }
+        r.send()
+    };
+    use reqwest::Method;
+    let s = || ("x-bz-content-sha1", sha.clone());
+    for (m, p, headers, code) in [
+        (Method::POST, "/bkt/a", vec![s()], 403),
+        (Method::GET, "/bkt/a", vec![s()], 403),
+        (Method::PUT, "/bkt/a?x=1", vec![s()], 403),
+        (Method::PUT, "/bkt", vec![s()], 403),
+        (Method::PUT, "/bkt/a//b", vec![s()], 403),
+        (Method::PUT, "/bkt/a", vec![], 400),
+        (
+            Method::PUT,
+            "/bkt/a",
+            vec![("x-bz-content-sha1", "do_not_verify".into())],
+            400,
+        ),
+        (
+            Method::PUT,
+            "/bkt/a",
+            vec![("x-bz-content-sha1", "a".repeat(39))],
+            400,
+        ),
+        (Method::PUT, "/bkt/a", vec![s(), s()], 400),
+        (
+            Method::PUT,
+            "/bkt/a",
+            vec![s(), ("x-bz-info-author", "me".into())],
+            403,
+        ),
+        (
+            Method::PUT,
+            "/bkt/a",
+            vec![s(), ("x-bz-server-side-encryption", "AES256".into())],
+            403,
+        ),
+        (
+            Method::PUT,
+            "/bkt/a",
+            vec![
+                s(),
+                ("x-bz-server-side-encryption-customer-key", "k".into()),
+            ],
+            403,
+        ),
+        (
+            Method::PUT,
+            "/bkt/a",
+            vec![s(), ("content-encoding", "gzip".into())],
+            403,
+        ),
+        (
+            Method::PUT,
+            "/bkt/a",
+            vec![
+                s(),
+                ("x-bz-info-src_last_modified_millis", "yesterday".into()),
+            ],
+            400,
+        ),
+    ] {
+        let r = send(m.clone(), p, headers).await.unwrap();
+        assert_eq!(
+            r.status().as_u16(),
+            code,
+            "{m} {p}: {}",
+            r.text().await.unwrap()
+        );
+    }
+    // a chunked body (no Content-Length): B2 takes none
+    let chunked = reqwest::Body::wrap_stream(futures_util::stream::once(async {
+        Ok::<_, std::io::Error>(Bytes::from_static(b"x"))
+    }));
+    let r = c
+        .put(format!("{}/upload/bkt/a", env.base))
+        .header("authorization", format!("Bearer {tok}"))
+        .header("x-bz-content-sha1", &sha)
+        .body(chunked)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 411);
+    assert_eq!(env.st(|s| (s.authorizes, s.hits)), (0, 0));
+    assert!(env.status().contains("b2: locked"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_upload_says_whether_to_retry_and_drops_its_url() {
+    let env = setup("23h").await;
+    let body = b"payload".to_vec();
+    let sha = sha1_hex(&body);
+    let put = || {
+        env.put(
+            "/my-bkt/sessions/s1/in/p",
+            body.clone(),
+            vec![("x-bz-content-sha1", sha.to_string())],
+        )
+    };
+    assert_eq!(put().await.0, 200);
+    for (status, code, urls) in [
+        (503, "service_unavailable", 2),
+        (401, "expired_auth_token", 3),
+        (408, "request_timeout", 4),
+    ] {
+        env.st(|s| s.upload_fail = Some((status, code)));
+        let (c, reply) = put().await;
+        assert_eq!(c, 503, "{reply}");
+        assert!(
+            reply.contains(&format!("upload not stored (B2: {status} {code}): retry")),
+            "{reply}"
+        );
+        // the upload token's end isn't the account token's: still unlocked
+        assert!(env.status().contains("b2: unlocked"));
+        assert_eq!(put().await.0, 200);
+        assert_eq!(
+            env.st(|s| s.upload_tokens.len()),
+            urls,
+            "a new upload URL after {status}"
+        );
+    }
+    // B2's other refusals are passed on (scrubbed); the URL is dropped too
+    env.st(|s| s.upload_fail = Some((400, "bad_request")));
+    let (c, reply) = put().await;
+    assert_eq!(c, 400);
+    assert!(reply.contains("bad_request"), "{reply}");
+    let (c, reply) = env
+        .put(
+            "/my-bkt/sessions/s1/in/p",
+            body.clone(),
+            vec![("x-bz-content-sha1", "0".repeat(40).to_string())],
+        )
+        .await;
+    assert_eq!(c, 400);
+    assert!(reply.contains("Sha1 did not match"), "{reply}");
+    assert_eq!(put().await.0, 200);
+    assert_eq!(env.st(|s| s.upload_tokens.len()), 6);
+    // a bucket the account doesn't have
+    let (c, reply) = env
+        .put(
+            "/missing/x",
+            body.clone(),
+            vec![("x-bz-content-sha1", sha.to_string())],
+        )
+        .await;
+    assert_eq!(c, 404, "{reply}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn parallel_uploads_get_their_own_upload_urls() {
+    let env = setup("23h").await;
+    env.st(|s| s.upload_delay = Duration::from_millis(800));
+    // the lookup and the first URL come from one upload; then two at once
+    let body = b"a".to_vec();
+    let sha = sha1_hex(&body);
+    assert_eq!(
+        env.put(
+            "/my-bkt/x/0",
+            body.clone(),
+            vec![("x-bz-content-sha1", sha.to_string())]
+        )
+        .await
+        .0,
+        200
+    );
+    let (a, b) = tokio::join!(
+        env.put(
+            "/my-bkt/x/1",
+            body.clone(),
+            vec![("x-bz-content-sha1", sha.to_string())]
+        ),
+        env.put(
+            "/my-bkt/x/2",
+            body.clone(),
+            vec![("x-bz-content-sha1", sha.to_string())]
+        )
+    );
+    assert_eq!((a.0, b.0), (200, 200), "{a:?} {b:?}");
+    assert_eq!(env.st(|s| (s.upload_tokens.len(), s.list_lookups)), (2, 1));
+    // both went back to the pool
+    let (a, b) = tokio::join!(
+        env.put(
+            "/my-bkt/x/3",
+            body.clone(),
+            vec![("x-bz-content-sha1", sha.to_string())]
+        ),
+        env.put(
+            "/my-bkt/x/4",
+            body.clone(),
+            vec![("x-bz-content-sha1", sha.to_string())]
+        )
+    );
+    assert_eq!((a.0, b.0), (200, 200));
+    assert_eq!(env.st(|s| s.upload_tokens.len()), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_ended_account_token_during_an_upload_locks() {
+    let env = setup("23h").await;
+    assert_eq!(env.call("b2_list_buckets", "{}").await.0, 200);
+    env.st(|s| s.expire = true);
+    let body = b"a".to_vec();
+    let (c, reply) = env
+        .put(
+            "/my-bkt/x",
+            body.clone(),
+            vec![("x-bz-content-sha1", sha1_hex(&body).to_string())],
+        )
+        .await;
+    assert_eq!(c, 503);
+    assert!(reply.contains("B2 token expired or revoked"), "{reply}");
+    assert!(env.status().contains("b2: locked"));
 }

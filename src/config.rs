@@ -74,6 +74,8 @@ struct RawB2Route {
     calls: Vec<String>,
     #[serde(default)]
     download: bool,
+    #[serde(default)]
+    upload: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -214,6 +216,8 @@ pub enum B2Route {
     Api(Vec<String>),
     /// GET/HEAD /<bucket>/<file name>, to the account's downloadUrl.
     Download,
+    /// PUT /<bucket>/<file name>, streamed to an upload URL credproxy gets itself (b2_get_upload_url).
+    Upload,
 }
 
 /// Calls a B2 route can't allow: credproxy makes the authorize call itself, the others hand out credentials that
@@ -494,11 +498,12 @@ fn check_b2(r: RawB2) -> Result<B2Auth, String> {
 }
 
 fn check_b2_route(r: RawB2Route) -> Result<B2Route, String> {
-    match (r.calls.is_empty(), r.download) {
-        (false, true) => return Err("b2: calls or download, not both".into()),
-        (true, false) => return Err("b2: no calls".into()),
-        (true, true) => return Ok(B2Route::Download),
-        (false, false) => {}
+    match (r.calls.is_empty(), r.download, r.upload) {
+        (true, true, false) => return Ok(B2Route::Download),
+        (true, false, true) => return Ok(B2Route::Upload),
+        (true, false, false) => return Err("b2: no calls".into()),
+        (false, false, false) => {}
+        _ => return Err("b2: one of calls, download or upload".into()),
     }
     for c in &r.calls {
         if let Some((_, why)) = B2_REFUSED.iter().find(|(n, _)| n == c) {
@@ -1068,6 +1073,9 @@ b2 = { calls = ["b2_list_buckets", "b2_create_key"] }
 [[services.b2.routes]]
 prefix = "/file"
 b2 = { download = true }
+[[services.b2.routes]]
+prefix = "/upload"
+b2 = { upload = true }
 "#;
 
     #[test]
@@ -1096,6 +1104,10 @@ b2 = { download = true }
         assert_eq!(
             s.route("/file/bkt/a/b").unwrap().0.b2,
             Some(B2Route::Download)
+        );
+        assert_eq!(
+            s.route("/upload/bkt/a/b").unwrap().0.b2,
+            Some(B2Route::Upload)
         );
         let c = parse(
             &B2.replace(
@@ -1144,6 +1156,10 @@ b2 = { download = true }
                 "download = true, calls = [\"b2_list_keys\"]",
             ),
             B2.replace("download = true", "download = false"),
+            B2.replace("upload = true", "upload = true, download = true"),
+            B2.replace("upload = true", "upload = true, calls = [\"b2_list_keys\"]"),
+            B2.replace("upload = true", "upload = false"),
+            B2.replace("upload = true }", "upload = true, buckets = [\"x\"] }"),
             B2.replace(
                 "download = true }",
                 "download = true }\nupstream = \"https://x\"",
