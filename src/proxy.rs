@@ -36,7 +36,7 @@ pub(crate) const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(60);
 /// they have no overall time limit.
 pub(crate) const IDLE: Duration = Duration::from_secs(60);
 
-/// What a connection's watchdog (serve.rs) needs to know: whether it carries an allowed streaming call (S3,
+/// What a connection's watchdog (serve.rs) needs to know: whether it carries an allowed streaming call (S3, a stream route,
 /// a B2 download), when bytes last
 /// moved, and until when silence is expected (Touch ID, the upstream preparing its reply).
 pub struct Progress {
@@ -47,6 +47,8 @@ struct ProgressState {
     /// Some("service METHOD path") once the connection carries an allowed streaming call (S3, a B2 download),
     /// named in the log if cut
     label: Option<String>,
+    /// The call's own idle limit (stream routes); None = the watchdog's default (`s3_idle`)
+    idle: Option<Duration>,
     last: tokio::time::Instant,
     quiet_until: Option<tokio::time::Instant>,
 }
@@ -56,6 +58,7 @@ impl Default for Progress {
         Progress {
             state: std::sync::Mutex::new(ProgressState {
                 label: None,
+                idle: None,
                 last: tokio::time::Instant::now(),
                 quiet_until: None,
             }),
@@ -74,6 +77,17 @@ impl Progress {
         s.last = tokio::time::Instant::now();
     }
 
+    /// A streaming call with its own idle limit instead of the watchdog's default.
+    pub(crate) fn mark_streaming_idle(&self, label: String, idle: Duration) {
+        self.mark_streaming(label);
+        self.state.lock().unwrap().idle = Some(idle);
+    }
+
+    /// The idle limit this connection is held to.
+    pub fn idle(&self, default: Duration) -> Duration {
+        self.state.lock().unwrap().idle.unwrap_or(default)
+    }
+
     pub fn label(&self) -> String {
         self.state.lock().unwrap().label.clone().unwrap_or_default()
     }
@@ -90,10 +104,10 @@ impl Progress {
         self.state.lock().unwrap().quiet_until = Some(tokio::time::Instant::now() + d);
     }
 
-    /// No bytes for `idle`, and no expected silence left.
-    pub fn stalled(&self, idle: Duration) -> bool {
+    /// No bytes for the call's idle limit (`default` unless it set its own), and no expected silence left.
+    pub fn stalled(&self, default: Duration) -> bool {
         let s = self.state.lock().unwrap();
-        let mut deadline = s.last + idle;
+        let mut deadline = s.last + s.idle.unwrap_or(default);
         if let Some(q) = s.quiet_until {
             deadline = deadline.max(q);
         }
@@ -143,9 +157,62 @@ pub(crate) fn reply(status: StatusCode, msg: &str) -> Response<Body> {
         .unwrap()
 }
 
+const MARK: &[u8] = b"[REDACTED]";
+
+/// `scrub` for a reply that arrives in chunks: a key split across chunks is still caught. Holds back only the
+/// longest chunk tail that could be the start of the key (at most key length − 1 bytes), so text that can't be part
+/// of a key goes out at once.
+pub struct Scrubber {
+    key: Zeroizing<Vec<u8>>,
+    held: Vec<u8>,
+}
+
+impl Scrubber {
+    pub fn new(key: &[u8]) -> Self {
+        Scrubber {
+            key: Zeroizing::new(key.to_vec()),
+            held: Vec::new(),
+        }
+    }
+
+    /// The next chunk: what can go out now.
+    pub fn push(&mut self, chunk: &[u8]) -> Vec<u8> {
+        let key: &[u8] = &self.key;
+        if key.is_empty() {
+            return chunk.to_vec();
+        }
+        let mut buf = std::mem::take(&mut self.held);
+        buf.extend_from_slice(chunk);
+        let k = key.len();
+        let mut out = Vec::with_capacity(buf.len());
+        let mut i = 0;
+        while i + k <= buf.len() {
+            if &buf[i..i + k] == key {
+                out.extend_from_slice(MARK);
+                i += k;
+            } else {
+                out.push(buf[i]);
+                i += 1;
+            }
+        }
+        let tail = &buf[i..];
+        let hold = (1..=tail.len())
+            .rev()
+            .find(|&n| key.starts_with(&tail[tail.len() - n..]))
+            .unwrap_or(0);
+        out.extend_from_slice(&tail[..tail.len() - hold]);
+        self.held = tail[tail.len() - hold..].to_vec();
+        out
+    }
+
+    /// The end of the reply: whatever was held back (not a whole key).
+    pub fn finish(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.held)
+    }
+}
+
 /// Replace every occurrence of `key` in `body`.
 pub fn scrub(body: &[u8], key: &[u8]) -> Vec<u8> {
-    const MARK: &[u8] = b"[REDACTED]";
     if key.is_empty() || body.len() < key.len() {
         return body.to_vec();
     }
@@ -287,6 +354,12 @@ async fn forward(
     if route.s3.is_some() {
         return forward_s3(vault, &http.s3, service, method, route, &sub, req, progress).await;
     }
+    if route.stream.is_some() {
+        return forward_stream(
+            vault, &http.api, service, method, route, &sub, req, progress,
+        )
+        .await;
+    }
     let (parts, body) = req.into_parts();
     let body = match read_small(body, IDLE).await {
         Ok(b) => b,
@@ -360,7 +433,17 @@ async fn forward(
 /// A small client body (≤ MAX_REQUEST), read within `limit`.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn read_small(body: Incoming, limit: Duration) -> Result<Bytes, Response<Body>> {
-    match tokio::time::timeout(limit, Limited::new(body, MAX_REQUEST).collect()).await {
+    read_body(body, MAX_REQUEST, limit).await
+}
+
+/// A client body of at most `max` bytes, read within `limit`.
+#[allow(clippy::result_large_err)]
+pub(crate) async fn read_body(
+    body: Incoming,
+    max: usize,
+    limit: Duration,
+) -> Result<Bytes, Response<Body>> {
+    match tokio::time::timeout(limit, Limited::new(body, max).collect()).await {
         Ok(Ok(b)) => Ok(b.to_bytes()),
         Ok(Err(e))
             if e.downcast_ref::<http_body_util::LengthLimitError>()
@@ -497,6 +580,192 @@ pub(crate) async fn buffered_reply(
     match read_buffered(res, secrets, progress).await {
         Ok(b) => b.into_response(),
         Err(r) => r,
+    }
+}
+
+/// Key-in-header route with `stream = true` (LLM APIs): the reply streams back as it arrives, scrubbed of the key on
+/// the fly, with no overall time limit: the connection's watchdog cuts the call after the route's `stream_idle`
+/// without bytes moving (connecting and waiting for the reply's start included; a Touch ID prompt is not). The request body (≤ the route's `max_body`) is
+/// read whole first, before the key.
+#[allow(clippy::too_many_arguments)]
+async fn forward_stream(
+    vault: &Arc<Vault>,
+    http: &reqwest::Client,
+    service: &str,
+    method: &str,
+    route: &Route,
+    sub: &str,
+    req: Request<Incoming>,
+    progress: &Arc<Progress>,
+) -> Response<Body> {
+    let svc = &vault.cfg.services[service];
+    let st = route.stream.as_ref().expect("stream route");
+    let p = if sub.is_empty() { "/" } else { sub };
+    if !route.allow.iter().any(|r| r.matches(method, p)) {
+        return reply(
+            StatusCode::FORBIDDEN,
+            &format!("{method} {} not allowed", log::printable(p)),
+        );
+    }
+    let Ok(m) = reqwest::Method::from_bytes(method.as_bytes()) else {
+        return reply(StatusCode::METHOD_NOT_ALLOWED, "bad method");
+    };
+    let (parts, body) = req.into_parts();
+    if parts
+        .headers
+        .get("content-length")
+        .and_then(|v| v.to_str().ok()?.parse::<u64>().ok())
+        .is_some_and(|n| n > st.max_body as u64)
+    {
+        return reply(StatusCode::PAYLOAD_TOO_LARGE, "request body too large");
+    }
+    let body = match read_body(body, st.max_body, IDLE).await {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+
+    // allowed: from now on the watchdog decides (the route's idle limit, no overall one); a Touch ID prompt and
+    // connecting are expected silence
+    let what = format!("{service} {method} {}{}", route.prefix, log::printable(sub));
+    progress.mark_streaming_idle(what.clone(), st.idle);
+    progress.quiet_for(crate::vault::UNLOCK_TIMEOUT + Duration::from_secs(10));
+    let key = match vault.key(service, false).await {
+        Ok(k) => k,
+        Err(e) => return reply(StatusCode::SERVICE_UNAVAILABLE, &e),
+    };
+    // the unlock is over: from here connecting and waiting for the reply count toward the idle limit
+    progress.touch();
+    let mut url = format!("{}{sub}", route.upstream);
+    if let Some(q) = parts.uri.query() {
+        url.push('?');
+        url.push_str(q);
+    }
+    let auth = Zeroizing::new(svc.auth_format.replace("{key}", &key));
+    let Ok(mut auth_value) = reqwest::header::HeaderValue::from_str(&auth) else {
+        return reply(StatusCode::INTERNAL_SERVER_ERROR, "bad auth header");
+    };
+    auth_value.set_sensitive(true);
+    let mut out = http
+        .request(m, &url)
+        .header(svc.auth_header.as_str(), auth_value)
+        .header("accept-encoding", "identity");
+    for n in ["content-type", "accept"]
+        .iter()
+        .copied()
+        .chain(st.forward_headers.iter().map(String::as_str))
+    {
+        for v in parts.headers.get_all(n) {
+            out = out.header(n, v.clone());
+        }
+    }
+    if !body.is_empty() {
+        out = out.body(body);
+    }
+    let res = match out.send().await {
+        Ok(r) => r,
+        Err(e) => return upstream_failed(&e),
+    };
+    progress.touch();
+    if res
+        .headers()
+        .get("content-encoding")
+        .is_some_and(|e| !e.as_bytes().eq_ignore_ascii_case(b"identity"))
+    {
+        return reply(StatusCode::BAD_GATEWAY, "upstream sent a compressed reply");
+    }
+    // HTTP/1 without a length or chunked framing ends at the connection's close: a cut-off reply would look whole
+    let chunked = res.headers().get_all("transfer-encoding").iter().any(|v| {
+        v.as_bytes()
+            .to_ascii_lowercase()
+            .windows(7)
+            .any(|w| w == b"chunked")
+    });
+    let bodiless = method == "HEAD" || res.status() == reqwest::StatusCode::NO_CONTENT;
+    if res.version() < reqwest::Version::HTTP_2
+        && !bodiless
+        && !chunked
+        && res.headers().get("content-length").is_none()
+    {
+        return reply(
+            StatusCode::BAD_GATEWAY,
+            "upstream reply has no length, so a cut-off one couldn't be told apart",
+        );
+    }
+    let mut b = Response::builder().status(res.status().as_u16());
+    for n in ["content-type", "retry-after"] {
+        if let Some(v) = res.headers().get(n)
+            && let Ok(v) =
+                hyper::header::HeaderValue::from_bytes(&scrub(v.as_bytes(), key.as_bytes()))
+        {
+            b = b.header(n, v);
+        }
+    }
+    let stream = Scrubbed {
+        inner: Box::pin(res.bytes_stream()),
+        scrubber: Scrubber::new(key.as_bytes()),
+        progress: progress.clone(),
+        log: vault.cfg.log.clone(),
+        what,
+        done: false,
+    };
+    b.body(BodyExt::boxed(StreamBody::new(stream))).unwrap()
+}
+
+/// An upstream reply's bytes, scrubbed on the fly; each chunk is progress for the watchdog. A reply the upstream
+/// breaks off is an error to the client (never a short success) and gets its own log line.
+struct Scrubbed<S> {
+    inner: S,
+    scrubber: Scrubber,
+    progress: Arc<Progress>,
+    log: std::path::PathBuf,
+    what: String,
+    done: bool,
+}
+
+impl<S> futures_util::Stream for Scrubbed<S>
+where
+    S: futures_util::Stream<Item = reqwest::Result<Bytes>> + Unpin,
+{
+    type Item = Result<Frame<Bytes>, BoxError>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        use std::task::Poll;
+        let this = &mut *self;
+        if this.done {
+            return Poll::Ready(None);
+        }
+        loop {
+            match std::pin::Pin::new(&mut this.inner).poll_next(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Some(Ok(c))) => {
+                    this.progress.touch();
+                    let out = this.scrubber.push(&c);
+                    if !out.is_empty() {
+                        return Poll::Ready(Some(Ok(Frame::data(Bytes::from(out)))));
+                    }
+                }
+                Poll::Ready(Some(Err(e))) => {
+                    this.done = true;
+                    log::line(
+                        &this.log,
+                        &format!("{} reply broke off (upstream closed)", this.what),
+                    );
+                    return Poll::Ready(Some(Err(BoxError::from(e))));
+                }
+                Poll::Ready(None) => {
+                    this.done = true;
+                    let rest = this.scrubber.finish();
+                    return Poll::Ready(if rest.is_empty() {
+                        None
+                    } else {
+                        Some(Ok(Frame::data(Bytes::from(rest))))
+                    });
+                }
+            }
+        }
     }
 }
 
@@ -1043,6 +1312,38 @@ mod tests {
             assert!(!super::host_ok(&h(bad), listen), "{bad}");
         }
         assert!(!super::host_ok(&hyper::HeaderMap::new(), listen));
+    }
+
+    /// Streaming scrubbing gives exactly what scrubbing the whole reply gives, however it's cut into chunks, and
+    /// holds back nothing that can't be the start of the key.
+    #[test]
+    fn scrubber_matches_scrub_at_every_split() {
+        use super::Scrubber;
+        let key = b"sk-ab12sk-ab9";
+        let body: &[u8] =
+            b"x sk-ab12sk-ab9 sk-ab12sk-ab12sk-ab9 sk-a end sk-ab12sk-ab9sk-ab12sk-ab9 s";
+        let want = scrub(body, key);
+        for i in 0..=body.len() {
+            for j in i..=body.len() {
+                let mut s = Scrubber::new(key);
+                let mut got = s.push(&body[..i]);
+                got.extend(s.push(&body[i..j]));
+                got.extend(s.push(&body[j..]));
+                got.extend(s.finish());
+                assert_eq!(got, want, "split at {i},{j}");
+            }
+        }
+        // byte by byte
+        let mut s = Scrubber::new(key);
+        let mut got: Vec<u8> = body.iter().flat_map(|b| s.push(&[*b])).collect();
+        got.extend(s.finish());
+        assert_eq!(got, want);
+        // an SSE event that can't end in a key prefix goes out whole, at once
+        let mut s = Scrubber::new(key);
+        assert_eq!(s.push(b"data: {}\n\n"), b"data: {}\n\n");
+        // a possible start of the key is held until the next chunk shows it isn't one
+        assert_eq!(s.push(b"data: sk-a"), b"data: ");
+        assert_eq!(s.push(b"x\n\n"), b"sk-ax\n\n");
     }
 
     #[test]

@@ -107,6 +107,15 @@ struct RawRoute {
     graphql_queries: Option<Vec<String>>,
     s3: Option<RawS3>,
     b2: Option<RawB2Route>,
+    /// Key-in-header routes: stream replies through (scrubbed on the fly) instead of buffering them.
+    #[serde(default)]
+    stream: bool,
+    /// With `stream`: cut a call after this long without bytes moving (no overall limit).
+    stream_idle: Option<String>,
+    /// With `stream`: largest request body.
+    max_body: Option<String>,
+    /// With `stream`: client headers forwarded on top of Content-Type and Accept.
+    forward_headers: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -248,6 +257,89 @@ pub struct Route {
     pub s3: Option<S3Route>,
     /// Some = B2 endpoint (B2 services only); `upstream` is then empty.
     pub b2: Option<B2Route>,
+    /// Some = key-in-header route whose replies stream through, scrubbed on the fly (LLM APIs).
+    pub stream: Option<StreamRoute>,
+}
+
+#[derive(Debug)]
+pub struct StreamRoute {
+    /// A call that moves no bytes for this long (waiting for the reply included) is cut off.
+    pub idle: Duration,
+    /// Largest request body, in bytes.
+    pub max_body: usize,
+    /// Extra client headers forwarded upstream (lowercase).
+    pub forward_headers: Vec<String>,
+}
+
+pub const DEFAULT_STREAM_IDLE: Duration = Duration::from_secs(600);
+pub const DEFAULT_STREAM_MAX_BODY: usize = 8 << 20;
+const MAX_STREAM_BODY: usize = 64 << 20;
+
+/// A size like `512KiB`, `8MiB` (or plain bytes).
+pub fn parse_size(s: &str) -> Result<usize, String> {
+    let s = s.trim();
+    let (num, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len()));
+    let n: usize = num.parse().map_err(|_| format!("bad size {s:?}"))?;
+    let mult = match unit {
+        "" => 1,
+        "KiB" => 1 << 10,
+        "MiB" => 1 << 20,
+        _ => return Err(format!("bad size {s:?} (use e.g. 512KiB, 8MiB)")),
+    };
+    let n = n
+        .checked_mul(mult)
+        .ok_or(format!("size {s:?} is too large"))?;
+    if n == 0 {
+        return Err("size must be > 0".into());
+    }
+    Ok(n)
+}
+
+/// Client headers a stream route can't forward: credproxy sets or forwards them itself, they carry credentials,
+/// or they belong to the connection.
+fn check_stream(
+    stream_idle: Option<String>,
+    max_body: Option<String>,
+    forward_headers: Option<Vec<String>>,
+    auth_header: &str,
+) -> Result<StreamRoute, String> {
+    let idle = match stream_idle {
+        Some(d) => bounded(&d, "stream_idle", Duration::from_secs(24 * 3600))?,
+        None => DEFAULT_STREAM_IDLE,
+    };
+    let max_body = match max_body {
+        Some(b) => {
+            let n = parse_size(&b).map_err(|e| format!("max_body: {e}"))?;
+            if n > MAX_STREAM_BODY {
+                return Err(format!("max_body: at most {}MiB", MAX_STREAM_BODY >> 20));
+            }
+            n
+        }
+        None => DEFAULT_STREAM_MAX_BODY,
+    };
+    let mut headers = Vec::new();
+    for h in forward_headers.unwrap_or_default() {
+        let l = h.to_ascii_lowercase();
+        if !valid_header(&h) {
+            return Err(format!("forward_headers: bad header name {h:?}"));
+        }
+        if RESERVED_HEADERS.contains(&l.as_str())
+            || ["authorization", "proxy-authorization", "cookie"].contains(&l.as_str())
+            || l == auth_header.to_ascii_lowercase()
+        {
+            return Err(format!(
+                "forward_headers: {h:?} is set by credproxy, carries credentials or belongs to the connection"
+            ));
+        }
+        if !headers.contains(&l) {
+            headers.push(l);
+        }
+    }
+    Ok(StreamRoute {
+        idle,
+        max_body,
+        forward_headers: headers,
+    })
 }
 
 #[derive(Debug)]
@@ -723,6 +815,26 @@ pub fn parse(text: &str) -> Result<Config, String> {
                     r.prefix
                 ));
             }
+            let stream = if r.stream {
+                if allow.is_empty() {
+                    return Err(format!(
+                        "service {name}: route {:?}: stream needs allow rules (key-in-header routes only)",
+                        r.prefix
+                    ));
+                }
+                Some(
+                    check_stream(r.stream_idle, r.max_body, r.forward_headers, &s.auth.header)
+                        .map_err(|e| format!("service {name}: route {:?}: {e}", r.prefix))?,
+                )
+            } else {
+                if r.stream_idle.is_some() || r.max_body.is_some() || r.forward_headers.is_some() {
+                    return Err(format!(
+                        "service {name}: route {:?}: stream_idle, max_body and forward_headers need stream = true",
+                        r.prefix
+                    ));
+                }
+                None
+            };
             routes.push(Route {
                 prefix,
                 upstream,
@@ -730,6 +842,7 @@ pub fn parse(text: &str) -> Result<Config, String> {
                 graphql_queries: r.graphql_queries,
                 s3,
                 b2: b2_route,
+                stream,
             });
         }
         services.insert(
@@ -1184,5 +1297,72 @@ b2 = { upload = true }
         for b in bad {
             assert!(parse(&b).is_err(), "accepted:\n{b}");
         }
+    }
+
+    #[test]
+    fn stream_route() {
+        let base = |extra: &str| {
+            format!(
+                r#"
+[services.vllm]
+secret = "vllm/api-key"
+[[services.vllm.routes]]
+prefix = "/v1"
+upstream = "https://vllm.example/v1"
+allow = ["POST /chat/completions"]
+{extra}
+"#
+            )
+        };
+        let c = parse(&base("stream = true")).unwrap();
+        let st = c.services["vllm"].routes[0].stream.as_ref().unwrap();
+        assert_eq!(st.idle, DEFAULT_STREAM_IDLE);
+        assert_eq!(st.max_body, DEFAULT_STREAM_MAX_BODY);
+        assert!(st.forward_headers.is_empty());
+        let c = parse(&base(
+            "stream = true\nstream_idle = \"15m\"\nmax_body = \"16MiB\"\nforward_headers = [\"Anthropic-Version\", \"anthropic-version\", \"anthropic-beta\"]",
+        ))
+        .unwrap();
+        let st = c.services["vllm"].routes[0].stream.as_ref().unwrap();
+        assert_eq!(st.idle, Duration::from_secs(900));
+        assert_eq!(st.max_body, 16 << 20);
+        assert_eq!(st.forward_headers, ["anthropic-version", "anthropic-beta"]);
+        assert!(
+            parse(&base("")).unwrap().services["vllm"].routes[0]
+                .stream
+                .is_none()
+        );
+        for bad in [
+            "stream_idle = \"5m\"",
+            "max_body = \"1MiB\"",
+            "forward_headers = [\"x-a\"]",
+            "stream = true\nstream_idle = \"25h\"",
+            "stream = true\nmax_body = \"65MiB\"",
+            "stream = true\nmax_body = \"8MB\"",
+            "stream = true\nmax_body = \"0\"",
+            "stream = true\nforward_headers = [\"Authorization\"]",
+            "stream = true\nforward_headers = [\"cookie\"]",
+            "stream = true\nforward_headers = [\"accept-encoding\"]",
+            "stream = true\nforward_headers = [\"host\"]",
+            "stream = true\nforward_headers = [\"bad header\"]",
+        ] {
+            assert!(parse(&base(bad)).is_err(), "accepted: {bad}");
+        }
+        // the token header can't be forwarded either
+        let custom = base("stream = true\nforward_headers = [\"x-api-key\"]").replace(
+            "secret = \"vllm/api-key\"",
+            "secret = \"vllm/api-key\"\nauth = { header = \"x-api-key\", format = \"{key}\" }",
+        );
+        assert!(parse(&custom).is_err());
+        // stream needs allow rules: not for GraphQL
+        assert!(
+            parse(&base("stream = true").replace(
+                "allow = [\"POST /chat/completions\"]",
+                "graphql_queries = [\"x\"]"
+            ))
+            .is_err()
+        );
+        assert_eq!(parse_size("512KiB").unwrap(), 512 << 10);
+        assert_eq!(parse_size("100").unwrap(), 100);
     }
 }

@@ -193,7 +193,7 @@ async fn serve(cfg: Config) -> Result<(), String> {
                     let conn: std::pin::Pin<Box<dyn std::future::Future<Output = _> + Send>> = Box::pin(conn);
                     if within_lifetime(conn, &watched, s3_idle).await {
                         let why = if watched.is_streaming() {
-                            format!("{} cut off: no progress for {}s", watched.label(), s3_idle.as_secs())
+                            format!("{} cut off: no progress for {}s", watched.label(), watched.idle(s3_idle).as_secs())
                         } else {
                             format!("- connection closed after {}s", CONNECTION_LIFETIME.as_secs())
                         };
@@ -341,6 +341,24 @@ mod tests {
         })
         .await;
         assert_eq!(t, Duration::from_secs(160));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stream_routes_have_their_own_idle_and_no_lifetime() {
+        // an LLM reply: 9 minutes before the first byte (within a 10 min stream_idle), then bytes every 30 s for
+        // an hour, then nothing: cut 10 min after the last bytes, never at 5 minutes or 60 s
+        let p = Arc::new(Progress::default());
+        p.mark_streaming_idle("t".into(), Duration::from_secs(600));
+        let q = p.clone();
+        let t = lives(p, async move {
+            tokio::time::sleep(Duration::from_secs(540)).await;
+            for _ in 0..120 {
+                q.touch();
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+        })
+        .await;
+        assert_eq!(t, Duration::from_secs(540 + 119 * 30 + 600));
     }
 
     #[tokio::test(start_paused = true)]
