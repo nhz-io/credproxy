@@ -148,6 +148,15 @@ auth = {{ header = "api_key", format = "{{key}}" }}
 prefix = "/v1"
 upstream = "http://127.0.0.1:{port}/v1"
 allow = ["GET /pods"]
+
+[services.basic]
+secret = "fake/api-key"
+auth = {{ basic = {{}} }}
+
+[[services.basic.routes]]
+prefix = "/v1"
+upstream = "http://127.0.0.1:{port}/v1"
+allow = ["GET /pods"]
 "#,
             d = d.display(),
             age_line = match fake_age {
@@ -778,4 +787,73 @@ async fn underscore_auth_header() {
     assert_eq!(send("api-key", tok.clone()).await.0, 401);
     assert_eq!(send("authorization", format!("Bearer {tok}")).await.0, 401);
     assert_eq!(send("api_key", env.token()).await.0, 401);
+}
+
+/// HTTP Basic (Azure DevOps PATs): the client sends `Basic base64(:<token>)` as `curl -u ":$token"` does, the
+/// upstream gets `Basic base64(:<key>)`, and neither the key nor its encoded form comes back in the reply.
+#[tokio::test]
+async fn basic_auth() {
+    let env = setup("12h").await;
+    let url = format!("{}/v1/pods", env.base.replace("/fake", "/basic"));
+    let tok = String::from_utf8(
+        sh(Command::new(BIN)
+            .args(["token", "basic"])
+            .env("CREDPROXY_CONFIG", &env.cfg))
+        .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    // the header value reqwest (like curl -u) builds for a user and password
+    let basic = |user: &str, pass: &str| {
+        reqwest::Client::new()
+            .get("http://x/")
+            .basic_auth(user, Some(pass))
+            .build()
+            .unwrap()
+            .headers()["authorization"]
+            .to_str()
+            .unwrap()
+            .to_string()
+    };
+    let send = |value: String| {
+        let url = url.clone();
+        async move {
+            let r = reqwest::Client::new()
+                .get(url)
+                .header("authorization", value)
+                .send()
+                .await
+                .unwrap();
+            (r.status().as_u16(), r.text().await.unwrap())
+        }
+    };
+    let (s, body) = send(basic("", &tok)).await;
+    assert_eq!(s, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["auth"], "Basic [REDACTED]");
+    let encoded_key = basic("", &env.key);
+    let encoded_key = encoded_key.strip_prefix("Basic ").unwrap();
+    assert!(!body.contains(&env.key) && !body.contains(encoded_key) && !body.contains(&tok));
+    // the upstream got the key: the log shows the call, the fake echoed a header that was then scrubbed
+    assert_eq!(env.hits.load(Ordering::SeqCst), 1);
+
+    assert_eq!(send(format!("Bearer {tok}")).await.0, 401);
+    assert_eq!(send(format!("Basic {tok}")).await.0, 401);
+    assert_eq!(send(basic("someone", &tok)).await.0, 401);
+    assert_eq!(send(basic("", "wrong")).await.0, 401);
+    assert_eq!(
+        send(basic("", &env.token())).await.0,
+        401,
+        "another service's token"
+    );
+    let unpadded = basic("", &tok).trim_end_matches('=').to_string();
+    if unpadded != basic("", &tok) {
+        assert_eq!(send(unpadded).await.0, 401, "only the canonical encoding");
+    }
+    assert_eq!(
+        env.hits.load(Ordering::SeqCst),
+        1,
+        "refused calls never reach the upstream"
+    );
 }

@@ -100,7 +100,7 @@ pub struct UploadUrl {
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 /// Standard base64 of `src`, appended to `out` (which has room: no copies left behind by growing).
-fn base64_into(src: &[u8], out: &mut String) {
+pub(crate) fn base64_into(src: &[u8], out: &mut String) {
     for c in src.chunks(3) {
         let n = (c[0] as u32) << 16
             | (*c.get(1).unwrap_or(&0) as u32) << 8

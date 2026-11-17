@@ -2,6 +2,7 @@
 //! requests, so the programs using them never see the keys.
 
 mod b2;
+mod basic;
 mod config;
 mod graphql;
 mod log;

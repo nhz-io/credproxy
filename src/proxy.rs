@@ -301,8 +301,14 @@ pub async fn handle(
     } else {
         log::printable(&rest)
     };
-    let ok = presented(req.headers(), &svc.auth_header, &svc.auth_format)
-        .is_some_and(|t| vault.check_token(&service, t));
+    let ok = match &svc.basic {
+        Some(user) => req
+            .headers()
+            .get(svc.auth_header.as_str())
+            .is_some_and(|v| vault.check_basic(&service, user, v.as_bytes())),
+        None => presented(req.headers(), &svc.auth_header, &svc.auth_format)
+            .is_some_and(|t| vault.check_token(&service, t)),
+    };
     let res = if ok {
         forward(&vault, &http, &service, &method, &rest, req, &progress).await
     } else {
@@ -399,11 +405,20 @@ async fn forward(
     let Ok(m) = reqwest::Method::from_bytes(method.as_bytes()) else {
         return reply(StatusCode::METHOD_NOT_ALLOWED, "bad method");
     };
-    let auth = Zeroizing::new(svc.auth_format.replace("{key}", key));
+    let auth = match &svc.basic {
+        Some(user) => crate::basic::credential(user, key),
+        None => Zeroizing::new(svc.auth_format.replace("{key}", key)),
+    };
     let Ok(mut auth_value) = reqwest::header::HeaderValue::from_str(&auth) else {
         return reply(StatusCode::INTERNAL_SERVER_ERROR, "bad auth header");
     };
     auth_value.set_sensitive(true);
+    // Scrubbed from the reply: the key, and for Basic also the encoded pair, which decodes back to it (a server
+    // echoing the Authorization header would otherwise hand it out).
+    let mut secrets: Vec<&[u8]> = vec![key.as_bytes()];
+    if svc.basic.is_some() {
+        secrets.push(&auth.as_bytes()[crate::basic::PREFIX.len()..]);
+    }
     // Only these client headers go upstream; cookies, auth and anything else are dropped. Replies must come back
     // uncompressed, or the key couldn't be scrubbed from them.
     let mut out = http
@@ -427,7 +442,7 @@ async fn forward(
         Ok(r) => r,
         Err(e) => return upstream_failed(&e),
     };
-    buffered_reply(res, &[key.as_bytes()], None).await
+    buffered_reply(res, &secrets, None).await
 }
 
 /// A small client body (≤ MAX_REQUEST), read within `limit`.

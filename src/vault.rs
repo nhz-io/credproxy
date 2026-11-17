@@ -195,6 +195,17 @@ impl Vault {
             .is_some_and(|s| bool::from(s.token.as_bytes().ct_eq(presented)))
     }
 
+    /// Is `presented` (a whole `Authorization` value) `Basic base64(<user>:<token>)` for the service's token?
+    /// Built from the token and compared whole, in constant time: no decoding of client input, so only the
+    /// canonical encoding (padded, standard alphabet, what `curl -u` and `base64` send) matches.
+    pub fn check_basic(&self, service: &str, user: &str, presented: &[u8]) -> bool {
+        let slots = self.slots.lock().unwrap();
+        slots.get(service).is_some_and(|s| {
+            let want = crate::basic::credential(user, &s.token);
+            bool::from(want.as_bytes().ct_eq(presented))
+        })
+    }
+
     pub fn token(&self, service: &str) -> Option<String> {
         self.slots
             .lock()

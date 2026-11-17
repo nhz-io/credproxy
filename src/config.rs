@@ -54,6 +54,17 @@ struct RawAuth {
     sigv4: Option<RawSigv4>,
     /// Backblaze B2 native API: the key is traded for a B2 token at unlock, then forgotten.
     b2: Option<RawB2>,
+    /// HTTP Basic: the key goes upstream as `Authorization: Basic base64(<user>:<key>)`, and clients send the
+    /// token the same way.
+    basic: Option<RawBasic>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawBasic {
+    /// The user name before the colon; Azure DevOps ignores it, so it is usually empty.
+    #[serde(default)]
+    user: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -92,6 +103,7 @@ impl Default for RawAuth {
             format: default_format(),
             sigv4: None,
             b2: None,
+            basic: None,
         }
     }
 }
@@ -207,6 +219,9 @@ pub struct Service {
     pub sigv4: Option<String>,
     /// Some: Backblaze B2 native API (the sealed file holds two lines, the key id and the application key).
     pub b2: Option<B2Auth>,
+    /// Some(user name): HTTP Basic. Clients send `Authorization: Basic base64(<user>:<token>)`, the upstream
+    /// gets `Basic base64(<user>:<key>)`.
+    pub basic: Option<String>,
     pub routes: Vec<Route>,
 }
 
@@ -701,6 +716,26 @@ pub fn parse(text: &str) -> Result<Config, String> {
         if s.auth.sigv4.is_some() && s.auth.b2.is_some() {
             return Err(format!("service {name}: auth.sigv4 or auth.b2, not both"));
         }
+        if let Some(b) = &s.auth.basic {
+            if s.auth.sigv4.is_some() || s.auth.b2.is_some() {
+                return Err(format!(
+                    "service {name}: auth.basic can't be combined with auth.sigv4 or auth.b2"
+                ));
+            }
+            if !s.auth.header.eq_ignore_ascii_case("authorization")
+                || s.auth.format != default_format()
+            {
+                return Err(format!(
+                    "service {name}: auth.basic sets the header (Authorization) and the format (Basic): leave out auth.header and auth.format"
+                ));
+            }
+            // RFC 7617: the user-id can't contain a colon
+            if b.user.contains(':') || b.user.chars().any(char::is_control) {
+                return Err(format!(
+                    "service {name}: auth.basic.user can't contain ':' or control characters"
+                ));
+            }
+        }
         let b2 = match s.auth.b2 {
             Some(b) => Some(check_b2(b).map_err(|e| format!("service {name}: {e}"))?),
             None => None,
@@ -816,6 +851,13 @@ pub fn parse(text: &str) -> Result<Config, String> {
                 ));
             }
             let stream = if r.stream {
+                // the stream scrubber holds one secret; a Basic service has two (the key and its encoded pair)
+                if s.auth.basic.is_some() {
+                    return Err(format!(
+                        "service {name}: route {:?}: stream isn't available with auth.basic",
+                        r.prefix
+                    ));
+                }
                 if allow.is_empty() {
                     return Err(format!(
                         "service {name}: route {:?}: stream needs allow rules (key-in-header routes only)",
@@ -850,9 +892,13 @@ pub fn parse(text: &str) -> Result<Config, String> {
             Service {
                 secret: PathBuf::from(format!("{}.age", s.secret)),
                 auth_header: s.auth.header,
-                auth_format: s.auth.format,
+                auth_format: match s.auth.basic {
+                    Some(_) => format!("{}{{key}}", crate::basic::PREFIX),
+                    None => s.auth.format,
+                },
                 sigv4: s.auth.sigv4.map(|v| v.service),
                 b2,
+                basic: s.auth.basic.map(|b| b.user),
                 routes,
             },
         );
@@ -1296,6 +1342,53 @@ b2 = { upload = true }
         ];
         for b in bad {
             assert!(parse(&b).is_err(), "accepted:\n{b}");
+        }
+    }
+
+    #[test]
+    fn basic_service() {
+        let base = |auth: &str, extra: &str| {
+            format!(
+                r#"
+[services.ado]
+secret = "ado/pat"
+auth = {auth}
+[[services.ado.routes]]
+prefix = "/tfs"
+upstream = "https://tfs.example:8080/tfs"
+allow = ["GET /{{collection}}/_apis/projects"]
+{extra}
+"#
+            )
+        };
+        let c = parse(&base("{ basic = {} }", "")).unwrap();
+        let s = &c.services["ado"];
+        assert_eq!(s.basic.as_deref(), Some(""));
+        assert_eq!(s.auth_header, "Authorization");
+        assert_eq!(s.auth_format, "Basic {key}");
+        let c = parse(&base("{ basic = { user = \"bot\" } }", "")).unwrap();
+        assert_eq!(c.services["ado"].basic.as_deref(), Some("bot"));
+        assert!(parse(RUNPOD).unwrap().services["runpod"].basic.is_none());
+        for (auth, extra, why) in [
+            ("{ basic = { user = \"a:b\" } }", "", "can't contain ':'"),
+            ("{ basic = { user = \"a\\nb\" } }", "", "can't contain ':'"),
+            (
+                "{ basic = {}, header = \"api_key\" }",
+                "",
+                "leave out auth.header",
+            ),
+            (
+                "{ basic = {}, format = \"Token {key}\" }",
+                "",
+                "leave out auth.header",
+            ),
+            ("{ basic = {}, sigv4 = {} }", "", "can't be combined"),
+            ("{ basic = {}, b2 = {} }", "", "can't be combined"),
+            ("{ basic = {} }", "stream = true", "stream isn't available"),
+            ("{ basic = { password = \"x\" } }", "", "unknown field"),
+        ] {
+            let e = parse(&base(auth, extra)).unwrap_err();
+            assert!(e.contains(why), "{auth} {extra}: {e}");
         }
     }
 
